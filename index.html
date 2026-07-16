@@ -6,21 +6,21 @@
   <title>蝦皮商品拍攝腳本工具</title>
   <style>
     :root{--ink:#19231f;--green:#174b3a;--lime:#d9f46b;--paper:#f7f6f1;--line:#dfe3df}
-    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;color:var(--ink);background:var(--paper);font-family:"Microsoft JhengHei",Arial,sans-serif}button,textarea{font:inherit}button{cursor:pointer}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;color:var(--ink);background:var(--paper);font-family:"Microsoft JhengHei",Arial,sans-serif}button,textarea,input{font:inherit}button{cursor:pointer}
     header{max-width:920px;height:66px;margin:auto;padding:0 20px;display:flex;align-items:center;justify-content:space-between}header strong{display:flex;align-items:center;gap:9px;font-size:17px}header strong b{display:grid;place-items:center;width:30px;height:30px;color:var(--green);background:var(--lime);border-radius:9px}header span{color:#718078;font-size:12px}
     .hero{max-width:700px;min-height:590px;margin:auto;padding:75px 18px 65px;text-align:center}.tag{margin:0 0 15px;color:#607269;font-size:12px;font-weight:800;letter-spacing:.12em}h1{margin:0;font-size:clamp(36px,7vw,60px);line-height:1.15;letter-spacing:-.055em}.intro{margin:19px 0 28px;color:#69756f;font-size:14px}
-    .card{padding:21px;border:1px solid var(--line);border-radius:19px;background:#fff;text-align:left;box-shadow:0 18px 55px rgba(27,64,50,.09)}label{display:block;margin-bottom:9px;font-size:13px;font-weight:900}label span{color:#8c9691;font-size:11px;font-weight:500}textarea{width:100%;min-height:86px;padding:14px;resize:vertical;color:#25342d;background:#fbfcfa;border:1.5px solid #ccd4cf;border-radius:11px;outline:none;font-size:13px;line-height:1.55}textarea:focus{border-color:var(--green);box-shadow:0 0 0 4px #e8f0ec}.focus-label{margin-top:16px}.focus-input{min-height:64px}.hint{margin:7px 2px 0;color:#8a948f;font-size:10px}.error{display:none;margin:8px 2px 0;color:#b54a3f;font-size:11px}.status{display:none;margin:11px 2px 0;padding:9px 11px;border-radius:8px;font-size:11px;line-height:1.5}.status.ok{display:block;color:#24543f;background:#edf6e8}.status.warn{display:block;color:#8b4c28;background:#fff2df}.generate{width:100%;height:53px;margin-top:14px;border:0;border-radius:11px;color:#fff;background:var(--green);font-weight:900}.generate:hover{background:#1f604a}.generate:disabled{cursor:not-allowed;opacity:.55}.steps{margin:18px 0 0;color:#97a09b;font-size:11px}
-    .result{display:none;max-width:880px;margin:0 auto 90px;padding:0 18px;scroll-margin-top:22px}.head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:14px}.head small{display:inline-block;margin-bottom:7px;padding:5px 9px;color:var(--green);background:#e6f2d1;border-radius:20px;font-weight:900}.head h2{margin:0;font-size:28px}.copy{min-width:108px;padding:10px 14px;color:var(--green);background:#fff;border:1px solid #cad4ce;border-radius:9px;font-size:12px;font-weight:800}.prepare{margin:0 0 12px;padding:13px 15px;color:#58675f;background:#e9eee9;border-radius:10px;font-size:12px;line-height:1.6}.scenes{display:grid;gap:10px}.scene{display:grid;grid-template-columns:38px 88px 1fr;gap:13px;padding:17px;background:#fff;border:1px solid var(--line);border-radius:13px}.number{display:grid;place-items:center;align-self:start;width:33px;height:33px;color:var(--green);background:var(--lime);border-radius:50%;font-size:12px;font-weight:900}.time b,.time span{display:block}.time b{margin-top:2px;font-size:12px}.time span{margin-top:5px;color:#718078;font-size:11px}.content{display:grid;gap:8px}.content p{display:grid;grid-template-columns:44px 1fr;gap:7px;margin:0;color:#3d4b44;font-size:12px;line-height:1.65}.content strong{color:#87918c;font-size:10px;letter-spacing:.06em}.action{margin:12px 0 0;padding:14px 16px;color:#2f5245;background:#f2f7e6;border:1px solid #dce9c8;border-radius:10px;font-size:12px;line-height:1.7}.copy-all{width:100%;height:49px;margin-top:14px;color:#fff;background:var(--green);border:0;border-radius:10px;font-weight:900}footer{padding:25px 18px;color:#929b96;border-top:1px solid var(--line);text-align:center;font-size:11px}
+    .card{padding:21px;border:1px solid var(--line);border-radius:19px;background:#fff;text-align:left;box-shadow:0 18px 55px rgba(27,64,50,.09)}label{display:block;margin-bottom:9px;font-size:13px;font-weight:900}label span{color:#8c9691;font-size:11px;font-weight:500}textarea{width:100%;min-height:86px;padding:14px;resize:vertical;color:#25342d;background:#fbfcfa;border:1.5px solid #ccd4cf;border-radius:11px;outline:none;font-size:13px;line-height:1.55}textarea:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 4px #e8f0ec}.focus-label{margin-top:16px}.focus-input{min-height:64px}.duration-row{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-top:16px}.duration-row label{margin:0}.duration-box{display:flex;align-items:center;gap:8px;color:#647169;font-size:12px}.duration-box input{width:88px;padding:10px 12px;color:#25342d;background:#fbfcfa;border:1.5px solid #ccd4cf;border-radius:9px;outline:none;text-align:center}.hint{margin:7px 2px 0;color:#8a948f;font-size:10px}.error{display:none;margin:8px 2px 0;color:#b54a3f;font-size:11px}.status{display:none;margin:11px 2px 0;padding:9px 11px;border-radius:8px;font-size:11px;line-height:1.5}.status.ok{display:block;color:#24543f;background:#edf6e8}.status.warn{display:block;color:#8b4c28;background:#fff2df}.generate{width:100%;height:53px;margin-top:14px;border:0;border-radius:11px;color:#fff;background:var(--green);font-weight:900}.generate:hover{background:#1f604a}.generate:disabled{cursor:not-allowed;opacity:.55}.steps{margin:18px 0 0;color:#97a09b;font-size:11px}
+    .result{display:none;max-width:880px;margin:0 auto 90px;padding:0 18px;scroll-margin-top:22px}.head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:14px}.head small{display:inline-block;margin-bottom:7px;padding:5px 9px;color:var(--green);background:#e6f2d1;border-radius:20px;font-weight:900}.head h2{margin:0;font-size:28px}.copy{min-width:108px;padding:10px 14px;color:var(--green);background:#fff;border:1px solid #cad4ce;border-radius:9px;font-size:12px;font-weight:800}.prepare{margin:0 0 12px;padding:13px 15px;color:#58675f;background:#e9eee9;border-radius:10px;font-size:12px;line-height:1.6}.scenes{display:grid;gap:10px}.scene{display:grid;grid-template-columns:38px 88px 1fr;gap:13px;padding:17px;background:#fff;border:1px solid var(--line);border-radius:13px}.number{display:grid;place-items:center;align-self:start;width:33px;height:33px;color:var(--green);background:var(--lime);border-radius:50%;font-size:12px;font-weight:900}.time b,.time span{display:block}.time b{margin-top:2px;font-size:12px}.time span{margin-top:5px;color:#718078;font-size:11px}.content{display:grid;gap:8px}.content p{display:grid;grid-template-columns:44px 1fr;gap:7px;margin:0;color:#3d4b44;font-size:12px;line-height:1.65}.content strong{color:#87918c;font-size:10px;letter-spacing:.06em}.copy-all{width:100%;height:49px;margin-top:14px;color:#fff;background:var(--green);border:0;border-radius:10px;font-weight:900}footer{padding:25px 18px;color:#929b96;border-top:1px solid var(--line);text-align:center;font-size:11px}
     @media(max-width:620px){header{height:58px;padding:0 14px}header span{font-size:10px}.hero{min-height:540px;padding:55px 13px 50px}.card{padding:16px}.result{padding:0 12px;margin-bottom:70px}.head{align-items:flex-start;flex-direction:column}.copy{width:100%}.scene{grid-template-columns:38px 1fr;padding:14px}.time{grid-column:2}.content{grid-column:1/3}.content p{grid-template-columns:40px 1fr}}
   </style>
 </head>
 <body>
-  <header><strong><b>拍</b>商品拍攝腳本</strong><span>免登入・離線可用</span></header>
+  <header><strong><b>拍</b>商品拍攝腳本</strong><span>免登入・AI 產生</span></header>
   <main>
     <section class="hero" id="top">
       <p class="tag">給蝦皮短影片拍攝人員</p>
       <h1>貼上商品連結<br>馬上產生拍攝腳本</h1>
-      <p class="intro">約 40 秒，包含拍攝畫面、口播和字幕。</p>
+      <p class="intro">自行設定秒數，產生開頭、賣點、結尾三段口播。</p>
       <div class="card">
         <label for="url">蝦皮商品連結</label>
         <textarea id="url" rows="3" placeholder="把蝦皮商品網址貼在這裡"></textarea>
@@ -28,6 +28,7 @@
         <label class="focus-label" for="focus">這支影片想特別介紹什麼？ <span>選填</span></label>
         <textarea class="focus-input" id="focus" rows="2" placeholder="例如：多介紹內裝、容量與隔層"></textarea>
         <p class="hint">也可以填：強調材質、示範尺寸、比較收納前後</p>
+        <div class="duration-row"><label for="duration">影片秒數 <span>10–60 秒</span></label><div class="duration-box"><input id="duration" type="number" min="10" max="60" step="1" value="40"><span>秒</span></div></div>
         <button class="generate" id="generate" disabled>AI 產生拍攝腳本</button>
         <p class="status" id="status" aria-live="polite"></p>
       </div>
@@ -37,7 +38,6 @@
       <div class="head"><div><small id="durationLabel">AI 產生・約 40 秒</small><h2 id="productName"></h2></div><button class="copy" id="copyTop">複製腳本</button></div>
       <p class="prepare"><b>精簡腳本：</b>開頭、賣點、結尾三段口播，照著時間拍就可以。</p>
       <div class="scenes" id="scenes"></div>
-      <p class="action" id="actionLine"></p>
       <button class="copy-all" id="copyBottom">複製完整腳本給同仁</button>
     </section>
   </main>
@@ -45,12 +45,13 @@
   <script>
     const input=document.querySelector('#url');
     const focusInput=document.querySelector('#focus');
+    const durationInput=document.querySelector('#duration');
     const generate=document.querySelector('#generate');
     const error=document.querySelector('#error');
     const result=document.querySelector('#result');
     const status=document.querySelector('#status');
     const durationLabel=document.querySelector('#durationLabel');
-    const AI_API_URL='https://shopee-video-script-ai.jachou123-afk.workers.dev';
+    const AI_API_URL='https://shopee-video-script-ai.jachou123-afk.workers.dev/?v=duration';
     let current=null;
 
     const features=[['尺寸','多種尺寸可選'],['透明','內容物一眼看清楚'],['磨砂','磨砂質感'],['防塵','防塵好收納'],['收納','分類收納更整齊'],['旅行','外出旅行方便攜帶'],['帆布','耐磨帆布材質'],['碎花','可愛碎花外型'],['迷你','小巧不占空間'],['拉鍊','拉鍊開合好拿取'],['拉鏈','拉鍊開合好拿取'],['零錢','零錢卡片集中收好']];
@@ -99,24 +100,26 @@
     }
 
     function escapeHtml(value){const div=document.createElement('div');div.textContent=value;return div.innerHTML}
-    function fullText(){return [`【${current.product.name}｜約 ${current.seconds||40} 秒拍攝腳本】`,current.focus?`拍攝方向：${current.focus}`:'','',...current.segments.map(s=>`* ${s[0]}（${s[1]}）：\n「${s[2]}」`),`🎬 搭配動作：${current.action}`].filter((line,index,list)=>line!==''||list[index-1]!=='').join('\n\n')}
+    function fullText(){return [`【${current.product.name}｜${current.seconds||40} 秒拍攝腳本】`,current.focus?`介紹重點：${current.focus}`:'','',...current.segments.map(s=>`* ${s[0]}（${s[1]}）：\n「${s[2]}」`)].filter((line,index,list)=>line!==''||list[index-1]!=='').join('\n\n')}
     function copy(button){navigator.clipboard.writeText(fullText()).then(()=>{const old=button.textContent;button.textContent='已複製 ✓';setTimeout(()=>button.textContent=old,1500)})}
 
-    function makeSimpleFallback(product,focus){
+    function makeSimpleFallback(product,focus,seconds){
       const direction=focus||product.features.slice(0,2).join('、');
+      const intro=Math.max(2,Math.min(5,Math.round(seconds*.15)));
+      const outro=Math.max(2,Math.min(8,Math.round(seconds*.2)));
+      const sellingEnd=seconds-outro;
       return {segments:[
-        ['0–5 秒','開頭',`正在找實用又好看的 ${product.name} 嗎？這款真的很適合日常使用！`],
-        ['5–30 秒','賣點',`這款主打 ${product.features.join('、')}。${direction?`這次特別帶你看 ${direction}，`:''}實際拿取和使用都很方便。`],
-        ['30–40 秒','結尾',`喜歡這款 ${product.name}，趕快點擊下方連結看看吧！`]
-      ],action:`先拍商品全貌，再近拍 ${direction||'主要特色'}，最後實際操作一次給觀眾看。`};
+        [`0–${intro} 秒`,'開頭',`正在找實用又好看的 ${product.name} 嗎？這款真的很適合日常使用！`],
+        [`${intro}–${sellingEnd} 秒`,'賣點',`這款主打 ${product.features.join('、')}。${direction?`這次特別介紹 ${direction}，`:''}日常使用很方便。`],
+        [`${sellingEnd}–${seconds} 秒`,'結尾',`喜歡這款 ${product.name}，趕快點擊下方連結看看吧！`]
+      ]};
     }
 
-    function showResult(product,segments,action,focus,seconds,isAi){
-      current={product,segments,action,focus,seconds};
+    function showResult(product,segments,focus,seconds,isAi){
+      current={product,segments,focus,seconds};
       document.querySelector('#productName').textContent=product.name;
       durationLabel.textContent=`${isAi?'AI 產生・':''}約 ${seconds} 秒`;
       document.querySelector('#scenes').innerHTML=segments.map((s,i)=>`<article class="scene"><div class="number">${i+1}</div><div class="time"><b>${escapeHtml(s[0])}</b><span>${escapeHtml(s[1])}</span></div><div class="content"><p><strong>口播</strong><span>「${escapeHtml(s[2])}」</span></p></div></article>`).join('');
-      document.querySelector('#actionLine').innerHTML=`<b>🎬 搭配動作：</b>${escapeHtml(action)}`;
       result.style.display='block';setTimeout(()=>result.scrollIntoView({behavior:'smooth'}),30);
     }
 
@@ -124,19 +127,21 @@
       const originalText=generate.textContent;
       const productUrl=input.value.trim().split(/\s+/)[0];
       const requestedFocus=focusInput.value.trim();
+      const requestedSeconds=Math.min(60,Math.max(10,Number.parseInt(durationInput.value,10)||40));
+      durationInput.value=requestedSeconds;
       generate.disabled=true;generate.textContent='AI 產生中…';status.className='status';status.textContent='';
       try{
-        const response=await fetch(AI_API_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productUrl,focus:requestedFocus})});
+        const response=await fetch(AI_API_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productUrl,focus:requestedFocus,seconds:requestedSeconds})});
         const data=await response.json().catch(()=>({}));
         if(!response.ok||!data.script)throw new Error(data.error||'目前無法連上 AI');
         const script=data.script;
         const segments=script.segments.map(segment=>[segment.time,segment.title,segment.voice]);
         const product={name:script.productName||parseProduct(productUrl).name};
-        showResult(product,segments,script.action,script.direction||requestedFocus,script.totalSeconds||40,true);
+        showResult(product,segments,script.direction||requestedFocus,script.totalSeconds||requestedSeconds,true);
         status.className='status ok';status.textContent='AI 腳本已完成，可直接複製給拍攝人員。';
       }catch(err){
-        const product=parseProduct(productUrl);const fallback=makeSimpleFallback(product,requestedFocus);
-        showResult(product,fallback.segments,fallback.action,requestedFocus,40,false);
+        const product=parseProduct(productUrl);const fallback=makeSimpleFallback(product,requestedFocus,requestedSeconds);
+        showResult(product,fallback.segments,requestedFocus,requestedSeconds,false);
         status.className='status warn';status.textContent=`AI 暫時無法使用，已先產生基本腳本。${err.message?'（'+err.message+'）':''}`;
       }finally{
         generate.disabled=false;generate.textContent=originalText;
