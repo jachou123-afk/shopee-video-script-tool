@@ -1,0 +1,1537 @@
+const allowedOrigins = new Set([
+  "https://jachou123-afk.github.io",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]);
+
+const usage = new Map();
+const lineActivations = new Map();
+const encoder = new TextEncoder();
+const globalLineScheduleName = "line-schedule:global-v1";
+
+function corsHeaders(origin) {
+  return {
+    "Access-Control-Allow-Origin": allowedOrigins.has(origin) ? origin : "https://jachou123-afk.github.io",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
+  };
+}
+
+function json(data, status, origin) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...corsHeaders(origin) },
+  });
+}
+
+function httpError(message, status = 400) {
+  return Object.assign(new Error(message), { status });
+}
+
+function cleanShopeeUrl(raw) {
+  const candidate = String(raw || "").trim().split(/\s+/)[0].replace(/[)\]}>，。！？、]+$/u, "");
+  const url = new URL(candidate);
+  if (!url.hostname.toLowerCase().endsWith("shopee.tw")) throw httpError("請貼上 shopee.tw 商品連結");
+  return url;
+}
+
+async function resolveShopeeUrl(raw) {
+  const url = cleanShopeeUrl(raw);
+  if (url.hostname.toLowerCase() !== "s.shopee.tw") return url.toString();
+
+  try {
+    const response = await fetch(url, {
+      method: "HEAD",
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    const resolved = cleanShopeeUrl(response.url);
+    response.body?.cancel();
+    return resolved.toString();
+  } catch {
+    return url.toString();
+  }
+}
+
+function cleanProductTitleText(value) {
+  const normalized = String(value || "")
+    .replace(/\s*\|\s*蝦皮購物\s*$/u, "")
+    .replace(/-i\.\d+\.\d+.*$/i, "")
+    .replace(/[+-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized
+    .replace(/^(?:(?:(?:台灣)?現貨|實拍影片)[!！\s]*)+/u, "")
+    .replace(/^【[^】]{1,60}】\s*/u, "")
+    .trim()
+    .slice(0, 500) || normalized.slice(0, 500) || "蝦皮商品";
+}
+
+function productTitle(raw) {
+  const url = cleanShopeeUrl(raw);
+  const seoName = url.searchParams.get("seoName");
+  const decoded = seoName || decodeURIComponent(url.pathname).replace(/^\//, "");
+  return cleanProductTitleText(decoded);
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, decimal) => String.fromCodePoint(Number.parseInt(decimal, 10)))
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&");
+}
+
+function extractShopeePageContent(html) {
+  const metadata = {};
+  for (const tag of String(html || "").match(/<meta\b[^>]*>/gis) || []) {
+    const attributes = {};
+    for (const match of tag.matchAll(/([:\w-]+)\s*=\s*(["'])([\s\S]*?)\2/g)) {
+      attributes[match[1].toLowerCase()] = decodeHtmlEntities(match[3]);
+    }
+    const key = String(attributes.property || attributes.name || "").toLowerCase();
+    if ((key === "og:title" || key === "og:description" || key === "description") && attributes.content) {
+      metadata[key] = attributes.content;
+    }
+  }
+  return {
+    title: metadata["og:title"] ? cleanProductTitleText(metadata["og:title"]) : "",
+    description: String(metadata["og:description"] || metadata.description || "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+      .slice(0, 6000),
+  };
+}
+
+function normalizeReaderProduct(product) {
+  const title = cleanProductTitleText(product?.title || "");
+  const description = String(product?.description || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, 12000);
+  return { title, description, source: String(product?.source || "nas_browser").slice(0, 80) };
+}
+
+function readerBrokerStub(env) {
+  if (!env.LINE_ACTIVATION) throw httpError("NAS 商品讀取服務尚未設定", 503);
+  const id = env.LINE_ACTIVATION.idFromName("shopee-reader-broker-v1");
+  return env.LINE_ACTIVATION.get(id);
+}
+
+async function fetchFromNasReader(productUrl, env) {
+  const response = await readerBrokerStub(env).fetch("https://shopee-reader/extract", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: productUrl }),
+  });
+  let result = null;
+  try {
+    result = await response.json();
+  } catch {}
+  if (!response.ok || !result?.ok) {
+    const reason = String(result?.error || `HTTP_${response.status}`).slice(0, 120);
+    throw httpError(`NAS 商品讀取失敗：${reason}`, 503);
+  }
+  return normalizeReaderProduct(result.product);
+}
+
+async function fetchShopeePageContent(productUrl, env) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  let direct = { title: "", description: "", source: "" };
+  try {
+    const response = await fetch(productUrl, {
+      headers: {
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-TW,zh;q=0.9",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (response.ok) {
+      direct = { ...extractShopeePageContent(await response.text()), source: "direct_meta" };
+      if (direct.description.length >= 5) return direct;
+    } else {
+      console.log("SHOPEE_DIRECT_FETCH", JSON.stringify({ status: response.status }));
+    }
+  } catch (error) {
+    console.log("SHOPEE_DIRECT_FETCH", JSON.stringify({ error: error?.name || "fetch_failed" }));
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  try {
+    const reader = await fetchFromNasReader(productUrl, env);
+    if (reader.description.length >= 5) return reader;
+  } catch (error) {
+    console.error("SHOPEE_NAS_READER", error?.message || error);
+  }
+
+  throw httpError("目前無法讀取商品完整內容，請確認 NAS 讀取服務在線且蝦皮帳號仍為登入狀態", 503);
+}
+
+function canonicalShopeeUrl(raw) {
+  const url = cleanShopeeUrl(raw);
+  const productPath = url.pathname.match(/^\/product\/(\d+)\/(\d+)/i);
+  const legacyPath = decodeURIComponent(url.pathname).match(/-i\.(\d+)\.(\d+)/i);
+  const ids = productPath || legacyPath;
+  return ids ? `https://shopee.tw/product/${ids[1]}/${ids[2]}` : url.toString();
+}
+
+function allowRequest(key) {
+  const hour = Math.floor(Date.now() / 3_600_000);
+  const usageKey = `${key}:${hour}`;
+  const count = usage.get(usageKey) || 0;
+  if (count >= 20) return false;
+  usage.set(usageKey, count + 1);
+  if (usage.size > 1000) {
+    for (const entry of usage.keys()) {
+      if (!entry.endsWith(`:${hour}`)) usage.delete(entry);
+    }
+  }
+  return true;
+}
+
+function outputText(response) {
+  if (typeof response.output_text === "string") return response.output_text;
+  for (const item of response.output || []) {
+    for (const content of item.content || []) {
+      if (content.type === "output_text" && typeof content.text === "string") return content.text;
+    }
+  }
+  return "";
+}
+
+const scriptSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["productName", "totalSeconds", "direction", "segments"],
+  properties: {
+    productName: { type: "string" },
+    totalSeconds: { type: "integer", minimum: 10, maximum: 60 },
+    direction: { type: "string" },
+    segments: {
+      type: "array",
+      minItems: 3,
+      maxItems: 3,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["time", "title", "voice"],
+        properties: {
+          time: { type: "string" },
+          title: { type: "string" },
+          voice: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+async function generateScript(body, env) {
+  if (!env.OPENAI_API_KEY) throw httpError("AI 服務尚未設定完成", 503);
+
+  const productUrl = await resolveShopeeUrl(String(body.productUrl || ""));
+  const pageContent = await fetchShopeePageContent(productUrl, env);
+  const suppliedTitle = String(body.productName || body.title || "").replace(/\s+/g, " ").trim().slice(0, 500);
+  const title = pageContent.title || suppliedTitle || productTitle(productUrl);
+  const focus = String(body.focus || "").trim().slice(0, 300);
+  const requestedSeconds = Math.min(60, Math.max(10, Number.parseInt(body.seconds, 10) || 40));
+
+  const prompt = [
+    `商品網址可辨識標題：${title}`,
+    pageContent.description
+      ? `以下是實際商品頁內容，請優先根據其中的商品特色、材質、尺寸、數量、顏色與使用方式撰寫：\n---商品頁內容---\n${pageContent.description}\n---商品頁內容結束---`
+      : "商品頁內容目前無法讀取，只能根據商品名稱撰寫；不可自行補充規格或賣點。",
+    `使用者希望的拍攝方向：${focus || "沒有指定，請突出最容易用畫面證明的賣點"}`,
+    `請製作一支總長剛好 ${requestedSeconds} 秒的繁體中文蝦皮商品短影片口播腳本。`,
+    "輸出只要 3 段：開頭、賣點、結尾。每段包含連續且不重疊的秒數與一段自然口播，不要拆成多個鏡頭，也不要另寫字幕。",
+    `totalSeconds 必須是 ${requestedSeconds}，三段時間必須從 0 秒開始、連續分配，最後剛好在 ${requestedSeconds} 秒結束。`,
+    "開頭約占 15%，用一句話吸引目標客群；賣點是主體；結尾約占 20%，要有簡短行動引導。",
+    "影片固定使用單一鏡頭，所以不要提供拍攝方式、搭配動作、鏡位、運鏡或畫面指示。",
+    "若使用者指定內裝、隔層或容量，賣點口播必須集中介紹該方向。",
+    "只能根據商品標題、上述商品頁內容與使用者方向撰寫；不要捏造材質、尺寸、數量、耐用年限或商品頁未提供的保證。",
+    "口播總長要能在指定秒數內自然說完，語氣像台灣電商短影片拍攝人員，清楚直接，不要誇大。",
+  ].join("\n");
+
+  const openai = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-5.6-luna",
+      instructions: "你是台灣電商短影片導演，專門把商品資料轉成能直接照著拍的短腳本。",
+      input: prompt,
+      max_output_tokens: 1000,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "shooting_script",
+          strict: true,
+          schema: scriptSchema,
+        },
+      },
+    }),
+  });
+
+  const response = await openai.json();
+  if (!openai.ok) {
+    console.error("OpenAI error", openai.status, response?.error?.code || "unknown");
+    if (openai.status === 401) throw httpError("AI 金鑰無效，請通知管理者", 502);
+    if (openai.status === 429) throw httpError("AI 使用額度不足或請求太多，請稍後再試", 502);
+    throw httpError("AI 暫時無法產生腳本，請稍後再試", 502);
+  }
+
+  const text = outputText(response);
+  if (!text) throw httpError("AI 沒有回傳腳本，請再試一次", 502);
+  try {
+    const script = JSON.parse(text);
+    script.productName = title;
+    script.totalSeconds = requestedSeconds;
+    script.pageContentRead = Boolean(pageContent.description);
+    return script;
+  } catch {
+    throw httpError("AI 回傳格式錯誤，請再試一次", 502);
+  }
+}
+
+function findShopeeUrl(text) {
+  return findShopeeUrls(text)[0] || "";
+}
+
+function findShopeeUrls(text) {
+  const urls = [];
+  const seen = new Set();
+  for (const match of String(text || "").matchAll(/https?:\/\/[^\s<>"'\[\]()]+/giu)) {
+    try {
+      const rawUrl = cleanShopeeUrl(match[0]).toString();
+      const productUrl = canonicalShopeeUrl(rawUrl);
+      if (seen.has(productUrl)) continue;
+      seen.add(productUrl);
+      urls.push(rawUrl);
+    } catch {}
+  }
+  return urls;
+}
+
+function scheduleItemsFromText(text) {
+  return findShopeeUrls(text).slice(0, 50).map((rawUrl) => ({
+    productUrl: canonicalShopeeUrl(rawUrl),
+    productName: productTitle(rawUrl).slice(0, 160),
+  }));
+}
+
+function isScheduleAddCommand(text) {
+  return /^廣告影片排程(?:\s|$)/u.test(String(text || "").trim());
+}
+
+function isPendingScheduleCommand(text) {
+  return /^要拍什麼[？?]?$/u.test(String(text || "").trim());
+}
+
+function isCompletedScheduleCommand(text) {
+  return /^已拍完$/u.test(String(text || "").trim());
+}
+
+function normalizeScheduleDigits(text) {
+  return String(text || "").trim().replace(/[０-９]/gu, (digit) => String(digit.charCodeAt(0) - 0xFF10));
+}
+
+function parseScheduleSelection(text) {
+  const match = normalizeScheduleDigits(text).match(/^(\d{1,3})$/u);
+  if (!match) return null;
+  const index = Number.parseInt(match[1], 10);
+  return index >= 1 ? index : null;
+}
+
+function parseScheduleCompletion(text) {
+  const match = normalizeScheduleDigits(text).match(/^完成\s*(?:第\s*)?(\d{1,3})(?:\s*號)?$/u);
+  if (!match) return null;
+  const index = Number.parseInt(match[1], 10);
+  return index >= 1 ? index : null;
+}
+
+function parseScheduleUndoCompletion(text) {
+  const match = normalizeScheduleDigits(text).match(/^取消完成\s*(?:第\s*)?(\d{1,3})(?:\s*號)?$/u);
+  if (!match) return null;
+  const index = Number.parseInt(match[1], 10);
+  return index >= 1 ? index : null;
+}
+
+function formatTaipeiDate(timestamp) {
+  try {
+    return new Intl.DateTimeFormat("zh-TW", {
+      timeZone: "Asia/Taipei",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(new Date(Number(timestamp)));
+  } catch {
+    return "時間不明";
+  }
+}
+
+function splitLineText(text, maxLength = 4500, maxMessages = 5) {
+  const lines = String(text || "").split("\n");
+  const chunks = [];
+  let current = "";
+  for (const line of lines) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length <= maxLength) {
+      current = candidate;
+      continue;
+    }
+    if (current) chunks.push(current);
+    current = line.slice(0, maxLength);
+    if (chunks.length >= maxMessages - 1) break;
+  }
+  if (current && chunks.length < maxMessages) chunks.push(current);
+  return chunks.map((chunk) => ({ type: "text", text: chunk }));
+}
+
+function formatPendingSchedule(items) {
+  if (!items.length) return "🎬 目前沒有待拍的廣告影片。";
+  const lines = [`🎬 全域待拍廣告影片（共 ${items.length} 項）`, ""];
+  items.forEach((item, index) => {
+    lines.push(`${index + 1}. ${item.productName || "蝦皮商品"}`);
+    lines.push(`   ${item.productUrl}`);
+  });
+  lines.push("", "請回覆編號產生文案，例如：1", "拍攝完成後輸入「完成1」。");
+  return lines.join("\n");
+}
+
+function formatCompletedSchedule(items) {
+  if (!items.length) return "✅ 目前還沒有已拍完的紀錄。";
+  const lines = [`✅ 全域已拍完（共 ${items.length} 項）`, ""];
+  items.forEach((item, index) => {
+    lines.push(`${index + 1}. ${item.productName || "蝦皮商品"}`);
+    lines.push(`   完成時間：${formatTaipeiDate(item.completedAt)}`);
+    lines.push(`   拍攝員工：${item.completedBy || "群組成員"}`);
+    lines.push(`   ${item.productUrl}`);
+  });
+  lines.push("", "若誤標完成，輸入「取消完成1」。");
+  return lines.join("\n");
+}
+
+function lineInput(text, productUrl) {
+  const secondsMatch = String(text).match(/(?:約\s*)?(\d{2})\s*秒/u);
+  const seconds = secondsMatch ? Math.min(60, Math.max(10, Number.parseInt(secondsMatch[1], 10))) : 40;
+  const focus = String(text)
+    .replace(/https?:\/\/[^\s]+/iu, " ")
+    .replace(/(?:約\s*)?\d{2}\s*秒/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
+  return { productUrl, focus, seconds };
+}
+
+function panelPostback(productUrl, seconds, focus = "", title = "", action = "generate") {
+  const params = new URLSearchParams({
+    action,
+    url: canonicalShopeeUrl(productUrl),
+    seconds: String(seconds),
+    focus,
+  });
+  let compactTitle = String(title || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  if (compactTitle) params.set("title", compactTitle);
+
+  // LINE postback data is limited to 300 characters. Chinese characters expand
+  // when URL encoded, so trim by the final encoded size instead of raw length.
+  while (compactTitle && params.toString().length > 300) {
+    compactTitle = compactTitle.slice(0, -1);
+    if (compactTitle) params.set("title", compactTitle);
+    else params.delete("title");
+  }
+  return params.toString();
+}
+
+function focusPanelPostback(productUrl, seconds, title = "") {
+  return panelPostback(productUrl, seconds, "", title, "choose_focus");
+}
+
+function createLinePanel(productUrl, title) {
+  const options = [
+    { label: "30 秒快速版", seconds: 30 },
+    { label: "40 秒標準版", seconds: 40 },
+    { label: "60 秒詳細版", seconds: 60 },
+  ];
+
+  const buttons = options.map((option) => ({
+    type: "button",
+    style: "primary",
+    color: "#174B3A",
+    height: "sm",
+    margin: option.seconds === 30 ? "lg" : "sm",
+    action: {
+      type: "postback",
+      label: option.label,
+      data: focusPanelPostback(productUrl, option.seconds, title),
+      displayText: option.label,
+    },
+  }));
+
+  return {
+    type: "flex",
+    altText: `請選擇「${title}」的拍攝腳本`,
+    contents: {
+      type: "bubble",
+      size: "mega",
+      header: {
+        type: "box",
+        layout: "vertical",
+        backgroundColor: "#174B3A",
+        paddingAll: "20px",
+        contents: [
+          { type: "text", text: "AI 商品拍攝腳本", color: "#D9F46B", weight: "bold", size: "sm" },
+          { type: "text", text: "選擇腳本版本", color: "#FFFFFF", weight: "bold", size: "xl", margin: "sm" },
+        ],
+      },
+      body: {
+        type: "box",
+        layout: "vertical",
+        paddingAll: "20px",
+        contents: [
+          { type: "text", text: title, weight: "bold", size: "md", wrap: true, maxLines: 2 },
+          { type: "text", text: "先選擇秒數，下一步再選拍攝重點。", color: "#718078", size: "sm", wrap: true, margin: "sm" },
+          ...buttons,
+        ],
+      },
+    },
+  };
+}
+
+function createLineFocusPanel(productUrl, title, seconds) {
+  const options = [
+    { label: "AI 自動選擇重點", focus: "" },
+    { label: "重點拍容量", focus: "重點拍容量" },
+    { label: "重點拍材質", focus: "重點拍材質" },
+    { label: "重點拍使用方式", focus: "重點拍使用方式" },
+  ];
+  const buttons = options.map((option, index) => ({
+    type: "button",
+    style: index === 0 ? "primary" : "secondary",
+    color: index === 0 ? "#174B3A" : undefined,
+    height: "sm",
+    margin: index === 0 ? "lg" : "sm",
+    action: {
+      type: "postback",
+      label: option.label,
+      data: panelPostback(productUrl, seconds, option.focus, title),
+      displayText: option.label,
+    },
+  }));
+
+  return {
+    type: "flex",
+    altText: `請選擇「${title}」的拍攝重點`,
+    contents: {
+      type: "bubble",
+      size: "mega",
+      header: {
+        type: "box",
+        layout: "vertical",
+        backgroundColor: "#174B3A",
+        paddingAll: "20px",
+        contents: [
+          { type: "text", text: `${seconds} 秒腳本`, color: "#D9F46B", weight: "bold", size: "sm" },
+          { type: "text", text: "選擇拍攝重點", color: "#FFFFFF", weight: "bold", size: "xl", margin: "sm" },
+        ],
+      },
+      body: {
+        type: "box",
+        layout: "vertical",
+        paddingAll: "20px",
+        contents: [
+          { type: "text", text: title, weight: "bold", size: "md", wrap: true, maxLines: 2 },
+          { type: "text", text: "不指定時，AI 會依商品名稱自動選擇。", color: "#718078", size: "sm", wrap: true, margin: "sm" },
+          ...buttons,
+        ],
+      },
+    },
+  };
+}
+
+function formatLineScript(script) {
+  const sections = (script.segments || []).map((segment, index) =>
+    `${index + 1}｜${segment.time}｜${segment.title}\n${segment.voice}`
+  );
+  const direction = script.direction ? `\n拍攝重點：${script.direction}` : "";
+  const source = script.pageContentRead === true
+    ? "📄 已讀取商品頁內容"
+    : script.pageContentRead === false ? "⚠️ 商品頁無法讀取，本次僅依商品名稱生成" : "";
+  return [
+    `🎬 ${script.productName}`,
+    source,
+    `⏱ ${script.totalSeconds} 秒${direction}`,
+    "",
+    ...sections,
+  ].filter(Boolean).join("\n\n").slice(0, 4900);
+}
+
+function base64Bytes(value) {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function verifyLineSignature(rawBody, signature, channelSecret) {
+  if (!signature || !channelSecret) return false;
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(channelSecret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    return crypto.subtle.verify("HMAC", key, base64Bytes(signature), encoder.encode(rawBody));
+  } catch {
+    return false;
+  }
+}
+
+async function replyLine(replyToken, messageOrMessages, env) {
+  const messages = Array.isArray(messageOrMessages)
+    ? messageOrMessages
+    : [{ type: "text", text: String(messageOrMessages).slice(0, 5000) }];
+  const response = await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ replyToken, messages }),
+  });
+  if (!response.ok) console.error("LINE reply error", response.status, await response.text());
+}
+
+function isGroupSource(source) {
+  return source?.type === "group" || source?.type === "room";
+}
+
+function isSelfMentioned(message) {
+  return (message?.mention?.mentionees || []).some((mentionee) =>
+    mentionee.type === "user" && mentionee.isSelf === true
+  );
+}
+
+function removeLineMentions(text, mention) {
+  let cleaned = String(text || "");
+  const ranges = (mention?.mentionees || [])
+    .filter((mentionee) => Number.isInteger(mentionee.index) && Number.isInteger(mentionee.length))
+    .sort((a, b) => b.index - a.index);
+  for (const range of ranges) {
+    cleaned = `${cleaned.slice(0, range.index)} ${cleaned.slice(range.index + range.length)}`;
+  }
+  return cleaned.replace(/\s+/g, " ").trim();
+}
+
+function isLineHelpCommand(text) {
+  return /^(?:使用方法|使用說明|如何使用|怎麼用|說明|help)$/iu.test(String(text || "").trim());
+}
+
+function lineHelpText() {
+  return [
+    "📖 文案小幫手指令說明",
+    "",
+    "【查看說明】",
+    "@文案小幫手",
+    "顯示這份完整指令清單。",
+    "",
+    "【單支商品文案】",
+    "群組：@文案小幫手 後，10 秒內貼蝦皮連結；也可以在同一則訊息直接 @並貼連結。",
+    "私訊：直接貼蝦皮連結。",
+    "功能：產生 40 秒標準版文案，拍攝重點由 AI 自動判斷。",
+    "",
+    "【廣告影片排程】",
+    "所有群組與私訊共用同一份待拍、已拍完清單。",
+    "廣告影片排程＋商品連結",
+    "一次新增一個或多個蝦皮商品到待拍清單。",
+    "",
+    "要拍什麼",
+    "列出目前所有待拍商品與編號。",
+    "",
+    "1、2、3…",
+    "直接讀取該編號已儲存的商品網址並產生文案，不必重貼連結。",
+    "",
+    "完成1、完成2…",
+    "把待拍清單中的該編號移到已拍完。",
+    "",
+    "已拍完",
+    "列出完成時間、拍攝員工、商品與已拍完編號。",
+    "",
+    "取消完成1、取消完成2…",
+    "依照『已拍完』清單編號，將誤標完成的商品退回待拍清單。",
+    "",
+    "排程相關指令不需要 @文案小幫手。",
+  ].join("\n");
+}
+
+function parseLineFollowup(text) {
+  const match = String(text || "").trim().match(/^(?:約\s*)?(\d{2})(?:\s*秒)?(?:\s*[；;、,，:]?\s*(.*))?$/u);
+  if (!match) return null;
+  const seconds = Number.parseInt(match[1], 10);
+  if (seconds < 10 || seconds > 60) return null;
+  return { seconds, focus: String(match[2] || "").trim().slice(0, 300) };
+}
+
+function linePendingKey(event) {
+  const source = event?.source || {};
+  const chatId = source.groupId || source.roomId || source.userId || "unknown-chat";
+  const userId = source.userId || "unknown-user";
+  return `line-pending:${chatId}:${userId}`;
+}
+
+function lineActivationKey(event) {
+  const source = event?.source || {};
+  const chatId = source.groupId || source.roomId || "unknown-chat";
+  return `line-armed:${chatId}`;
+}
+
+export class LineActivation {
+  constructor(state, env) {
+    this.storage = state.storage;
+    this.env = env;
+    this.readerSocket = null;
+    this.readerHello = null;
+    this.readerPending = new Map();
+  }
+
+  readerAuthorized(request) {
+    const token = String(this.env.SHOPEE_READER_TOKEN || "");
+    return Boolean(token) && request.headers.get("Authorization") === `Bearer ${token}`;
+  }
+
+  clearReader(error = "SHOPEE_READER_DISCONNECTED") {
+    this.readerSocket = null;
+    this.readerHello = null;
+    for (const pending of this.readerPending.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve(Response.json({ ok: false, error }, { status: 503 }));
+    }
+    this.readerPending.clear();
+  }
+
+  acceptReader(request) {
+    if (!this.readerAuthorized(request)) return new Response("Unauthorized", { status: 401 });
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("WebSocket upgrade required", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.readerSocket?.close(1012, "Replaced by a new reader connection");
+    this.clearReader("SHOPEE_READER_REPLACED");
+    this.readerSocket = server;
+    server.accept();
+    server.addEventListener("message", (event) => this.handleReaderMessage(event));
+    server.addEventListener("close", () => this.clearReader());
+    server.addEventListener("error", () => this.clearReader());
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  handleReaderMessage(event) {
+    let message;
+    try {
+      message = JSON.parse(String(event.data || ""));
+    } catch {
+      return;
+    }
+    if (message?.type === "hello") {
+      this.readerHello = { receivedAt: Date.now(), browser: message.browser || null };
+      return;
+    }
+    if (!message?.id) return;
+    const pending = this.readerPending.get(message.id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.readerPending.delete(message.id);
+    pending.resolve(Response.json(message, { status: message.ok ? 200 : 503 }));
+  }
+
+  extractWithReader(request) {
+    if (!this.readerSocket || this.readerSocket.readyState !== WebSocket.OPEN) {
+      return Response.json({ ok: false, error: "SHOPEE_READER_OFFLINE" }, { status: 503 });
+    }
+    return request.json().then(({ url }) => {
+      const id = crypto.randomUUID();
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          this.readerPending.delete(id);
+          resolve(Response.json({ ok: false, error: "SHOPEE_READER_TIMEOUT" }, { status: 504 }));
+        }, 35000);
+        this.readerPending.set(id, { resolve, timer });
+        try {
+          this.readerSocket.send(JSON.stringify({ type: "extract", id, url }));
+        } catch {
+          clearTimeout(timer);
+          this.readerPending.delete(id);
+          resolve(Response.json({ ok: false, error: "SHOPEE_READER_SEND_FAILED" }, { status: 503 }));
+        }
+      });
+    });
+  }
+
+  async addScheduleItems(request) {
+    const body = await request.json();
+    const pendingValue = await this.storage.get("schedule-pending");
+    const pending = Array.isArray(pendingValue) ? pendingValue : [];
+    const existing = new Set(pending.map((item) => item.productUrl));
+    const added = [];
+    let duplicateCount = 0;
+    let fullCount = 0;
+    for (const rawItem of Array.isArray(body?.items) ? body.items.slice(0, 50) : []) {
+      const productUrl = String(rawItem?.productUrl || "").slice(0, 500);
+      const productName = String(rawItem?.productName || "蝦皮商品").replace(/\s+/g, " ").trim().slice(0, 160);
+      if (!productUrl) continue;
+      if (existing.has(productUrl)) {
+        duplicateCount += 1;
+        continue;
+      }
+      if (pending.length + added.length >= 100) {
+        fullCount += 1;
+        continue;
+      }
+      existing.add(productUrl);
+      added.push({
+        productUrl,
+        productName: productName || "蝦皮商品",
+        addedAt: Number(body?.addedAt) || Date.now(),
+        addedBy: String(body?.addedBy || "").slice(0, 120),
+      });
+    }
+    const updated = [...pending, ...added];
+    if (added.length) await this.storage.put("schedule-pending", updated);
+    return Response.json({ added, duplicateCount, fullCount, pendingCount: updated.length });
+  }
+
+  async listScheduleItems() {
+    const pending = await this.storage.get("schedule-pending");
+    const completed = await this.storage.get("schedule-completed");
+    return Response.json({
+      pending: Array.isArray(pending) ? pending : [],
+      completed: Array.isArray(completed) ? completed : [],
+    });
+  }
+
+  async importScheduleItems(request) {
+    const body = await request.json();
+    const sourceScope = String(body?.sourceScope || "").slice(0, 200);
+    const importedValue = await this.storage.get("schedule-imported-scopes");
+    const importedScopes = Array.isArray(importedValue) ? importedValue : [];
+    if (sourceScope && importedScopes.includes(sourceScope)) {
+      return Response.json({ imported: false, alreadyImported: true });
+    }
+
+    const pendingValue = await this.storage.get("schedule-pending");
+    const completedValue = await this.storage.get("schedule-completed");
+    const pending = Array.isArray(pendingValue) ? pendingValue : [];
+    const completed = Array.isArray(completedValue) ? completedValue : [];
+    const pendingUrls = new Set(pending.map((item) => item.productUrl));
+    let pendingImported = 0;
+    for (const item of Array.isArray(body?.pending) ? body.pending : []) {
+      const productUrl = String(item?.productUrl || "").slice(0, 500);
+      if (!productUrl || pendingUrls.has(productUrl) || pending.length >= 100) continue;
+      pendingUrls.add(productUrl);
+      pending.push({
+        productUrl,
+        productName: String(item?.productName || "蝦皮商品").slice(0, 160),
+        addedAt: Number(item?.addedAt) || Date.now(),
+        addedBy: String(item?.addedBy || "").slice(0, 120),
+      });
+      pendingImported += 1;
+    }
+
+    const completedKeys = new Set(completed.map((item) => `${item.productUrl}|${Number(item.completedAt) || 0}`));
+    let completedImported = 0;
+    for (const item of Array.isArray(body?.completed) ? body.completed : []) {
+      const productUrl = String(item?.productUrl || "").slice(0, 500);
+      const completedAt = Number(item?.completedAt) || 0;
+      const key = `${productUrl}|${completedAt}`;
+      if (!productUrl || completedKeys.has(key)) continue;
+      completedKeys.add(key);
+      completed.push({
+        ...item,
+        productUrl,
+        productName: String(item?.productName || "蝦皮商品").slice(0, 160),
+        completedAt: completedAt || Date.now(),
+        completedBy: String(item?.completedBy || "群組成員").slice(0, 120),
+        completedById: String(item?.completedById || "").slice(0, 80),
+      });
+      completedImported += 1;
+    }
+    completed.sort((a, b) => Number(b.completedAt) - Number(a.completedAt));
+
+    await this.storage.put("schedule-pending", pending);
+    await this.storage.put("schedule-completed", completed.slice(0, 200));
+    if (sourceScope) {
+      await this.storage.put("schedule-imported-scopes", [...importedScopes, sourceScope].slice(-1000));
+    }
+    return Response.json({ imported: true, alreadyImported: false, pendingImported, completedImported });
+  }
+
+  async getScheduleItem(request) {
+    const { index } = await request.json();
+    const pending = await this.storage.get("schedule-pending");
+    const items = Array.isArray(pending) ? pending : [];
+    const selectedIndex = Number.parseInt(index, 10) - 1;
+    return Response.json({
+      item: selectedIndex >= 0 && selectedIndex < items.length ? items[selectedIndex] : null,
+      pendingCount: items.length,
+    });
+  }
+
+  async completeScheduleItem(request) {
+    const body = await request.json();
+    const productUrl = String(body?.productUrl || "");
+    const pendingValue = await this.storage.get("schedule-pending");
+    const pending = Array.isArray(pendingValue) ? pendingValue : [];
+    const selectedIndex = pending.findIndex((item) => item.productUrl === productUrl);
+    if (selectedIndex < 0) {
+      return Response.json({ completed: null, pendingCount: pending.length, alreadyCompleted: true });
+    }
+    const [selected] = pending.splice(selectedIndex, 1);
+    const completedValue = await this.storage.get("schedule-completed");
+    const completed = Array.isArray(completedValue) ? completedValue : [];
+    const record = {
+      ...selected,
+      productName: String(body?.productName || selected.productName || "蝦皮商品").slice(0, 160),
+      completedAt: Number(body?.completedAt) || Date.now(),
+      completedBy: String(body?.completedBy || "群組成員").slice(0, 120),
+      completedById: String(body?.completedById || "").slice(0, 80),
+    };
+    await this.storage.put("schedule-pending", pending);
+    await this.storage.put("schedule-completed", [record, ...completed].slice(0, 200));
+    return Response.json({ completed: record, pendingCount: pending.length, alreadyCompleted: false });
+  }
+
+  async reopenScheduleItem(request) {
+    const { index } = await request.json();
+    const pendingValue = await this.storage.get("schedule-pending");
+    const completedValue = await this.storage.get("schedule-completed");
+    const pending = Array.isArray(pendingValue) ? pendingValue : [];
+    const completed = Array.isArray(completedValue) ? completedValue : [];
+    const selectedIndex = Number.parseInt(index, 10) - 1;
+    if (selectedIndex < 0 || selectedIndex >= completed.length) {
+      return Response.json({
+        restored: null,
+        pendingCount: pending.length,
+        completedCount: completed.length,
+        full: false,
+      });
+    }
+
+    const selected = completed[selectedIndex];
+    const alreadyPending = pending.some((item) => item.productUrl === selected.productUrl);
+    if (!alreadyPending && pending.length >= 100) {
+      return Response.json({
+        restored: null,
+        pendingCount: pending.length,
+        completedCount: completed.length,
+        full: true,
+      });
+    }
+
+    completed.splice(selectedIndex, 1);
+    const restored = {
+      productUrl: selected.productUrl,
+      productName: selected.productName || "蝦皮商品",
+      addedAt: Date.now(),
+      addedBy: selected.completedById || selected.addedBy || "",
+    };
+    if (!alreadyPending) pending.push(restored);
+    await this.storage.put("schedule-pending", pending);
+    await this.storage.put("schedule-completed", completed);
+    return Response.json({
+      restored,
+      pendingCount: pending.length,
+      completedCount: completed.length,
+      alreadyPending,
+      full: false,
+    });
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/reader/connect" && request.method === "GET") {
+      return this.acceptReader(request);
+    }
+    if (url.pathname === "/reader/status" && request.method === "GET") {
+      if (!this.readerAuthorized(request)) return new Response("Unauthorized", { status: 401 });
+      return Response.json({
+        connected: Boolean(this.readerSocket && this.readerSocket.readyState === WebSocket.OPEN),
+        hello: this.readerHello,
+      });
+    }
+    if (url.pathname === "/extract" && request.method === "POST") {
+      return this.extractWithReader(request);
+    }
+    if (url.pathname === "/schedule/add" && request.method === "POST") {
+      return this.addScheduleItems(request);
+    }
+    if (url.pathname === "/schedule/list" && request.method === "POST") {
+      return this.listScheduleItems();
+    }
+    if (url.pathname === "/schedule/import" && request.method === "POST") {
+      return this.importScheduleItems(request);
+    }
+    if (url.pathname === "/schedule/get" && request.method === "POST") {
+      return this.getScheduleItem(request);
+    }
+    if (url.pathname === "/schedule/complete" && request.method === "POST") {
+      return this.completeScheduleItem(request);
+    }
+    if (url.pathname === "/schedule/reopen" && request.method === "POST") {
+      return this.reopenScheduleItem(request);
+    }
+    if (url.pathname === "/arm" && request.method === "POST") {
+      const { armedAt } = await request.json();
+      await this.storage.put("armedAt", Number(armedAt));
+      return Response.json({ armed: true });
+    }
+    if (url.pathname === "/take" && request.method === "POST") {
+      const { now } = await request.json();
+      const armedAt = await this.storage.get("armedAt");
+      await this.storage.delete("armedAt");
+      const elapsed = Number(now) - Number(armedAt);
+      return Response.json({ valid: Boolean(armedAt) && elapsed >= 0 && elapsed <= 10000 });
+    }
+    return new Response("Not found", { status: 404 });
+  }
+}
+
+async function durableLineActivation(event, env, action, timestamp) {
+  if (!env.LINE_ACTIVATION) return null;
+  try {
+    const id = env.LINE_ACTIVATION.idFromName(lineActivationKey(event));
+    const stub = env.LINE_ACTIVATION.get(id);
+    const response = await stub.fetch(`https://line-activation/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(action === "arm" ? { armedAt: timestamp } : { now: timestamp }),
+    });
+    if (!response.ok) return null;
+    return response.json();
+  } catch (error) {
+    console.error("LINE activation Durable Object error", error?.message || error);
+    return null;
+  }
+}
+
+async function armLineGroup(event, env) {
+  const key = lineActivationKey(event);
+  const armedAt = Number(event.timestamp) || Date.now();
+  const durable = await durableLineActivation(event, env, "arm", armedAt);
+  if (durable?.armed) {
+    console.log("LINE_ARM", JSON.stringify({ storage: "durable", armed: true }));
+    return true;
+  }
+  lineActivations.set(key, armedAt);
+  if (lineActivations.size > 1000) {
+    for (const [activationKey, timestamp] of lineActivations) {
+      if (armedAt - timestamp > 60000) lineActivations.delete(activationKey);
+    }
+  }
+  if (env.LINE_PENDING) {
+    await env.LINE_PENDING.put(
+      key,
+      JSON.stringify({ armedAt }),
+      { expirationTtl: 60 },
+    );
+  }
+  console.log("LINE_ARM", JSON.stringify({ storage: env.LINE_PENDING ? "memory+kv" : "memory", armed: true }));
+  return true;
+}
+
+async function takeLineGroupActivation(event, env) {
+  const key = lineActivationKey(event);
+  const now = Number(event.timestamp) || Date.now();
+  const durable = await durableLineActivation(event, env, "take", now);
+  if (typeof durable?.valid === "boolean") {
+    console.log("LINE_GATE", JSON.stringify({ storage: "durable", valid: durable.valid }));
+    return durable.valid;
+  }
+  const memoryArmedAt = lineActivations.get(key);
+  lineActivations.delete(key);
+  if (memoryArmedAt) {
+    if (env.LINE_PENDING) await env.LINE_PENDING.delete(key);
+    const elapsed = now - Number(memoryArmedAt);
+    const valid = elapsed >= 0 && elapsed <= 10000;
+    console.log("LINE_GATE", JSON.stringify({ storage: "memory", valid, elapsed }));
+    return valid;
+  }
+  if (!env.LINE_PENDING) return false;
+  const value = await env.LINE_PENDING.get(key, "json");
+  await env.LINE_PENDING.delete(key);
+  if (!value?.armedAt) return false;
+  const elapsed = now - Number(value.armedAt);
+  const valid = elapsed >= 0 && elapsed <= 10000;
+  console.log("LINE_GATE", JSON.stringify({ storage: "kv", valid, elapsed }));
+  return valid;
+}
+
+async function savePendingLineProduct(event, productUrl, productName, env) {
+  if (!env.LINE_PENDING) return false;
+  await env.LINE_PENDING.put(
+    linePendingKey(event),
+    JSON.stringify({ productUrl, productName, savedAt: Date.now() }),
+    { expirationTtl: 600 },
+  );
+  return true;
+}
+
+async function takePendingLineProduct(event, env) {
+  if (!env.LINE_PENDING) return null;
+  const key = linePendingKey(event);
+  const value = await env.LINE_PENDING.get(key, "json");
+  if (!value?.productUrl) return null;
+  await env.LINE_PENDING.delete(key);
+  return value;
+}
+
+function lineScheduleScope(event) {
+  const source = event?.source || {};
+  return source.groupId || source.roomId || source.userId || "unknown-chat";
+}
+
+function lineScheduleStub(env, name) {
+  const id = env.LINE_ACTIVATION.idFromName(name);
+  return env.LINE_ACTIVATION.get(id);
+}
+
+async function migrateLegacyLineSchedule(event, env, globalStub) {
+  const legacyScope = lineScheduleScope(event);
+  const legacyName = `line-schedule:${legacyScope}`;
+  if (legacyName === globalLineScheduleName) return;
+  try {
+    const legacyResponse = await lineScheduleStub(env, legacyName).fetch("https://line-schedule/schedule/list", {
+      method: "POST",
+    });
+    if (!legacyResponse.ok) return;
+    const legacy = await legacyResponse.json();
+    const importResponse = await globalStub.fetch("https://line-schedule/schedule/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceScope: legacyScope,
+        pending: legacy.pending || [],
+        completed: legacy.completed || [],
+      }),
+    });
+    if (!importResponse.ok) console.error("LINE schedule migration import failed", importResponse.status);
+  } catch (error) {
+    console.error("LINE schedule migration error", error?.message || error);
+  }
+}
+
+async function lineScheduleRequest(event, env, action, body = {}) {
+  if (!env.LINE_ACTIVATION) throw httpError("廣告影片排程儲存服務尚未設定", 503);
+  const stub = lineScheduleStub(env, globalLineScheduleName);
+  await migrateLegacyLineSchedule(event, env, stub);
+  const response = await stub.fetch(`https://line-schedule/schedule/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw httpError("廣告影片排程暫時無法使用", 503);
+  return response.json();
+}
+
+async function lineDisplayName(event, env) {
+  const source = event?.source || {};
+  const userId = String(source.userId || "");
+  if (!userId || !env.LINE_CHANNEL_ACCESS_TOKEN) return "群組成員";
+  let path = `/v2/bot/profile/${encodeURIComponent(userId)}`;
+  if (source.groupId) {
+    path = `/v2/bot/group/${encodeURIComponent(source.groupId)}/member/${encodeURIComponent(userId)}`;
+  } else if (source.roomId) {
+    path = `/v2/bot/room/${encodeURIComponent(source.roomId)}/member/${encodeURIComponent(userId)}`;
+  }
+  try {
+    const response = await fetch(`https://api.line.me${path}`, {
+      headers: { "Authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    });
+    if (!response.ok) return "群組成員";
+    const profile = await response.json();
+    return String(profile?.displayName || "群組成員").replace(/\s+/g, " ").trim().slice(0, 120) || "群組成員";
+  } catch {
+    return "群組成員";
+  }
+}
+
+async function addLineSchedule(event, text, env) {
+  const items = scheduleItemsFromText(text);
+  if (!items.length) {
+    await replyLine(event.replyToken, "請在「廣告影片排程」下方貼上至少一個蝦皮商品連結。", env);
+    return;
+  }
+  const result = await lineScheduleRequest(event, env, "add", {
+    items,
+    addedAt: Number(event.timestamp) || Date.now(),
+    addedBy: event.source?.userId || "",
+  });
+  const notes = [`📥 已新增 ${result.added?.length || 0} 項廣告影片排程。`];
+  if (result.duplicateCount) notes.push(`略過 ${result.duplicateCount} 個重複商品。`);
+  if (result.fullCount) notes.push(`另有 ${result.fullCount} 項因待拍清單已滿而未加入。`);
+  notes.push(`目前共有 ${result.pendingCount || 0} 項待拍。`, "輸入「要拍什麼」即可查看清單。");
+  await replyLine(event.replyToken, notes.join("\n"), env);
+}
+
+async function replyLineScheduleList(event, env, completed = false) {
+  const result = await lineScheduleRequest(event, env, "list");
+  const items = completed ? result.completed || [] : result.pending || [];
+  const text = completed ? formatCompletedSchedule(items) : formatPendingSchedule(items);
+  await replyLine(event.replyToken, splitLineText(text), env);
+}
+
+async function generateScheduledLineScript(event, index, env) {
+  const selection = await lineScheduleRequest(event, env, "get", { index });
+  if (!selection.item) {
+    const message = selection.pendingCount
+      ? `請輸入 1～${selection.pendingCount} 之間的待拍編號。`
+      : "這個聊天室目前沒有待拍項目，請先輸入「要拍什麼」確認清單。";
+    await replyLine(event.replyToken, message, env);
+    return;
+  }
+
+  const userKey = event.source?.userId || lineScheduleScope(event);
+  if (!allowRequest(`line:${userKey}`)) {
+    await replyLine(event.replyToken, "這個小時產生的腳本較多，請稍後再試。", env);
+    return;
+  }
+
+  try {
+    const script = await generateScript({
+      productUrl: selection.item.productUrl,
+      productName: selection.item.productName,
+      seconds: 40,
+      focus: "",
+    }, env);
+    await replyLine(event.replyToken, [
+      { type: "text", text: formatLineScript(script) },
+      { type: "text", text: `拍攝完成後，請輸入「完成${index}」。`.slice(0, 5000) },
+    ], env);
+  } catch (error) {
+    console.error("LINE scheduled generation error", error?.message || error);
+    await replyLine(event.replyToken, `目前無法產生排程腳本：${error?.message || "請稍後再試"}\n不需要再貼網址，請稍後重新輸入編號。`, env);
+  }
+}
+
+async function completeLineScheduleItem(event, index, env) {
+  const selection = await lineScheduleRequest(event, env, "get", { index });
+  if (!selection.item) {
+    const message = selection.pendingCount
+      ? `請輸入 1～${selection.pendingCount} 之間的待拍編號。`
+      : "目前沒有待拍項目。";
+    await replyLine(event.replyToken, message, env);
+    return;
+  }
+
+  const completedBy = await lineDisplayName(event, env);
+  const result = await lineScheduleRequest(event, env, "complete", {
+    productUrl: selection.item.productUrl,
+    productName: selection.item.productName,
+    completedAt: Date.now(),
+    completedBy,
+    completedById: event.source?.userId || "",
+  });
+  const message = result.alreadyCompleted
+    ? "ℹ️ 這項排程已由其他員工完成，請輸入「要拍什麼」更新清單。"
+    : `✅ 已完成：${result.completed?.productName || selection.item.productName}\n若標錯，輸入「已拍完」查看編號，再輸入「取消完成1」。`;
+  await replyLine(event.replyToken, message, env);
+}
+
+async function reopenLineScheduleItem(event, index, env) {
+  const result = await lineScheduleRequest(event, env, "reopen", { index });
+  if (result.full) {
+    await replyLine(event.replyToken, "待拍清單已滿，暫時無法取消完成。", env);
+    return;
+  }
+  if (!result.restored) {
+    const message = result.completedCount
+      ? `請輸入 1～${result.completedCount} 之間的已拍完編號。`
+      : "目前沒有可以取消的已拍完項目。";
+    await replyLine(event.replyToken, message, env);
+    return;
+  }
+  const note = result.alreadyPending ? "（待拍清單中已經有同一商品，因此沒有重複新增）" : "";
+  await replyLine(
+    event.replyToken,
+    `↩️ 已取消完成：${result.restored.productName}\n商品已回到待拍清單。${note}`,
+    env,
+  );
+}
+
+async function processLineEvent(event, env) {
+  if (!event.replyToken) return;
+
+  if (event.type === "postback") {
+    const params = new URLSearchParams(event.postback?.data || "");
+    const action = params.get("action");
+    if (action !== "generate" && action !== "choose_focus") return;
+    const productUrl = findShopeeUrl(params.get("url") || "");
+    if (!productUrl) {
+      await replyLine(event.replyToken, "商品連結已失效，請重新貼上蝦皮商品連結。", env);
+      return;
+    }
+    if (action === "choose_focus") {
+      const seconds = Number.parseInt(params.get("seconds"), 10) || 40;
+      const title = String(params.get("title") || "蝦皮商品").slice(0, 500);
+      await replyLine(event.replyToken, [createLineFocusPanel(productUrl, title, seconds)], env);
+      return;
+    }
+    return generateLineScript(event, {
+      productUrl,
+      productName: String(params.get("title") || "").slice(0, 500),
+      seconds: Number.parseInt(params.get("seconds"), 10) || 40,
+      focus: String(params.get("focus") || "").slice(0, 300),
+    }, env);
+  }
+
+  if (event.type !== "message" || event.message?.type !== "text") return;
+
+  const text = removeLineMentions(event.message.text || "", event.message.mention);
+  const productUrl = findShopeeUrl(text);
+  const groupMessage = isGroupSource(event.source);
+  const mentioned = isSelfMentioned(event.message);
+  console.log("LINE_EVENT", JSON.stringify({
+    sourceType: event.source?.type || "unknown",
+    hasUserId: Boolean(event.source?.userId),
+    mentioned,
+    containsShopee: /shopee/iu.test(text),
+    productUrlDetected: Boolean(productUrl),
+    textLength: text.length,
+  }));
+
+  if (isScheduleAddCommand(text)) {
+    try {
+      await addLineSchedule(event, text, env);
+    } catch (error) {
+      console.error("LINE schedule add error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法儲存廣告影片排程：${error?.message || "請稍後再試"}`, env);
+    }
+    return;
+  }
+
+  if (isPendingScheduleCommand(text) || isCompletedScheduleCommand(text)) {
+    try {
+      await replyLineScheduleList(event, env, isCompletedScheduleCommand(text));
+    } catch (error) {
+      console.error("LINE schedule list error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法讀取廣告影片排程：${error?.message || "請稍後再試"}`, env);
+    }
+    return;
+  }
+
+  const undoCompletedIndex = parseScheduleUndoCompletion(text);
+  if (undoCompletedIndex) {
+    try {
+      await reopenLineScheduleItem(event, undoCompletedIndex, env);
+    } catch (error) {
+      console.error("LINE schedule reopen error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法取消完成：${error?.message || "請稍後再試"}`, env);
+    }
+    return;
+  }
+
+  const completedIndex = parseScheduleCompletion(text);
+  if (completedIndex) {
+    try {
+      await completeLineScheduleItem(event, completedIndex, env);
+    } catch (error) {
+      console.error("LINE schedule complete error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法完成這筆排程：${error?.message || "請稍後再試"}`, env);
+    }
+    return;
+  }
+
+  const scheduleIndex = parseScheduleSelection(text);
+  if (scheduleIndex) {
+    try {
+      await generateScheduledLineScript(event, scheduleIndex, env);
+    } catch (error) {
+      console.error("LINE schedule selection error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法讀取這筆待拍排程：${error?.message || "請稍後再試"}`, env);
+    }
+    return;
+  }
+
+  const mentionOnly = groupMessage && mentioned && !text;
+  if ((isLineHelpCommand(text) && (!groupMessage || mentioned)) || mentionOnly) {
+    if (mentionOnly) await armLineGroup(event, env);
+    await replyLine(
+      event.replyToken,
+      lineHelpText(),
+      env,
+    );
+    return;
+  }
+
+  if (!productUrl) {
+    const followup = parseLineFollowup(text);
+    if (followup) {
+      const pending = await takePendingLineProduct(event, env);
+      if (pending) {
+        return generateLineScript(event, {
+          productUrl: pending.productUrl,
+          productName: pending.productName,
+          seconds: followup.seconds,
+          focus: followup.focus,
+        }, env);
+      }
+    }
+
+    if (groupMessage) {
+      if (!mentioned) {
+        if (/https?:\/\/|shopee/iu.test(text) && await takeLineGroupActivation(event, env)) {
+          await replyLine(event.replyToken, "我收到訊息了，但無法辨識其中的蝦皮商品連結。請重新複製完整商品網址再試一次。", env);
+        }
+        return;
+      }
+      const armed = await armLineGroup(event, env);
+      await replyLine(
+        event.replyToken,
+        armed ? "已準備好，請在 10 秒內貼上蝦皮商品連結。" : "請直接在同一則訊息中 @我 並貼上蝦皮商品連結。",
+        env,
+      );
+      return;
+    }
+  }
+
+  if (!productUrl) {
+    await replyLine(
+      event.replyToken,
+      "請貼上蝦皮商品連結。收到後會直接產生 40 秒標準版腳本，拍攝重點由 AI 自動判斷。",
+      env,
+    );
+    return;
+  }
+
+  if (groupMessage && !mentioned) {
+    const activated = await takeLineGroupActivation(event, env);
+    if (!activated) return;
+  }
+
+  const input = lineInput(text, productUrl);
+  return generateLineScript(event, input, env);
+}
+
+async function generateLineScript(event, input, env) {
+  const userKey = event.source?.userId || event.source?.groupId || event.source?.roomId || "unknown";
+  if (!allowRequest(`line:${userKey}`)) {
+    await replyLine(event.replyToken, "這個小時產生的腳本較多，請稍後再試。", env);
+    return;
+  }
+
+  try {
+    const script = await generateScript(input, env);
+    await replyLine(event.replyToken, formatLineScript(script), env);
+  } catch (error) {
+    console.error("LINE generation error", error?.message || error);
+    await replyLine(event.replyToken, `目前無法產生腳本：${error?.message || "請稍後再試"}`, env);
+  }
+}
+
+async function handleLineWebhook(request, env, context) {
+  if (!env.LINE_CHANNEL_SECRET || !env.LINE_CHANNEL_ACCESS_TOKEN) {
+    return new Response("LINE integration is not configured", { status: 503 });
+  }
+
+  const rawBody = await request.text();
+  const valid = await verifyLineSignature(rawBody, request.headers.get("x-line-signature"), env.LINE_CHANNEL_SECRET);
+  if (!valid) return new Response("Invalid signature", { status: 401 });
+
+  let body;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+
+  const work = Promise.all((body.events || []).map((event) => processLineEvent(event, env)));
+  if (context?.waitUntil) context.waitUntil(work);
+  else await work;
+  return new Response("OK", { status: 200 });
+}
+
+export {
+  canonicalShopeeUrl,
+  createLineFocusPanel,
+  createLinePanel,
+  extractShopeePageContent,
+  fetchShopeePageContent,
+  findShopeeUrl,
+  findShopeeUrls,
+  formatCompletedSchedule,
+  formatLineScript,
+  formatPendingSchedule,
+  isGroupSource,
+  isLineHelpCommand,
+  isScheduleAddCommand,
+  isSelfMentioned,
+  lineHelpText,
+  lineInput,
+  lineActivationKey,
+  linePendingKey,
+  panelPostback,
+  parseLineFollowup,
+  parseScheduleCompletion,
+  parseScheduleSelection,
+  parseScheduleUndoCompletion,
+  processLineEvent,
+  productTitle,
+  removeLineMentions,
+  scheduleItemsFromText,
+  splitLineText,
+  armLineGroup,
+  takeLineGroupActivation,
+  verifyLineSignature,
+};
+
+export default {
+  async fetch(request, env, context) {
+    const url = new URL(request.url);
+    const origin = request.headers.get("Origin") || "";
+
+    if (url.pathname === "/reader/connect" || url.pathname === "/reader/status") {
+      if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const path = url.pathname === "/reader/connect" ? "/reader/connect" : "/reader/status";
+      return readerBrokerStub(env).fetch(`https://shopee-reader${path}`, request);
+    }
+
+    if (url.pathname === "/line/webhook") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      return handleLineWebhook(request, env, context);
+    }
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(origin) });
+    }
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, origin);
+    if (origin && !allowedOrigins.has(origin)) return json({ error: "不允許的網站來源" }, 403, origin);
+
+    const clientKey = request.headers.get("CF-Connecting-IP") || "local";
+    if (!allowRequest(`web:${clientKey}`)) return json({ error: "今日使用次數較多，請稍後再試" }, 429, origin);
+
+    try {
+      const script = await generateScript(await request.json(), env);
+      return json({ script }, 200, origin);
+    } catch (error) {
+      return json({ error: error?.message || "無法產生腳本" }, error?.status || 400, origin);
+    }
+  },
+};

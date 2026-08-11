@@ -1,0 +1,6 @@
+.config/
+.dev.vars
+.wrangler/
+node_modules/
+*.log
+*.local

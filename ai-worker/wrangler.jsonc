@@ -1,0 +1,44 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "shopee-video-script-ai",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-14",
+  "secrets": {
+    "required": [
+      "OPENAI_API_KEY",
+      "LINE_CHANNEL_SECRET",
+      "LINE_CHANNEL_ACCESS_TOKEN",
+      "SHOPEE_READER_TOKEN"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "LINE_PENDING",
+      "id": "e700b5845ec540868f0fa735c61e1c18"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LINE_ACTIVATION",
+        "class_name": "LineActivation"
+      }
+    ]
+  },
+  "exports": {
+    "LineActivation": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
