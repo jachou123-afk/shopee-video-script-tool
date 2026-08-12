@@ -644,6 +644,14 @@ function isLineHelpCommand(text) {
   return /^(?:使用方法|使用說明|如何使用|怎麼用|說明|help)$/iu.test(String(text || "").trim());
 }
 
+function parseWarehouseLocationCommand(text) {
+  const normalized = normalizeScheduleDigits(text).trim();
+  const match = normalized.match(/^儲位\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/iu);
+  if (!match) return null;
+  const sku = String(match[1] || "").replace(/[，,。；;]+$/u, "").trim().toUpperCase();
+  return sku && sku.length <= 80 ? sku : null;
+}
+
 function lineHelpText() {
   return [
     "📖 文案小幫手指令說明",
@@ -677,8 +685,75 @@ function lineHelpText() {
     "取消完成1、取消完成2…",
     "依照『已拍完』清單編號，將誤標完成的商品退回待拍清單。",
     "",
+    "【查詢 ERP 主倉儲位】",
+    "儲位＋貨號",
+    "例如：儲位 A12345",
+    "回覆商品名稱、主倉儲位與主倉可用庫存。",
+    "",
     "排程相關指令不需要 @文案小幫手。",
+    "儲位查詢也不需要 @文案小幫手。",
   ].join("\n");
+}
+
+function normalizeWarehouseLocationItem(rawItem) {
+  const sku = String(rawItem?.sku || "").replace(/\s+/g, "").trim().toUpperCase().slice(0, 80);
+  if (!sku) return null;
+  const variants = [];
+  for (const rawVariant of Array.isArray(rawItem?.variants) ? rawItem.variants.slice(0, 120) : []) {
+    const location = String(rawVariant?.location || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    const style = String(rawVariant?.style || "").replace(/\s+/g, " ").trim().slice(0, 100);
+    const size = String(rawVariant?.size || "").replace(/\s+/g, " ").trim().slice(0, 100);
+    const barcode = String(rawVariant?.barcode || "").replace(/\s+/g, "").trim().slice(0, 100);
+    variants.push({
+      location,
+      style,
+      size,
+      barcode,
+      available: Math.trunc(Number(rawVariant?.available) || 0),
+    });
+  }
+  return {
+    sku,
+    name: String(rawItem?.name || "ERP 商品").replace(/\s+/g, " ").trim().slice(0, 200) || "ERP 商品",
+    available: Math.trunc(Number(rawItem?.available) || 0),
+    variants,
+  };
+}
+
+function warehouseLocationBucket(sku, bucketCount = 64) {
+  let hash = 2166136261;
+  for (const char of String(sku || "")) {
+    hash ^= char.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % bucketCount;
+}
+
+function formatWarehouseLocation(item, metadata = {}) {
+  if (!item) {
+    const updated = metadata.updatedAt ? `\n儲位資料更新：${formatTaipeiDate(Date.parse(metadata.updatedAt))}` : "";
+    return `🔎 ERP 主倉查無此貨號。\n請確認貨號是否完整，例如：儲位 A12345${updated}`;
+  }
+  const lines = [
+    `📦 ${item.sku}｜${item.name}`,
+    `主倉可用庫存：${Number(item.available) || 0}`,
+    "儲位：",
+  ];
+  const variants = Array.isArray(item.variants) ? item.variants : [];
+  const located = variants.filter((variant) => String(variant.location || "").trim());
+  if (!located.length) {
+    lines.push("尚未設定儲位");
+  } else {
+    const shown = located.slice(0, 40);
+    for (const variant of shown) {
+      const specification = [variant.style, variant.size].filter(Boolean).join("／");
+      const prefix = specification ? `${specification}：` : "";
+      lines.push(`- ${prefix}${variant.location}（可用 ${Number(variant.available) || 0}）`);
+    }
+    if (located.length > shown.length) lines.push(`另有 ${located.length - shown.length} 筆規格未列出。`);
+  }
+  if (metadata.updatedAt) lines.push(`更新：${formatTaipeiDate(Date.parse(metadata.updatedAt))}`);
+  return lines.join("\n");
 }
 
 function parseLineFollowup(text) {
@@ -965,6 +1040,66 @@ export class LineActivation {
     });
   }
 
+  async syncWarehouseLocations(request) {
+    const body = await request.json();
+    if (!Array.isArray(body?.items) || !body.items.length) {
+      return Response.json({ ok: false, error: "EMPTY_LOCATION_DATA" }, { status: 400 });
+    }
+    const bucketCount = 64;
+    const buckets = Array.from({ length: bucketCount }, () => ({}));
+    let itemCount = 0;
+    for (const rawItem of body.items.slice(0, 20000)) {
+      const item = normalizeWarehouseLocationItem(rawItem);
+      if (!item) continue;
+      buckets[warehouseLocationBucket(item.sku, bucketCount)][item.sku] = item;
+      itemCount += 1;
+    }
+    if (!itemCount) {
+      return Response.json({ ok: false, error: "EMPTY_LOCATION_DATA" }, { status: 400 });
+    }
+
+    const previous = await this.storage.get("warehouse-location-active");
+    const version = crypto.randomUUID();
+    for (let index = 0; index < bucketCount; index += 1) {
+      await this.storage.put(`warehouse-location:${version}:${index}`, buckets[index]);
+    }
+    const metadata = {
+      version,
+      bucketCount,
+      itemCount,
+      warehouseId: Number(body?.warehouseId) || 1,
+      warehouseName: String(body?.warehouseName || "主倉").slice(0, 80),
+      updatedAt: String(body?.updatedAt || new Date().toISOString()).slice(0, 80),
+    };
+    await this.storage.put("warehouse-location-active", metadata);
+
+    if (previous?.version && previous.version !== version) {
+      const previousCount = Math.min(256, Math.max(1, Number(previous.bucketCount) || bucketCount));
+      for (let index = 0; index < previousCount; index += 1) {
+        await this.storage.delete(`warehouse-location:${previous.version}:${index}`);
+      }
+    }
+    return Response.json({ ok: true, itemCount, updatedAt: metadata.updatedAt });
+  }
+
+  async queryWarehouseLocation(request) {
+    const { sku: rawSku } = await request.json();
+    const sku = String(rawSku || "").replace(/\s+/g, "").trim().toUpperCase().slice(0, 80);
+    const metadata = await this.storage.get("warehouse-location-active");
+    if (!metadata?.version || !sku) {
+      return Response.json({ ok: true, item: null, metadata: metadata || null });
+    }
+    const bucketCount = Math.min(256, Math.max(1, Number(metadata.bucketCount) || 64));
+    const bucket = await this.storage.get(
+      `warehouse-location:${metadata.version}:${warehouseLocationBucket(sku, bucketCount)}`,
+    );
+    return Response.json({
+      ok: true,
+      item: bucket && typeof bucket === "object" ? bucket[sku] || null : null,
+      metadata,
+    });
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/reader/connect" && request.method === "GET") {
@@ -997,6 +1132,12 @@ export class LineActivation {
     }
     if (url.pathname === "/schedule/reopen" && request.method === "POST") {
       return this.reopenScheduleItem(request);
+    }
+    if (url.pathname === "/warehouse-locations/sync" && request.method === "POST") {
+      return this.syncWarehouseLocations(request);
+    }
+    if (url.pathname === "/warehouse-locations/query" && request.method === "POST") {
+      return this.queryWarehouseLocation(request);
     }
     if (url.pathname === "/arm" && request.method === "POST") {
       const { armedAt } = await request.json();
@@ -1149,6 +1290,31 @@ async function lineScheduleRequest(event, env, action, body = {}) {
   });
   if (!response.ok) throw httpError("廣告影片排程暫時無法使用", 503);
   return response.json();
+}
+
+async function warehouseLocationRequest(env, sku) {
+  if (!env.LINE_ACTIVATION) throw httpError("ERP 儲位查詢服務尚未設定", 503);
+  const stub = lineScheduleStub(env, globalLineScheduleName);
+  const response = await stub.fetch("https://line-schedule/warehouse-locations/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sku }),
+  });
+  if (!response.ok) throw httpError("ERP 儲位查詢暫時無法使用", 503);
+  return response.json();
+}
+
+async function replyWarehouseLocation(event, sku, env) {
+  try {
+    const result = await warehouseLocationRequest(env, sku);
+    const text = result?.metadata
+      ? formatWarehouseLocation(result.item, result.metadata)
+      : "ERP 主倉儲位資料尚未完成第一次同步，請稍後再試。";
+    await replyLine(event.replyToken, text, env);
+  } catch (error) {
+    console.error("LINE warehouse location error", error?.message || error);
+    await replyLine(event.replyToken, `目前無法查詢 ERP 儲位：${error?.message || "請稍後再試"}`, env);
+  }
 }
 
 async function lineDisplayName(event, env) {
@@ -1337,6 +1503,16 @@ async function processLineEvent(event, env) {
     return;
   }
 
+  const warehouseSku = parseWarehouseLocationCommand(text);
+  if (warehouseSku) {
+    await replyWarehouseLocation(event, warehouseSku, env);
+    return;
+  }
+  if (/^儲位\s*(?:[+＋:：]\s*)?$/u.test(text)) {
+    await replyLine(event.replyToken, "請在『儲位』後面加上貨號，例如：儲位 A12345", env);
+    return;
+  }
+
   const undoCompletedIndex = parseScheduleUndoCompletion(text);
   if (undoCompletedIndex) {
     try {
@@ -1468,6 +1644,19 @@ async function handleLineWebhook(request, env, context) {
   return new Response("OK", { status: 200 });
 }
 
+async function handleWarehouseLocationPush(request, env) {
+  const expected = String(env.ERP_SYNC_TOKEN || "");
+  const supplied = String(request.headers.get("X-Erp-Sync-Token") || "");
+  if (!expected || supplied !== expected) return new Response("Unauthorized", { status: 401 });
+  if (!env.LINE_ACTIVATION) return Response.json({ ok: false, error: "STORAGE_NOT_CONFIGURED" }, { status: 503 });
+  const stub = lineScheduleStub(env, globalLineScheduleName);
+  return stub.fetch("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: await request.text(),
+  });
+}
+
 export {
   canonicalShopeeUrl,
   createLineFocusPanel,
@@ -1489,6 +1678,7 @@ export {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseWarehouseLocationCommand,
   parseScheduleCompletion,
   parseScheduleSelection,
   parseScheduleUndoCompletion,
@@ -1497,6 +1687,8 @@ export {
   removeLineMentions,
   scheduleItemsFromText,
   splitLineText,
+  formatWarehouseLocation,
+  warehouseLocationBucket,
   armLineGroup,
   takeLineGroupActivation,
   verifyLineSignature,
@@ -1516,6 +1708,11 @@ export default {
     if (url.pathname === "/line/webhook") {
       if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
       return handleLineWebhook(request, env, context);
+    }
+
+    if (url.pathname === "/erp/locations/push") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      return handleWarehouseLocationPush(request, env);
     }
 
     if (request.method === "OPTIONS") {

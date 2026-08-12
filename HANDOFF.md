@@ -17,6 +17,7 @@
 - `完成2`: move pending item 2 to completed.
 - `已拍完`: list completed details, employee, and completion time.
 - `取消完成1`: move completed item 1 back to pending.
+- `儲位 A12345`: return the ERP 主倉 location and available quantity for the item number; no mention is required.
 
 All groups and private chats share one global schedule. When an older chat first uses a schedule command, its previous per-chat records are merged into the global queue.
 
@@ -29,3 +30,5 @@ All groups and private chats share one global schedule. When an older chat first
 5. Deploy from `ai-worker` with `wrangler deploy`.
 
 Required Worker secrets are listed in `ai-worker/wrangler.jsonc`. Secret values, NAS browser state, logs, and local Wrangler caches are not stored in GitHub.
+
+The separate NAS ERP project downloads both `InventoryId=-1` (不分倉, used by the existing calculations) and `InventoryId=1` (主倉, used for `倉庫儲位`) during one authenticated run. It retains the previous Worker snapshot whenever the main-warehouse export or location push fails.

@@ -12,6 +12,7 @@ import {
   formatCompletedSchedule,
   formatLineScript,
   formatPendingSchedule,
+  formatWarehouseLocation,
   isGroupSource,
   isLineHelpCommand,
   isScheduleAddCommand,
@@ -23,6 +24,7 @@ import {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseWarehouseLocationCommand,
   parseScheduleCompletion,
   parseScheduleSelection,
   parseScheduleUndoCompletion,
@@ -33,6 +35,7 @@ import {
   splitLineText,
   takeLineGroupActivation,
   verifyLineSignature,
+  warehouseLocationBucket,
 } from "../src/index.js";
 
 test("findShopeeUrl accepts full and short Shopee URLs", () => {
@@ -72,6 +75,32 @@ test("schedule commands and numeric selections are recognized", () => {
   assert.equal(parseScheduleCompletion("完成第 ２ 號"), 2);
   assert.equal(parseScheduleUndoCompletion("取消完成1"), 1);
   assert.equal(parseScheduleUndoCompletion("取消完成第２號"), 2);
+});
+
+test("warehouse location command accepts common LINE input forms", () => {
+  assert.equal(parseWarehouseLocationCommand("儲位 A12345"), "A12345");
+  assert.equal(parseWarehouseLocationCommand("儲位+A12345"), "A12345");
+  assert.equal(parseWarehouseLocationCommand("儲位：a-123"), "A-123");
+  assert.equal(parseWarehouseLocationCommand("儲位"), null);
+  assert.equal(parseWarehouseLocationCommand("查儲位 A12345"), null);
+});
+
+test("warehouse location formatter shows variants and missing locations", () => {
+  const text = formatWarehouseLocation({
+    sku: "A12345",
+    name: "測試商品",
+    available: 8,
+    variants: [
+      { location: "A區-01", style: "紅色", size: "大", available: 5 },
+      { location: "B區-02", style: "藍色", size: "", available: 3 },
+    ],
+  }, { updatedAt: "2026-08-12T14:30:00+08:00" });
+  assert.match(text, /A12345｜測試商品/);
+  assert.match(text, /主倉可用庫存：8/);
+  assert.match(text, /紅色／大：A區-01/);
+  assert.match(text, /更新：2026\/08\/12/);
+  assert.match(formatWarehouseLocation({ sku: "B1", name: "無儲位", available: 0, variants: [] }), /尚未設定儲位/);
+  assert.equal(warehouseLocationBucket("A12345"), warehouseLocationBucket("A12345"));
 });
 
 test("schedule list formatters include pending and completed details", () => {
@@ -418,7 +447,7 @@ test("LINE help command recognizes simple usage requests", () => {
   assert.equal(isLineHelpCommand("help"), true);
   assert.equal(isLineHelpCommand("我要買東西"), false);
   const help = lineHelpText();
-  for (const command of ["廣告影片排程", "要拍什麼", "完成1", "已拍完", "取消完成1"]) {
+  for (const command of ["廣告影片排程", "要拍什麼", "完成1", "已拍完", "取消完成1", "儲位＋貨號"]) {
     assert.match(help, new RegExp(command));
   }
   assert.match(help, /不必重貼連結/);
@@ -601,6 +630,111 @@ test("LineActivation stores pending schedules and keeps completed history", asyn
   data = await response.json();
   assert.deepEqual(data.pending.map((item) => item.productName), ["商品 B", "商品 A 完整名稱"]);
   assert.deepEqual(data.completed, []);
+});
+
+test("LineActivation atomically publishes and queries ERP warehouse locations", async () => {
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+
+  let response = await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: "2026-08-12T14:30:00+08:00",
+      warehouseId: 1,
+      warehouseName: "主倉",
+      items: [{
+        sku: "a12345",
+        name: "測試商品",
+        available: 8,
+        variants: [{ location: "A區-01", style: "紅色", size: "大", barcode: "4711", available: 8 }],
+      }],
+    }),
+  }));
+  let data = await response.json();
+  assert.equal(data.ok, true);
+  assert.equal(data.itemCount, 1);
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query", {
+    method: "POST",
+    body: JSON.stringify({ sku: "A12345" }),
+  }));
+  data = await response.json();
+  assert.equal(data.item.sku, "A12345");
+  assert.equal(data.item.variants[0].location, "A區-01");
+  assert.equal(data.metadata.warehouseName, "主倉");
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({ items: [] }),
+  }));
+  assert.equal(response.status, 400);
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query", {
+    method: "POST",
+    body: JSON.stringify({ sku: "A12345" }),
+  }));
+  data = await response.json();
+  assert.equal(data.item.name, "測試商品");
+});
+
+test("group users can query a warehouse location without mentioning the bot", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: "2026-08-12T14:30:00+08:00",
+      items: [{
+        sku: "A12345",
+        name: "測試商品",
+        available: 8,
+        variants: [{ location: "A區-01", style: "", size: "", available: 8 }],
+      }],
+    }),
+  }));
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${input}`);
+  };
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() {
+        return { fetch(input, init) { return object.fetch(new Request(input, init)); } };
+      },
+    },
+  };
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "warehouse-query",
+      timestamp: Date.now(),
+      source: { type: "group", groupId: "g1", userId: "u1" },
+      message: { type: "text", text: "儲位 A12345" },
+    }, env);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].messages[0].text, /A12345｜測試商品/);
+  assert.match(replies[0].messages[0].text, /A區-01/);
 });
 
 test("formatLineScript creates a readable LINE reply", () => {
