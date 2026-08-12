@@ -84,6 +84,10 @@ test("warehouse location command accepts common LINE input forms", () => {
   assert.equal(parseWarehouseLocationCommand("儲位 A12345"), "A12345");
   assert.equal(parseWarehouseLocationCommand("儲位+A12345"), "A12345");
   assert.equal(parseWarehouseLocationCommand("儲位：a-123"), "A-123");
+  assert.equal(parseWarehouseLocationCommand("A725"), "A725");
+  assert.equal(parseWarehouseLocationCommand("p063"), "P063");
+  assert.equal(parseWarehouseLocationCommand("1"), null);
+  assert.equal(parseWarehouseLocationCommand("要拍什麼"), null);
   assert.equal(parseWarehouseLocationCommand("儲位"), null);
   assert.equal(parseWarehouseLocationCommand("查儲位 A12345"), null);
 });
@@ -478,7 +482,7 @@ test("LINE help command recognizes simple usage requests", () => {
   assert.equal(isLineHelpCommand("help"), true);
   assert.equal(isLineHelpCommand("我要買東西"), false);
   const help = lineHelpText();
-  for (const command of ["廣告影片排程", "要拍什麼", "完成1", "已拍完", "取消完成1", "儲位＋貨號"]) {
+  for (const command of ["廣告影片排程", "要拍什麼", "完成1", "已拍完", "取消完成1", "直接輸入貨號"]) {
     assert.match(help, new RegExp(command));
   }
   assert.match(help, /不必重貼連結/);
@@ -758,7 +762,7 @@ test("group users can query a warehouse location without mentioning the bot", as
       replyToken: "warehouse-query",
       timestamp: Date.now(),
       source: { type: "group", groupId: "g1", userId: "u1" },
-      message: { type: "text", text: "儲位 A12345" },
+      message: { type: "text", text: "A12345" },
     }, env);
   } finally {
     globalThis.fetch = originalFetch;

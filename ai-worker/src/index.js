@@ -703,10 +703,15 @@ function isLineHelpCommand(text) {
 
 function parseWarehouseLocationCommand(text) {
   const normalized = normalizeScheduleDigits(text).trim();
-  const match = normalized.match(/^儲位\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/iu);
-  if (!match) return null;
-  const sku = String(match[1] || "").replace(/[，,。；;]+$/u, "").trim().toUpperCase();
-  return sku && sku.length <= 80 ? sku : null;
+  const prefixed = normalized.match(/^儲位\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/iu);
+  if (prefixed) {
+    const sku = String(prefixed[1] || "").replace(/[，,。；;]+$/u, "").trim().toUpperCase();
+    return sku && sku.length <= 80 ? sku : null;
+  }
+
+  const sku = normalized.toUpperCase();
+  const isBareSku = /^(?=[A-Z0-9._-]{2,80}$)(?=[A-Z0-9._-]*[A-Z])(?=[A-Z0-9._-]*\d)[A-Z0-9._-]+$/u.test(sku);
+  return isBareSku ? sku : null;
 }
 
 function lineHelpText() {
@@ -743,8 +748,8 @@ function lineHelpText() {
     "依照『已拍完』清單編號，將誤標完成的商品退回待拍清單。",
     "",
     "【查詢 ERP 主倉儲位】",
-    "儲位＋貨號",
-    "例如：儲位 A12345",
+    "直接輸入貨號，例如：A12345",
+    "原本的「儲位 A12345」也可以使用。",
     "回覆商品名稱、主倉儲位與主倉可用庫存。",
     "",
     "排程相關指令不需要 @文案小幫手。",
@@ -789,7 +794,7 @@ function warehouseLocationBucket(sku, bucketCount = 64) {
 function formatWarehouseLocation(item, metadata = {}) {
   if (!item) {
     const updated = metadata.updatedAt ? `\n儲位資料更新：${formatTaipeiDate(Date.parse(metadata.updatedAt))}` : "";
-    return `🔎 ERP 主倉查無此貨號。\n請確認貨號是否完整，例如：儲位 A12345${updated}`;
+    return `🔎 ERP 主倉查無此貨號。\n請確認貨號是否完整，例如：A12345${updated}`;
   }
   const lines = [
     `📦 ${item.sku}｜${item.name}`,
