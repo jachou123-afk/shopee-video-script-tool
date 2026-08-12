@@ -31,6 +31,25 @@ function httpError(message, status = 400) {
   return Object.assign(new Error(message), { status });
 }
 
+async function withAbortTimeout(task, timeoutMs, message = "處理逾時") {
+  const controller = new AbortController();
+  const timeoutError = httpError(message, 504);
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => task(controller.signal)),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort(timeoutError);
+          reject(timeoutError);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function cleanShopeeUrl(raw) {
   const candidate = String(raw || "").trim().split(/\s+/)[0].replace(/[)\]}>，。！？、]+$/u, "");
   const url = new URL(candidate);
@@ -38,7 +57,7 @@ function cleanShopeeUrl(raw) {
   return url;
 }
 
-async function resolveShopeeUrl(raw) {
+async function resolveShopeeUrl(raw, signal) {
   const url = cleanShopeeUrl(raw);
   if (url.hostname.toLowerCase() !== "s.shopee.tw") return url.toString();
 
@@ -47,11 +66,13 @@ async function resolveShopeeUrl(raw) {
       method: "HEAD",
       redirect: "follow",
       headers: { "User-Agent": "Mozilla/5.0" },
+      signal,
     });
     const resolved = cleanShopeeUrl(response.url);
     response.body?.cancel();
     return resolved.toString();
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return url.toString();
   }
 }
@@ -128,11 +149,12 @@ function readerBrokerStub(env) {
   return env.LINE_ACTIVATION.get(id);
 }
 
-async function fetchFromNasReader(productUrl, env) {
+async function fetchFromNasReader(productUrl, env, signal) {
   const response = await readerBrokerStub(env).fetch("https://shopee-reader/extract", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url: productUrl }),
+    signal,
   });
   let result = null;
   try {
@@ -145,8 +167,11 @@ async function fetchFromNasReader(productUrl, env) {
   return normalizeReaderProduct(result.product);
 }
 
-async function fetchShopeePageContent(productUrl, env) {
+async function fetchShopeePageContent(productUrl, env, signal) {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abortFromParent();
+  else signal?.addEventListener("abort", abortFromParent, { once: true });
   const timeout = setTimeout(() => controller.abort(), 8000);
   let direct = { title: "", description: "", source: "" };
   try {
@@ -166,15 +191,18 @@ async function fetchShopeePageContent(productUrl, env) {
       console.log("SHOPEE_DIRECT_FETCH", JSON.stringify({ status: response.status }));
     }
   } catch (error) {
+    if (signal?.aborted) throw error;
     console.log("SHOPEE_DIRECT_FETCH", JSON.stringify({ error: error?.name || "fetch_failed" }));
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abortFromParent);
   }
 
   try {
-    const reader = await fetchFromNasReader(productUrl, env);
+    const reader = await fetchFromNasReader(productUrl, env, signal);
     if (reader.description.length >= 5) return reader;
   } catch (error) {
+    if (signal?.aborted) throw error;
     console.error("SHOPEE_NAS_READER", error?.message || error);
   }
 
@@ -287,11 +315,12 @@ const scriptSchema = {
   },
 };
 
-async function generateScript(body, env) {
+async function generateScript(body, env, options = {}) {
   if (!env.OPENAI_API_KEY) throw httpError("AI 服務尚未設定完成", 503);
 
-  const productUrl = await resolveShopeeUrl(String(body.productUrl || ""));
-  const pageContent = await fetchShopeePageContent(productUrl, env);
+  const signal = options?.signal;
+  const productUrl = await resolveShopeeUrl(String(body.productUrl || ""), signal);
+  const pageContent = await fetchShopeePageContent(productUrl, env, signal);
   const suppliedTitle = String(body.productName || body.title || "").replace(/\s+/g, " ").trim().slice(0, 500);
   const title = pageContent.title || suppliedTitle || productTitle(productUrl);
   const focus = String(body.focus || "").trim().slice(0, 300);
@@ -333,6 +362,7 @@ async function generateScript(body, env) {
         },
       },
     }),
+    signal,
   });
 
   const response = await openai.json();
@@ -1032,6 +1062,34 @@ export class LineActivation {
     });
   }
 
+  async acquireScheduleGeneration(request) {
+    const body = await request.json();
+    const key = "schedule-generation-lock";
+    const now = Date.now();
+    const current = await this.storage.get(key);
+    if (current?.expiresAt > now) {
+      return Response.json({
+        acquired: false,
+        retryAfterSeconds: Math.max(1, Math.ceil((current.expiresAt - now) / 1000)),
+      });
+    }
+    const token = crypto.randomUUID();
+    const ttlMs = Math.min(60000, Math.max(5000, Number(body?.ttlMs) || 30000));
+    await this.storage.put(key, { token, expiresAt: now + ttlMs });
+    return Response.json({ acquired: true, token });
+  }
+
+  async releaseScheduleGeneration(request) {
+    const body = await request.json();
+    const key = "schedule-generation-lock";
+    const current = await this.storage.get(key);
+    if (current?.token && current.token === String(body?.token || "")) {
+      await this.storage.delete(key);
+      return Response.json({ released: true });
+    }
+    return Response.json({ released: false });
+  }
+
   async completeScheduleItem(request) {
     const body = await request.json();
     const productUrl = String(body?.productUrl || "");
@@ -1188,6 +1246,12 @@ export class LineActivation {
     }
     if (url.pathname === "/schedule/get" && request.method === "POST") {
       return this.getScheduleItem(request);
+    }
+    if (url.pathname === "/schedule/generation-acquire" && request.method === "POST") {
+      return this.acquireScheduleGeneration(request);
+    }
+    if (url.pathname === "/schedule/generation-release" && request.method === "POST") {
+      return this.releaseScheduleGeneration(request);
     }
     if (url.pathname === "/schedule/complete" && request.method === "POST") {
       return this.completeScheduleItem(request);
@@ -1354,6 +1418,36 @@ async function lineScheduleRequest(event, env, action, body = {}) {
   return response.json();
 }
 
+async function acquireLineScheduleGeneration(env) {
+  if (!env.LINE_ACTIVATION) throw httpError("廣告影片排程儲存服務尚未設定", 503);
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/schedule/generation-acquire",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ttlMs: 30000 }),
+    },
+  );
+  if (!response.ok) throw httpError("文案產生鎖定服務暫時無法使用", 503);
+  return response.json();
+}
+
+async function releaseLineScheduleGeneration(env, token) {
+  if (!env.LINE_ACTIVATION || !token) return;
+  try {
+    await lineScheduleStub(env, globalLineScheduleName).fetch(
+      "https://line-schedule/schedule/generation-release",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      },
+    );
+  } catch (error) {
+    console.error("LINE schedule generation release error", error?.message || error);
+  }
+}
+
 async function warehouseLocationRequest(env, sku) {
   if (!env.LINE_ACTIVATION) throw httpError("ERP 儲位查詢服務尚未設定", 503);
   const stub = lineScheduleStub(env, globalLineScheduleName);
@@ -1443,20 +1537,39 @@ async function generateScheduledLineScript(event, index, env) {
     return;
   }
 
+  const lock = await acquireLineScheduleGeneration(env);
+  if (!lock.acquired) {
+    await replyLine(
+      event.replyToken,
+      `上一支文案正在產生中，請等它回覆後再輸入編號（約 ${lock.retryAfterSeconds || 1} 秒）。`,
+      env,
+    );
+    return;
+  }
+
   try {
-    const script = await generateScript({
-      productUrl: selection.item.productUrl,
-      productName: selection.item.productName,
-      seconds: 40,
-      focus: "",
-    }, env);
+    const script = await withAbortTimeout(
+      (signal) => generateScript({
+        productUrl: selection.item.productUrl,
+        productName: selection.item.productName,
+        seconds: 40,
+        focus: "",
+      }, env, { signal }),
+      24000,
+      "商品內容讀取或 AI 產生時間較長",
+    );
     await replyLine(event.replyToken, [
       { type: "text", text: formatLineScript(script) },
       { type: "text", text: `拍攝完成後，請輸入「完成${index}」。`.slice(0, 5000) },
     ], env);
   } catch (error) {
     console.error("LINE scheduled generation error", error?.message || error);
-    await replyLine(event.replyToken, `目前無法產生排程腳本：${error?.message || "請稍後再試"}\n不需要再貼網址，請稍後重新輸入編號。`, env);
+    const retryHint = error?.status === 504
+      ? "請等 10 秒後重新輸入同一個編號。"
+      : "不需要再貼網址，請稍後重新輸入編號。";
+    await replyLine(event.replyToken, `目前無法產生排程腳本：${error?.message || "請稍後再試"}\n${retryHint}`, env);
+  } finally {
+    await releaseLineScheduleGeneration(env, lock.token);
   }
 }
 
@@ -1755,6 +1868,7 @@ export {
   splitLineText,
   formatWarehouseLocation,
   warehouseLocationBucket,
+  withAbortTimeout,
   armLineGroup,
   takeLineGroupActivation,
   verifyLineSignature,

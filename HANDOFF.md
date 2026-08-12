@@ -4,10 +4,10 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `51484200-513e-448f-a5b9-340fd34d7995`
+- Worker version at handoff: `bf2e9e4f-092f-407e-a789-30c6877f6443`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader runs separately on the NAS. Its login session and token are intentionally not committed.
-- Validation status: all 37 Worker tests pass.
+- Validation status: all 38 Worker tests pass.
 
 ## LINE workflow
 
@@ -27,9 +27,9 @@ Pending and completed schedule lists extract the Shopee product ID from `/produc
 
 The pure-profit lookup uses the `PROFIT_DASHBOARD_BYPASS_TOKEN` Cloudflare Worker secret. The value is intentionally not committed. Lookup failures fall back to the original product name so schedule listing remains available.
 
-## Known LINE group check
+## LINE schedule generation concurrency
 
-The group `長頸鹿之拜託別再包錯了` was reported as not responding. During the diagnostic window, the Worker did not receive a `LINE_EVENT`, so the command parser was not the failing layer. Confirm that `廣告文案小幫手` remains in the group's member list and that the group does not already contain another LINE Official Account. `要拍什麼` and direct SKU queries do not require an @ mention.
+Sending two schedule numbers almost simultaneously previously overloaded the single authenticated NAS browser. Reproduction showed one request taking 36.8 seconds and returning 503 while another took 28.3 seconds, exceeding or approaching Cloudflare's 30-second `waitUntil()` window. Production now uses a Durable Object generation lock: one schedule script runs at a time, a concurrent number receives an immediate busy reply, and a 24-second abort deadline returns a retry message instead of silently losing the LINE reply.
 
 ## Continue from another computer
 
@@ -41,10 +41,6 @@ The group `長頸鹿之拜託別再包錯了` was reported as not responding. Du
 
 Required Worker secrets are listed in `ai-worker/wrangler.jsonc`. Secret values, NAS browser state, logs, and local Wrangler caches are not stored in GitHub.
 
-Latest handoff commits on `agent/line-schedule-handoff`:
-
-- `a6dddad Allow direct SKU warehouse lookup`
-- `3868f6f Show product SKUs in LINE shooting schedule`
-- `177fa4c Add ERP warehouse location lookup`
+Recent handoff changes on `agent/line-schedule-handoff` include LINE generation concurrency protection, direct SKU warehouse lookup, pure-profit SKU labels, and ERP main-warehouse location sync.
 
 The separate NAS ERP project downloads both `InventoryId=-1` (不分倉, used by the existing calculations) and `InventoryId=1` (主倉, used for `倉庫儲位`) during one authenticated run. It retains the previous Worker snapshot whenever the main-warehouse export or location push fails.

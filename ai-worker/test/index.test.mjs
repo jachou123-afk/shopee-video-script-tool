@@ -39,7 +39,22 @@ import {
   takeLineGroupActivation,
   verifyLineSignature,
   warehouseLocationBucket,
+  withAbortTimeout,
 } from "../src/index.js";
+
+test("withAbortTimeout stops slow background work before the LINE reply window closes", async () => {
+  let aborted = false;
+  await assert.rejects(
+    withAbortTimeout((signal) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }), 5, "排程處理逾時"),
+    /排程處理逾時/,
+  );
+  assert.equal(aborted, true);
+});
 
 test("findShopeeUrl accepts full and short Shopee URLs", () => {
   assert.equal(findShopeeUrl("幫我做 https://shopee.tw/商品名稱-i.1.2 30 秒"), "https://shopee.tw/%E5%95%86%E5%93%81%E5%90%8D%E7%A8%B1-i.1.2");
@@ -632,6 +647,32 @@ test("LineActivation stores pending schedules and keeps completed history", asyn
   }));
   data = await response.json();
   assert.equal(data.item.productName, "商品 A");
+
+  response = await object.fetch(new Request("https://line-schedule/schedule/generation-acquire", {
+    method: "POST",
+    body: JSON.stringify({ ttlMs: 30000 }),
+  }));
+  const firstLock = await response.json();
+  assert.equal(firstLock.acquired, true);
+  assert.ok(firstLock.token);
+
+  response = await object.fetch(new Request("https://line-schedule/schedule/generation-acquire", {
+    method: "POST",
+    body: JSON.stringify({ ttlMs: 30000 }),
+  }));
+  assert.equal((await response.json()).acquired, false);
+
+  response = await object.fetch(new Request("https://line-schedule/schedule/generation-release", {
+    method: "POST",
+    body: JSON.stringify({ token: firstLock.token }),
+  }));
+  assert.equal((await response.json()).released, true);
+
+  response = await object.fetch(new Request("https://line-schedule/schedule/generation-acquire", {
+    method: "POST",
+    body: JSON.stringify({ ttlMs: 30000 }),
+  }));
+  assert.equal((await response.json()).acquired, true);
 
   response = await object.fetch(new Request("https://line-schedule/schedule/complete", {
     method: "POST",
