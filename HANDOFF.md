@@ -36,7 +36,9 @@ Sending two schedule numbers almost simultaneously previously overloaded the sin
 - Worker version `9f027c84-c0a8-41d3-ad4a-8344c661bdf5` sends `reasoning: { effort: "none" }` to `gpt-5.6-luna`, while retaining the same structured 40-second script schema and full-product-content requirement.
 - A production request after the Worker change completed successfully with `pageContentRead: true` in 27.76 seconds. This showed that the remaining bottleneck was primarily the NAS browser path.
 - `nas-shopee-reader/src/browser.mjs` now checks a six-hour in-memory product cache, then calls Shopee's authenticated product API through the already-open control page, and opens a full product page only as a fallback.
-- The NAS fast-path source is tested and committed here but was not yet deployed at this handoff because NAS SSH port 22 was closed. Enable temporary root SSH, copy the project to `/volume1/docker/shopee-reader` without overwriting its `.env` or `data/profile`, rebuild the container, then benchmark a first and repeated request.
+- The NAS fast path was deployed on 2026-08-12. The host source and running container both had SHA-256 `aa7e0733d92545546a4cb47033690d077dcf029d2bae5945aaad4b7204939ad8`; `.env` and `data/profile` were preserved. Because rebuilding the full Playwright base image exceeded ten minutes on the NAS, production uses a safe incremental image layer based on the existing image. A future normal full build from the committed source will contain the same code.
+- Production benchmarks after deployment all returned HTTP 200 with `pageContentRead: true`: 7.17 seconds for the first request, 5.43 seconds for the repeated cached request, and 5.50 seconds for a different uncached product. Before the NAS fast path, the same workflow took 27.76 seconds.
+- The pre-deployment reader source is retained on the NAS as `src/browser.mjs.bak-20260812-173917`. The temporary root SSH key and temporary build context were removed after verification.
 
 ## Continue from another computer
 
