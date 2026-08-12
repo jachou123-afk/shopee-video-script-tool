@@ -198,12 +198,14 @@ test("lineInput defaults a bare product link to 40 seconds with AI-selected focu
 test("processLineEvent generates the default script immediately for a bare product link", async () => {
   const originalFetch = globalThis.fetch;
   const lineRequests = [];
+  let openAiPayload = null;
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
     if (url.startsWith("https://shopee.tw/")) {
       return new Response('<meta property="og:title" content="透明收納袋 | 蝦皮購物"><meta property="og:description" content="透明袋身，方便辨識內容物">');
     }
     if (url === "https://api.openai.com/v1/responses") {
+      openAiPayload = JSON.parse(init.body);
       return Response.json({
         output_text: JSON.stringify({
           productName: "透明收納袋",
@@ -244,6 +246,7 @@ test("processLineEvent generates the default script immediately for a bare produ
   assert.equal(lineRequests[0].messages[0].type, "text");
   assert.match(lineRequests[0].messages[0].text, /40 秒/);
   assert.doesNotMatch(lineRequests[0].messages[0].text, /選擇腳本版本|請回覆：秒數/);
+  assert.deepEqual(openAiPayload.reasoning, { effort: "none" });
 });
 
 test("LINE schedule selection reuses the stored URL and supports complete plus undo", async () => {

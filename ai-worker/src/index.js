@@ -350,6 +350,7 @@ async function generateScript(body, env, options = {}) {
     },
     body: JSON.stringify({
       model: "gpt-5.6-luna",
+      reasoning: { effort: "none" },
       instructions: "你是台灣電商短影片導演，專門把商品資料轉成能直接照著拍的短腳本。",
       input: prompt,
       max_output_tokens: 1000,

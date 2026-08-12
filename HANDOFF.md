@@ -4,10 +4,10 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `bf2e9e4f-092f-407e-a789-30c6877f6443`
+- Worker version at handoff: `9f027c84-c0a8-41d3-ad4a-8344c661bdf5`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
-- The authenticated Shopee reader runs separately on the NAS. Its login session and token are intentionally not committed.
-- Validation status: all 38 Worker tests pass.
+- The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
+- Validation status: all 38 Worker tests and all 5 NAS reader tests pass.
 
 ## LINE workflow
 
@@ -31,13 +31,21 @@ The pure-profit lookup uses the `PROFIT_DASHBOARD_BYPASS_TOKEN` Cloudflare Worke
 
 Sending two schedule numbers almost simultaneously previously overloaded the single authenticated NAS browser. Reproduction showed one request taking 36.8 seconds and returning 503 while another took 28.3 seconds, exceeding or approaching Cloudflare's 30-second `waitUntil()` window. Production now uses a Durable Object generation lock: one schedule script runs at a time, a concurrent number receives an immediate busy reply, and a 24-second abort deadline returns a retry message instead of silently losing the LINE reply.
 
+## Script-generation latency
+
+- Worker version `9f027c84-c0a8-41d3-ad4a-8344c661bdf5` sends `reasoning: { effort: "none" }` to `gpt-5.6-luna`, while retaining the same structured 40-second script schema and full-product-content requirement.
+- A production request after the Worker change completed successfully with `pageContentRead: true` in 27.76 seconds. This showed that the remaining bottleneck was primarily the NAS browser path.
+- `nas-shopee-reader/src/browser.mjs` now checks a six-hour in-memory product cache, then calls Shopee's authenticated product API through the already-open control page, and opens a full product page only as a fallback.
+- The NAS fast-path source is tested and committed here but was not yet deployed at this handoff because NAS SSH port 22 was closed. Enable temporary root SSH, copy the project to `/volume1/docker/shopee-reader` without overwriting its `.env` or `data/profile`, rebuild the container, then benchmark a first and repeated request.
+
 ## Continue from another computer
 
 1. Clone this repository.
 2. Install Node.js 22 or newer and Wrangler.
 3. Run `node --test ai-worker/test/index.test.mjs`.
-4. Authenticate with `wrangler login`.
-5. Deploy from `ai-worker` with `wrangler deploy`.
+4. Run `node --test nas-shopee-reader/test/shopee.test.mjs`.
+5. Authenticate with `wrangler login`.
+6. Deploy from `ai-worker` with `wrangler deploy`.
 
 Required Worker secrets are listed in `ai-worker/wrangler.jsonc`. Secret values, NAS browser state, logs, and local Wrangler caches are not stored in GitHub.
 
