@@ -5,6 +5,7 @@ import {
   canonicalShopeeUrl,
   createLineFocusPanel,
   createLinePanel,
+  enrichScheduleItemsWithProfitSkus,
   extractShopeePageContent,
   fetchShopeePageContent,
   findShopeeUrl,
@@ -30,8 +31,10 @@ import {
   parseScheduleUndoCompletion,
   processLineEvent,
   productTitle,
+  profitSkuMapFromDashboard,
   removeLineMentions,
   scheduleItemsFromText,
+  shopeeProductId,
   splitLineText,
   takeLineGroupActivation,
   verifyLineSignature,
@@ -105,21 +108,49 @@ test("warehouse location formatter shows variants and missing locations", () => 
 
 test("schedule list formatters include pending and completed details", () => {
   const pending = formatPendingSchedule([{
+    skuLabel: "A725",
     productName: "太陽能階梯燈",
     productUrl: "https://shopee.tw/product/1/2",
   }]);
   assert.match(pending, /待拍廣告影片（共 1 項）/);
-  assert.match(pending, /1\. 太陽能階梯燈/);
+  assert.match(pending, /1\. 【A725】太陽能階梯燈/);
 
   const completed = formatCompletedSchedule([{
+    skuLabel: "A725",
     productName: "太陽能階梯燈",
     productUrl: "https://shopee.tw/product/1/2",
     completedAt: Date.UTC(2026, 7, 11, 9, 30),
     completedBy: "小明",
   }]);
   assert.match(completed, /已拍完（共 1 項）/);
+  assert.match(completed, /【A725】太陽能階梯燈/);
   assert.match(completed, /拍攝員工：小明/);
   assert.match(completed, /2026\/08\/11/);
+});
+
+test("Shopee product IDs map to pure-profit SKU labels", async () => {
+  assert.equal(shopeeProductId("https://shopee.tw/product/52793230/27127565611"), "27127565611");
+  assert.equal(shopeeProductId("https://shopee.tw/水垢魔力擦-i.52793230.27127565611"), "27127565611");
+  const mapping = profitSkuMapFromDashboard({
+    current: { products: [{ pid: "27127565611", skuLabel: "A725" }] },
+  });
+  assert.equal(mapping.get("27127565611"), "A725");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    assert.equal(String(input), "https://vicchou-profit-analysis.vicchou.chatgpt.site/api/dashboard-data");
+    assert.equal(init.headers["OAI-Sites-Authorization"], "Bearer test-bypass");
+    return Response.json({ current: { products: [{ pid: "27127565611", skuLabel: "A725" }] } });
+  };
+  try {
+    const [item] = await enrichScheduleItemsWithProfitSkus([{
+      productName: "水垢魔力擦",
+      productUrl: "https://shopee.tw/product/52793230/27127565611",
+    }], { PROFIT_DASHBOARD_BYPASS_TOKEN: "test-bypass" });
+    assert.equal(item.skuLabel, "A725");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("splitLineText keeps long schedule lists within LINE message limits", () => {

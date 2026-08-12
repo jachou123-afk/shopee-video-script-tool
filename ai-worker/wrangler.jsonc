@@ -9,7 +9,8 @@
       "LINE_CHANNEL_SECRET",
       "LINE_CHANNEL_ACCESS_TOKEN",
       "SHOPEE_READER_TOKEN",
-      "ERP_SYNC_TOKEN"
+      "ERP_SYNC_TOKEN",
+      "PROFIT_DASHBOARD_BYPASS_TOKEN"
     ]
   },
   "observability": {

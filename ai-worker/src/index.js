@@ -8,6 +8,7 @@ const usage = new Map();
 const lineActivations = new Map();
 const encoder = new TextEncoder();
 const globalLineScheduleName = "line-schedule:global-v1";
+const profitDashboardDataUrl = "https://vicchou-profit-analysis.vicchou.chatgpt.site/api/dashboard-data";
 
 function corsHeaders(origin) {
   return {
@@ -186,6 +187,54 @@ function canonicalShopeeUrl(raw) {
   const legacyPath = decodeURIComponent(url.pathname).match(/-i\.(\d+)\.(\d+)/i);
   const ids = productPath || legacyPath;
   return ids ? `https://shopee.tw/product/${ids[1]}/${ids[2]}` : url.toString();
+}
+
+function shopeeProductId(raw) {
+  try {
+    const url = cleanShopeeUrl(raw);
+    const productPath = url.pathname.match(/^\/product\/\d+\/(\d+)/i);
+    const legacyPath = decodeURIComponent(url.pathname).match(/-i\.\d+\.(\d+)/i);
+    return String((productPath || legacyPath)?.[1] || "");
+  } catch {
+    return "";
+  }
+}
+
+function profitSkuMapFromDashboard(data) {
+  const products = Array.isArray(data?.current?.products) ? data.current.products : [];
+  const mapping = new Map();
+  for (const product of products) {
+    const productId = String(product?.pid || "").trim();
+    const skuLabel = String(product?.skuLabel || "").replace(/\s+/g, " ").trim().slice(0, 100);
+    if (productId && skuLabel) mapping.set(productId, skuLabel);
+  }
+  return mapping;
+}
+
+async function enrichScheduleItemsWithProfitSkus(items, env) {
+  const normalized = (Array.isArray(items) ? items : []).map((item) => ({ ...item }));
+  const bypassToken = String(env?.PROFIT_DASHBOARD_BYPASS_TOKEN || "").trim();
+  if (!normalized.length || !bypassToken) return normalized;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+  try {
+    const response = await fetch(profitDashboardDataUrl, {
+      headers: { "OAI-Sites-Authorization": `Bearer ${bypassToken}` },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    const mapping = profitSkuMapFromDashboard(await response.json());
+    return normalized.map((item) => ({
+      ...item,
+      skuLabel: mapping.get(shopeeProductId(item.productUrl)) || String(item.skuLabel || "").trim(),
+    }));
+  } catch (error) {
+    console.error("PROFIT_SKU_LOOKUP", error?.message || error);
+    return normalized;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function allowRequest(key) {
@@ -404,11 +453,19 @@ function splitLineText(text, maxLength = 4500, maxMessages = 5) {
   return chunks.map((chunk) => ({ type: "text", text: chunk }));
 }
 
+function formatScheduleProductName(item) {
+  const productName = String(item?.productName || "蝦皮商品").replace(/\s+/g, " ").trim() || "蝦皮商品";
+  const skuLabel = String(item?.skuLabel || "").replace(/\s+/g, " ").trim();
+  return skuLabel && !productName.startsWith(`【${skuLabel}】`)
+    ? `【${skuLabel}】${productName}`
+    : productName;
+}
+
 function formatPendingSchedule(items) {
   if (!items.length) return "🎬 目前沒有待拍的廣告影片。";
   const lines = [`🎬 全域待拍廣告影片（共 ${items.length} 項）`, ""];
   items.forEach((item, index) => {
-    lines.push(`${index + 1}. ${item.productName || "蝦皮商品"}`);
+    lines.push(`${index + 1}. ${formatScheduleProductName(item)}`);
     lines.push(`   ${item.productUrl}`);
   });
   lines.push("", "請回覆編號產生文案，例如：1", "拍攝完成後輸入「完成1」。");
@@ -419,7 +476,7 @@ function formatCompletedSchedule(items) {
   if (!items.length) return "✅ 目前還沒有已拍完的紀錄。";
   const lines = [`✅ 全域已拍完（共 ${items.length} 項）`, ""];
   items.forEach((item, index) => {
-    lines.push(`${index + 1}. ${item.productName || "蝦皮商品"}`);
+    lines.push(`${index + 1}. ${formatScheduleProductName(item)}`);
     lines.push(`   完成時間：${formatTaipeiDate(item.completedAt)}`);
     lines.push(`   拍攝員工：${item.completedBy || "群組成員"}`);
     lines.push(`   ${item.productUrl}`);
@@ -1359,7 +1416,8 @@ async function addLineSchedule(event, text, env) {
 
 async function replyLineScheduleList(event, env, completed = false) {
   const result = await lineScheduleRequest(event, env, "list");
-  const items = completed ? result.completed || [] : result.pending || [];
+  const storedItems = completed ? result.completed || [] : result.pending || [];
+  const items = await enrichScheduleItemsWithProfitSkus(storedItems, env);
   const text = completed ? formatCompletedSchedule(items) : formatPendingSchedule(items);
   await replyLine(event.replyToken, splitLineText(text), env);
 }
@@ -1662,6 +1720,7 @@ export {
   createLineFocusPanel,
   createLinePanel,
   extractShopeePageContent,
+  enrichScheduleItemsWithProfitSkus,
   fetchShopeePageContent,
   findShopeeUrl,
   findShopeeUrls,
@@ -1684,8 +1743,10 @@ export {
   parseScheduleUndoCompletion,
   processLineEvent,
   productTitle,
+  profitSkuMapFromDashboard,
   removeLineMentions,
   scheduleItemsFromText,
+  shopeeProductId,
   splitLineText,
   formatWarehouseLocation,
   warehouseLocationBucket,
