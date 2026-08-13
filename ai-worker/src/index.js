@@ -24,6 +24,14 @@ const nasImagePrecacheChunkSize = 100;
 const nasImagePrecacheOfflineDelayMs = 5 * 60_000;
 const warehousePositionDryRunTargetBasicId = "@059hdfyo";
 const warehousePositionDryRunMaxSnapshotAgeMs = 30 * 60_000;
+const warehousePositionWizardAction = "warehouse_position_dry_run";
+const warehousePositionWizardOptions = Object.freeze({
+  zones: ["01", "02", "03", "04", "05", "06"],
+  sides: ["L", "R"],
+  shelves: ["01", "02", "03", "04", "05"],
+  levels: ["01", "02", "03", "04"],
+  trays: ["T1", "T2", "T3", "T4"],
+});
 let profitWarehouseCatalogCache = { expiresAt: 0, token: "", products: new Map() };
 let lineBotInfoCache = { expiresAt: 0, token: "", info: null };
 
@@ -921,6 +929,141 @@ function parseWarehousePositionDryRunCommand(text) {
   return sku && newLocation ? { sku, newLocation } : null;
 }
 
+function parseWarehousePositionDryRunStartCommand(text) {
+  const normalized = normalizeScheduleDigits(text).normalize("NFKC").replace(/\s+/g, " ").trim();
+  const match = normalized.match(/^改儲位\s+([^\s]+)$/u);
+  return match ? parseWarehouseLocationCommand(match[1]) : null;
+}
+
+function warehousePositionWizardPostback(state = {}) {
+  const params = new URLSearchParams({
+    action: warehousePositionWizardAction,
+    step: String(state.step || "warehouse"),
+    sku: String(state.sku || ""),
+  });
+  for (const key of ["warehouse", "zone", "side", "shelf", "level", "tray"]) {
+    if (state[key]) params.set(key, String(state[key]));
+  }
+  return params.toString();
+}
+
+function warehousePositionWizardQuickReplyItem(label, state, displayText = label) {
+  return {
+    type: "action",
+    action: {
+      type: "postback",
+      label,
+      data: warehousePositionWizardPostback(state),
+      displayText,
+    },
+  };
+}
+
+function createWarehousePositionWizardMessage(state = {}, notice = "") {
+  const sku = parseWarehouseLocationCommand(state.sku);
+  if (!sku) return null;
+  const step = String(state.step || "warehouse");
+  const base = { sku, warehouse: state.warehouse, zone: state.zone, side: state.side, shelf: state.shelf, level: state.level };
+  let prompt = "";
+  let choices = [];
+
+  if (step === "warehouse") {
+    prompt = `貨號：${sku}\n請選擇倉庫：`;
+    choices = [
+      warehousePositionWizardQuickReplyItem("A倉", { step: "zone", sku, warehouse: "A" }),
+      warehousePositionWizardQuickReplyItem("B倉", { step: "zone", sku, warehouse: "B" }),
+    ];
+  } else if (step === "zone" && state.warehouse === "B") {
+    prompt = `貨號：${sku}\n倉庫：B倉\n請選擇區號：`;
+    choices = warehousePositionWizardOptions.zones.map((zone) =>
+      warehousePositionWizardQuickReplyItem(zone, { ...base, step: "side", warehouse: "B", zone })
+    );
+    choices.push(warehousePositionWizardQuickReplyItem("上一步", { step: "warehouse", sku }, "重新選倉庫"));
+  } else if (step === "side" && state.warehouse === "B" && warehousePositionWizardOptions.zones.includes(state.zone)) {
+    prompt = `貨號：${sku}\nB倉・區號 ${state.zone}\n請選擇層架方向：`;
+    choices = [
+      warehousePositionWizardQuickReplyItem("左邊 L", { ...base, step: "shelf", side: "L" }),
+      warehousePositionWizardQuickReplyItem("右邊 R", { ...base, step: "shelf", side: "R" }),
+      warehousePositionWizardQuickReplyItem("上一步", { step: "zone", sku, warehouse: "B" }, "重選區號"),
+    ];
+  } else if (
+    step === "shelf" && state.warehouse === "B"
+    && warehousePositionWizardOptions.zones.includes(state.zone)
+    && warehousePositionWizardOptions.sides.includes(state.side)
+  ) {
+    prompt = `貨號：${sku}\nB倉・${state.zone}區・${state.side === "R" ? "右邊" : "左邊"}\n請選擇第幾個層架：`;
+    choices = warehousePositionWizardOptions.shelves.map((shelf) =>
+      warehousePositionWizardQuickReplyItem(`${state.side}${shelf}`, { ...base, step: "level", shelf })
+    );
+    choices.push(warehousePositionWizardQuickReplyItem("上一步", {
+      step: "side", sku, warehouse: "B", zone: state.zone,
+    }, "重選左右"));
+  } else if (
+    step === "level" && state.warehouse === "B"
+    && warehousePositionWizardOptions.zones.includes(state.zone)
+    && warehousePositionWizardOptions.sides.includes(state.side)
+    && warehousePositionWizardOptions.shelves.includes(state.shelf)
+  ) {
+    prompt = `貨號：${sku}\n已選：${state.zone}-${state.side}${state.shelf}\n請選擇層位：`;
+    choices = warehousePositionWizardOptions.levels.map((level) =>
+      warehousePositionWizardQuickReplyItem(level, { ...base, step: "tray", level })
+    );
+    choices.push(warehousePositionWizardQuickReplyItem("上一步", {
+      step: "shelf", sku, warehouse: "B", zone: state.zone, side: state.side,
+    }, "重選層架"));
+  } else if (
+    step === "tray" && state.warehouse === "B"
+    && warehousePositionWizardOptions.zones.includes(state.zone)
+    && warehousePositionWizardOptions.sides.includes(state.side)
+    && warehousePositionWizardOptions.shelves.includes(state.shelf)
+    && warehousePositionWizardOptions.levels.includes(state.level)
+  ) {
+    prompt = `貨號：${sku}\n已選：${state.zone}-${state.side}${state.shelf}-${state.level}\n請選擇箱位：`;
+    choices = warehousePositionWizardOptions.trays.map((tray) =>
+      warehousePositionWizardQuickReplyItem(tray, { ...base, step: "preview", tray })
+    );
+    choices.push(warehousePositionWizardQuickReplyItem("上一步", {
+      step: "level", sku, warehouse: "B", zone: state.zone, side: state.side, shelf: state.shelf,
+    }, "重選層位"));
+  } else {
+    return null;
+  }
+
+  choices.push(warehousePositionWizardQuickReplyItem("取消", { step: "cancel", sku }, "取消改儲位演練"));
+  return {
+    type: "text",
+    text: `${notice ? `${notice}\n\n` : ""}🧪 儲位修改純演練\n${prompt}\n\n全部選完後只會顯示預覽，不會寫入 ERP。`,
+    quickReply: { items: choices },
+  };
+}
+
+function warehousePositionWizardState(params) {
+  const sku = parseWarehouseLocationCommand(params.get("sku"));
+  if (!sku || params.get("action") !== warehousePositionWizardAction) return null;
+  return {
+    step: String(params.get("step") || ""),
+    sku,
+    warehouse: String(params.get("warehouse") || ""),
+    zone: String(params.get("zone") || ""),
+    side: String(params.get("side") || ""),
+    shelf: String(params.get("shelf") || ""),
+    level: String(params.get("level") || ""),
+    tray: String(params.get("tray") || ""),
+  };
+}
+
+function warehousePositionWizardLocation(state) {
+  if (
+    state?.warehouse !== "B"
+    || !warehousePositionWizardOptions.zones.includes(state.zone)
+    || !warehousePositionWizardOptions.sides.includes(state.side)
+    || !warehousePositionWizardOptions.shelves.includes(state.shelf)
+    || !warehousePositionWizardOptions.levels.includes(state.level)
+    || !warehousePositionWizardOptions.trays.includes(state.tray)
+  ) return "";
+  return `${state.zone}-${state.side}${state.shelf}-${state.level}/${state.tray}`;
+}
+
 function normalizeWarehouseSearchText(value) {
   return String(value || "")
     .normalize("NFKC")
@@ -995,8 +1138,9 @@ function lineHelpText() {
     "回覆相關商品圖片、貨號、主要儲位與庫存；點『完整儲位』可查看所有規格。",
     "",
     "【儲位修改演練】",
-    "僅限私訊：改儲位 A12345 02-R04-01/T3",
-    "目前只讀取主倉快照並顯示修改預覽，不會寫入 ERP。",
+    "僅限私訊：改儲位 A12345",
+    "接著用按鈕選擇 B倉、區號、左右層架、層位與箱位；A倉按鈕先保留但尚未開放。",
+    "全部選完只讀取主倉快照並顯示修改預覽，不會寫入 ERP。",
     "多規格商品會安全停止，不會自行猜測規格。",
     "",
     "排程相關指令不需要 @文案小幫手。",
@@ -2471,6 +2615,23 @@ async function lineBotInfo(env) {
   return info;
 }
 
+async function warehousePositionDryRunAccess(event, env) {
+  if (event.source?.type !== "user" || !event.source?.userId) {
+    return {
+      ok: false,
+      message: "🔒 為了避免誤改資料，『改儲位』演練只能在 @059hdfyo 私訊中使用。\n\n本次沒有寫入 ERP。",
+    };
+  }
+  const info = await lineBotInfo(env);
+  if (String(info?.basicId || "").toLowerCase() !== warehousePositionDryRunTargetBasicId.toLowerCase()) {
+    return {
+      ok: false,
+      message: `🔒 儲位功能已停止：目前 LINE 官方帳號不是 ${warehousePositionDryRunTargetBasicId}。\n\n本次沒有寫入 ERP。`,
+    };
+  }
+  return { ok: true };
+}
+
 function warehousePositionVariantLabel(variant) {
   const parts = [variant?.style, variant?.size, variant?.barcode]
     .map((value) => String(value || "").trim())
@@ -2539,18 +2700,10 @@ function createWarehousePositionDryRunPreview(item, metadata, newLocation, now =
 }
 
 async function replyWarehousePositionDryRun(event, command, env) {
-  if (event.source?.type !== "user" || !event.source?.userId) {
-    await replyLine(event.replyToken, "🔒 為了避免誤改資料，『改儲位』演練只能在 @059hdfyo 私訊中使用。\n\n本次沒有寫入 ERP。", env);
-    return;
-  }
   try {
-    const info = await lineBotInfo(env);
-    if (String(info?.basicId || "").toLowerCase() !== warehousePositionDryRunTargetBasicId.toLowerCase()) {
-      await replyLine(
-        event.replyToken,
-        `🔒 儲位功能已停止：目前 LINE 官方帳號不是 ${warehousePositionDryRunTargetBasicId}。\n\n本次沒有寫入 ERP。`,
-        env,
-      );
+    const access = await warehousePositionDryRunAccess(event, env);
+    if (!access.ok) {
+      await replyLine(event.replyToken, access.message, env);
       return;
     }
     const result = await warehouseLocationRequest(env, command.sku, false);
@@ -2561,6 +2714,75 @@ async function replyWarehousePositionDryRun(event, command, env) {
     );
   } catch (error) {
     console.error("LINE warehouse position dry run error", error?.message || error);
+    await replyLine(
+      event.replyToken,
+      `⚠️ 儲位修改演練已停止：${error?.message || "請稍後再試"}\n\n本次沒有寫入 ERP。`,
+      env,
+    );
+  }
+}
+
+async function replyWarehousePositionWizardStart(event, sku, env) {
+  try {
+    const access = await warehousePositionDryRunAccess(event, env);
+    if (!access.ok) {
+      await replyLine(event.replyToken, access.message, env);
+      return;
+    }
+    await replyLine(event.replyToken, [createWarehousePositionWizardMessage({ step: "warehouse", sku })], env);
+  } catch (error) {
+    console.error("LINE warehouse position wizard start error", error?.message || error);
+    await replyLine(
+      event.replyToken,
+      `⚠️ 儲位修改演練已停止：${error?.message || "請稍後再試"}\n\n本次沒有寫入 ERP。`,
+      env,
+    );
+  }
+}
+
+async function replyWarehousePositionWizard(event, params, env) {
+  try {
+    const access = await warehousePositionDryRunAccess(event, env);
+    if (!access.ok) {
+      await replyLine(event.replyToken, access.message, env);
+      return;
+    }
+    const state = warehousePositionWizardState(params);
+    if (!state) {
+      await replyLine(event.replyToken, "⚠️ 儲位選項無效，請重新輸入「改儲位 貨號」。\n\n本次沒有寫入 ERP。", env);
+      return;
+    }
+    if (state.step === "cancel") {
+      await replyLine(event.replyToken, "已取消儲位修改演練。\n\n本次沒有寫入 ERP。", env);
+      return;
+    }
+    if (state.step === "zone" && state.warehouse === "A") {
+      await replyLine(event.replyToken, [createWarehousePositionWizardMessage(
+        { step: "warehouse", sku: state.sku },
+        "A倉目前尚未開放，這一版請選擇 B倉。",
+      )], env);
+      return;
+    }
+    if (state.step === "preview") {
+      const newLocation = warehousePositionWizardLocation(state);
+      if (!newLocation) {
+        await replyLine(event.replyToken, "⚠️ 儲位選項不完整或無效，請重新輸入「改儲位 貨號」。\n\n本次沒有寫入 ERP。", env);
+        return;
+      }
+      await replyWarehousePositionDryRun(event, {
+        sku: state.sku,
+        newLocation,
+      }, env);
+      return;
+    }
+    const message = createWarehousePositionWizardMessage(state);
+    if (!message) {
+      await replyLine(event.replyToken, "⚠️ 儲位選項不完整或無效，請重新輸入「改儲位 貨號」。\n\n本次沒有寫入 ERP。", env);
+      return;
+    }
+    await replyLine(event.replyToken, [message], env);
+  } catch (error) {
+    console.error("LINE warehouse position wizard error", error?.message || error);
     await replyLine(
       event.replyToken,
       `⚠️ 儲位修改演練已停止：${error?.message || "請稍後再試"}\n\n本次沒有寫入 ERP。`,
@@ -2889,6 +3111,10 @@ async function processLineEvent(event, env) {
   if (event.type === "postback") {
     const params = new URLSearchParams(event.postback?.data || "");
     const action = params.get("action");
+    if (action === warehousePositionWizardAction) {
+      await replyWarehousePositionWizard(event, params, env);
+      return;
+    }
     if (action !== "generate" && action !== "choose_focus") return;
     const productUrl = findShopeeUrl(params.get("url") || "");
     if (!productUrl) {
@@ -2926,10 +3152,15 @@ async function processLineEvent(event, env) {
 
   if (isWarehousePositionDryRunCommand(text)) {
     const command = parseWarehousePositionDryRunCommand(text);
+    const wizardSku = parseWarehousePositionDryRunStartCommand(text);
+    if (wizardSku) {
+      await replyWarehousePositionWizardStart(event, wizardSku, env);
+      return;
+    }
     if (!command) {
       await replyLine(
         event.replyToken,
-        "🧪 儲位修改演練格式：\n改儲位 貨號 新儲位\n\n例如：改儲位 A861 02-R04-01/T3\n目前只做預覽，不會寫入 ERP。",
+        "🧪 儲位修改演練格式：\n改儲位 貨號\n\n例如：改儲位 A861\n接著使用 LINE 按鈕選擇 B倉、區號、左右層架、層位與箱位。\n目前只做預覽，不會寫入 ERP。",
         env,
       );
       return;
@@ -3361,6 +3592,7 @@ export {
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
   parseWarehousePositionDryRunCommand,
+  parseWarehousePositionDryRunStartCommand,
   parseWarehouseSearchCommand,
   parseScheduleCompletion,
   parseScheduleSelection,
@@ -3375,6 +3607,9 @@ export {
   splitLineText,
   formatWarehouseLocation,
   createWarehousePositionDryRunPreview,
+  createWarehousePositionWizardMessage,
+  warehousePositionWizardLocation,
+  warehousePositionWizardPostback,
   warehouseLocationBucket,
   warehouseSearchScore,
   withAbortTimeout,

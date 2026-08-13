@@ -105,15 +105,17 @@ Recent handoff changes on `agent/line-schedule-handoff` include LINE generation 
 
 The separate NAS ERP project downloads both `InventoryId=-1` (不分倉, used by the existing calculations) and `InventoryId=1` (主倉, used for `倉庫儲位`) during one authenticated run. It retains the previous Worker snapshot whenever the main-warehouse export or location push fails.
 
-## `@059hdfyo` warehouse-position dry run (implemented locally 2026-08-13; not deployed)
+## `@059hdfyo` warehouse-position dry run (button workflow, 2026-08-13)
 
 - Warehouse-position work is scoped only to `@059hdfyo` (`廣告文案小幫手`). `@037vajci` is a separate official account and must not receive this workflow.
-- Private-chat command: `改儲位 A861 02-R04-01/T3`.
+- Private-chat command: `改儲位 A861`. It opens LINE quick-reply buttons; the older full command `改儲位 A861 02-R04-01/T3` remains a read-only shortcut.
+- A倉 remains visible but returns an unavailable notice. B倉 supports zone `01`-`06`, direction `L`/`R`, shelf `01`-`05`, level `01`-`04`, and tray `T1`-`T4`. For example, B倉 → `02` → `R` → `R04` → `01` → `T1` builds `02-R04-01/T1`.
+- The wizard is stateless: each LINE postback carries the already-selected values, every value is checked against an allowlist, and no selection is written to KV, Durable Object storage, or ERP.
 - The Worker calls LINE `GET /v2/bot/info` and refuses the command unless the active channel token reports Basic ID `@059hdfyo`. Group and room commands are refused.
 - This phase reads only the existing ERP main-warehouse cloud snapshot with image lookup disabled. It does not create a confirmation transaction, call an ERP write endpoint, or change Durable Object storage.
 - The preview fails closed unless the snapshot is `InventoryId=1`, is no more than 30 minutes old, and the product has exactly one variant. Multiple or missing variants are never guessed.
 - The reply shows product, variant, stock, old location, proposed location, snapshot time, and states that only `DepotPosition` would be allowed to change in a later write phase.
-- Worker validation is 52/52 tests passing after this change. The code is still local-only and must not be described as deployed until a real Cloudflare deployment completes.
+- Worker validation is 54/54 tests passing after this change, including the complete button path and an assertion that Durable Object storage remains unchanged.
 
 ## Planned LINE-to-ERP warehouse-position writeback (investigated 2026-08-13; not implemented)
 
