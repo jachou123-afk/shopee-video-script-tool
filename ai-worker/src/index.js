@@ -2163,16 +2163,20 @@ async function enrichWarehouseSearchItems(items, env) {
   const enriched = normalized.map((item) => {
     const cachedImageUrl = normalizeShopeeImageUrl(item.imageUrl);
     const product = catalog.get(normalizeWarehouseSku(item.sku)) || {};
+    const sourceImageUrl = normalizeShopeeImageUrl(product.imageUrl);
     return {
       ...item,
       productId: product.productId || item.productId,
       productUrl: product.productUrl || item.productUrl,
-      imageUrl: cachedImageUrl,
+      imageUrl: cachedImageUrl || sourceImageUrl,
     };
   });
-  const missingImages = enriched
-    .filter((item) => item.productUrl && !item.imageUrl)
-    .map((item) => warehouseImageCandidate(item.sku, catalog.get(normalizeWarehouseSku(item.sku)) || item))
+  const missingImages = normalized
+    .filter((item) => !normalizeShopeeImageUrl(item.imageUrl))
+    .map((item) => warehouseImageCandidate(
+      item.sku,
+      catalog.get(normalizeWarehouseSku(item.sku)) || item,
+    ))
     .filter(Boolean);
   if (!missingImages.length) return enriched;
   try {

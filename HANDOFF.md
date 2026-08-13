@@ -4,7 +4,7 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `3cbfe7da-1e85-460e-825d-727c7a1303b1`
+- Worker version at handoff: `8a8f5344-e13d-42b4-bff8-8144abb0c345`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
 - Validation status: all 43 Worker tests and all 6 NAS reader tests pass.
@@ -15,6 +15,7 @@
 - A successful ERP main-warehouse sync reconciles all SKUs that have a Shopee product mapping in the pure-profit dashboard. A LINE keyword search can also add the displayed uncached SKUs to the priority queue, but never waits for a live image fetch.
 - The image worker is a Durable Object alarm queue: exactly one product is processed per alarm, the randomized interval is 45-75 seconds, every 20 attempts is followed by a 15-minute pause, and the Taipei-day cap is 100 attempts. Errors use exponential backoff up to six hours; a single product is skipped after three failures so it cannot block the entire queue forever. A later ERP sync queues failed products again.
 - When the dashboard already exposes a Shopee image ID/URL, the Worker downloads that image without using the NAS. When it does not (for example A235 at diagnosis time), the alarm asks the authenticated NAS reader for the first image and then copies the resulting bytes into Cloudflare KV.
+- While a dashboard image is waiting for its persistent Cloudflare copy, LINE cards continue showing the dashboard-provided Shopee image immediately. The background queue still caches it, and subsequent cards prefer the Cloudflare copy. This prevents existing image cards (for example a `洗衣袋` search) from temporarily losing their image during cache warm-up.
 - The protected queue status endpoint is `GET /erp/images/status` and uses the existing `X-Erp-Sync-Token` header. It reports queue progress, priority count, daily attempt count, and the last cache error/success.
 - R2 was intentionally not used because the Cloudflare account returned API code `10042` (R2 not enabled). Workers KV was already available, supports binary values, and avoids requiring a new Cloudflare billing/storage activation for this feature.
 

@@ -1064,6 +1064,18 @@ test("group users can search warehouse products by a bare keyword without mentio
   }));
   const replies = [];
   globalThis.fetch = async (input, init = {}) => {
+    if (String(input) === "https://vicchou-profit-analysis.vicchou.chatgpt.site/api/dashboard-data") {
+      assert.equal(init.headers["OAI-Sites-Authorization"], "Bearer warehouse-card-bypass");
+      return Response.json({
+        current: {
+          products: [{
+            pid: "100",
+            skuLabel: "A100",
+            image: "tw-11134207-laundry-bag-image",
+          }],
+        },
+      });
+    }
     if (String(input) === "https://api.line.me/v2/bot/message/reply") {
       replies.push(JSON.parse(init.body));
       return new Response("OK");
@@ -1072,6 +1084,7 @@ test("group users can search warehouse products by a bare keyword without mentio
   };
   const env = {
     LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    PROFIT_DASHBOARD_BYPASS_TOKEN: "warehouse-card-bypass",
     LINE_ACTIVATION: {
       idFromName(name) { return name; },
       get() { return { fetch(input, init) { return object.fetch(new Request(input, init)); } }; },
@@ -1091,6 +1104,10 @@ test("group users can search warehouse products by a bare keyword without mentio
   assert.equal(replies.length, 1);
   assert.equal(replies[0].messages[0].type, "flex");
   assert.match(replies[0].messages[0].altText, /洗衣袋.*找到 1 項/);
+  assert.equal(
+    replies[0].messages[0].contents.contents[0].hero.url,
+    "https://down-tw.img.susercontent.com/file/tw-11134207-laundry-bag-image",
+  );
   assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 A100");
 });
 
