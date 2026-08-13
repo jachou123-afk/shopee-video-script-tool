@@ -26,6 +26,10 @@ Each successful ERP sync also reconciles the Shopee product-image queue. Images 
 
 During cache warm-up, a product image already supplied by the pure-profit dashboard remains visible on the LINE card. The queue copies it in the background, and the persistent Cloudflare image takes priority once available. Products for which the dashboard has no image still require one successful NAS lookup before their first cached image can appear.
 
+G/K SKUs are handled separately because they are not listed on Shopee. On the first exact-SKU or keyword search without a cached image, the Worker asks the connected NAS reader to select the best local material, resize it to a LINE-safe square JPEG, and upload it through the authenticated `/reader/images/{sku}` endpoint. The Worker stores the bytes in the same `PRODUCT_IMAGES` KV namespace and records the selected file metadata in the Durable Object cache. Later searches use the persistent public Worker image URL immediately.
+
+The authenticated `POST /reader/precache` endpoint starts a slow full warm-up for every G/K SKU in the active ERP main-warehouse snapshot. Its queue lives in the reader-broker Durable Object, processes only one NAS image every 45-75 seconds, skips existing KV images, and continues past missing folders. `GET /reader/precache` reports its queue and last result. Both methods require the existing NAS reader bearer token.
+
 Image queue status is available to the ERP integration at `GET /erp/images/status` using the same `X-Erp-Sync-Token` header. The endpoint reports queue progress, current-day attempts, priority count, and the most recent success or error without exposing secret values.
 
 Schedule lists use Shopee product IDs to look up `skuLabel` in the current pure-profit dashboard period and display `【貨號】商品名稱`. This requires the `PROFIT_DASHBOARD_BYPASS_TOKEN` Worker secret and gracefully falls back to the original name if the dashboard is unavailable.

@@ -12,8 +12,12 @@ services:
       READER_TOKEN: ${READER_TOKEN}
       VNC_PASSWORD: ${VNC_PASSWORD}
       SHOPEE_HOME_URL: https://shopee.tw/
+      NAS_G_IMAGE_ROOT: /nas-images/G
+      NAS_K_IMAGE_ROOT: /nas-images/K
       TZ: Asia/Taipei
     volumes:
       - ./data:/data
+      - /volume1/圖片區/G類-娃娃機吊飾:/nas-images/G:ro
+      - /volume1/圖片區/K類-娃娃機吊飾2:/nas-images/K:ro
     ports:
       - "6080:6080"

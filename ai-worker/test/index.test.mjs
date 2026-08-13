@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
+import worker, {
   armLineGroup,
   canonicalShopeeUrl,
   createLineFocusPanel,
@@ -18,6 +18,7 @@ import {
   isGroupSource,
   isLineHelpCommand,
   isLineScriptPromptCommand,
+  isNasLocalImageSku,
   isScheduleAddCommand,
   isSelfMentioned,
   LineActivation,
@@ -48,6 +49,13 @@ import {
   warehouseSearchScore,
   withAbortTimeout,
 } from "../src/index.js";
+
+test("recognizes only G and K SKUs as NAS-local image products", () => {
+  assert.equal(isNasLocalImageSku("g041"), true);
+  assert.equal(isNasLocalImageSku("Ｋ017"), true);
+  assert.equal(isNasLocalImageSku("A235"), false);
+  assert.equal(isNasLocalImageSku("G"), false);
+});
 
 test("withAbortTimeout stops slow background work before the LINE reply window closes", async () => {
   let aborted = false;
@@ -969,6 +977,335 @@ test("warehouse image cache downloads only one product per alarm and persists th
     assert.equal(data.rate.attempts, 2);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("authenticated NAS image upload stores and indexes a public G/K product image", async () => {
+  const storedImages = new Map();
+  const values = new Map();
+  const productImages = {
+    async put(key, value, options) {
+      storedImages.set(key, { value: value.slice(0), metadata: structuredClone(options.metadata) });
+    },
+    async getWithMetadata(key) {
+      const stored = storedImages.get(key);
+      return stored ? { value: stored.value, metadata: stored.metadata } : { value: null, metadata: null };
+    },
+  };
+  const activation = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  }, { PRODUCT_IMAGES: productImages });
+  await activation.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({ items: [{ sku: "G041", name: "爆米花吊飾", available: 3, variants: [] }] }),
+  }));
+  const env = {
+    SHOPEE_READER_TOKEN: "reader-secret",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() {
+        return { fetch(input, init) { return activation.fetch(new Request(input, init)); } };
+      },
+    },
+    PRODUCT_IMAGES: productImages,
+  };
+  let response = await worker.fetch(new Request("https://worker.example/reader/images/G041", {
+    method: "POST",
+    headers: { "Content-Type": "image/jpeg" },
+    body: new Uint8Array([1, 2, 3]),
+  }), env, {});
+  assert.equal(response.status, 401);
+
+  response = await worker.fetch(new Request("https://worker.example/reader/images/G041", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer reader-secret",
+      "Content-Type": "image/jpeg",
+      "X-Nas-Image-File": encodeURIComponent("01.jpg"),
+      "X-Nas-Image-Folder": encodeURIComponent("G041爆米花吊飾"),
+      "X-Nas-Image-Width": "1200",
+      "X-Nas-Image-Height": "1200",
+    },
+    body: new Uint8Array([1, 2, 3]),
+  }), env, {});
+  assert.equal(response.status, 200);
+  const uploaded = await response.json();
+  assert.equal(uploaded.sku, "G041");
+  assert.match(uploaded.imageUrl, /\/product-images\/G041\?v=/);
+  assert.equal(storedImages.get("warehouse/G041").metadata.source, "nas");
+  assert.equal(storedImages.get("warehouse/G041").metadata.candidateCount, "0");
+
+  response = await activation.fetch(new Request("https://line-schedule/warehouse-locations/query", {
+    method: "POST",
+    body: JSON.stringify({ sku: "G041" }),
+  }));
+  let queried = await response.json();
+  assert.match(queried.item.imageUrl, /\/product-images\/G041\?v=/);
+
+  response = await worker.fetch(new Request(uploaded.imageUrl), env, {});
+  assert.equal(response.status, 200);
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [1, 2, 3]);
+
+  values.clear();
+  await activation.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({ items: [{ sku: "G041", name: "爆米花吊飾", available: 3, variants: [] }] }),
+  }));
+  response = await activation.fetch(new Request("https://line-schedule/warehouse-locations/query", {
+    method: "POST",
+    body: JSON.stringify({ sku: "G041" }),
+  }));
+  queried = await response.json();
+  assert.match(queried.item.imageUrl, /\/product-images\/G041\?v=/, "query should repair a missing index from PRODUCT_IMAGES");
+});
+
+test("LineActivation asks the NAS reader for a local image and caches its record", async () => {
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const originalWebSocket = globalThis.WebSocket;
+  if (!globalThis.WebSocket) globalThis.WebSocket = { OPEN: 1 };
+  object.readerSocket = {
+    readyState: globalThis.WebSocket.OPEN,
+    send(raw) {
+      const job = JSON.parse(raw);
+      assert.equal(job.type, "local-image");
+      assert.equal(job.sku, "K017");
+      queueMicrotask(() => object.handleReaderMessage({
+        data: JSON.stringify({
+          id: job.id,
+          ok: true,
+          image: {
+            imageUrl: "https://shopee-video-script-ai.jachou123-afk.workers.dev/product-images/K017?v=123",
+            cachedAt: 123,
+            contentType: "image/jpeg",
+            fileName: "01.jpg",
+            folderName: "K017鴻圖大展吊飾",
+            candidateCount: 8,
+            score: 900,
+          },
+        }),
+      }));
+    },
+  };
+  try {
+    const response = await object.fetch(new Request("https://line-schedule/warehouse-images/cache-nas", {
+      method: "POST",
+      body: JSON.stringify({ sku: "k017" }),
+    }));
+    assert.equal(response.status, 200);
+    const data = await response.json();
+    assert.equal(data.item.sku, "K017");
+    assert.equal(data.item.source, "nas");
+    assert.equal(data.item.fileName, "01.jpg");
+    assert.equal(data.item.candidateCount, 8);
+  } finally {
+    if (originalWebSocket) globalThis.WebSocket = originalWebSocket;
+    else delete globalThis.WebSocket;
+  }
+});
+
+test("an exact G045 query routes local-image work through the reader broker and indexes the result globally", async () => {
+  const scheduleValues = new Map();
+  const readerValues = new Map();
+  const storage = (values) => ({
+    async put(key, value) { values.set(key, structuredClone(value)); },
+    async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+    async delete(key) { values.delete(key); },
+  });
+  const schedule = new LineActivation({ storage: storage(scheduleValues) });
+  const reader = new LineActivation({ storage: storage(readerValues) });
+  await schedule.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      items: [{
+        sku: "G045",
+        name: "重機吊飾+掛繩",
+        available: 5,
+        variants: [{ location: "G區-45", available: 5 }],
+      }],
+    }),
+  }));
+
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+  if (!globalThis.WebSocket) globalThis.WebSocket = { OPEN: 1 };
+  let readerJobs = 0;
+  reader.readerSocket = {
+    readyState: globalThis.WebSocket.OPEN,
+    send(raw) {
+      const job = JSON.parse(raw);
+      readerJobs += 1;
+      assert.equal(job.type, "local-image");
+      assert.equal(job.sku, "G045");
+      queueMicrotask(() => reader.handleReaderMessage({
+        data: JSON.stringify({
+          id: job.id,
+          ok: true,
+          image: {
+            sku: "G045",
+            imageUrl: "https://shopee-video-script-ai.jachou123-afk.workers.dev/product-images/G045?v=456",
+            cachedAt: 456,
+            contentType: "image/jpeg",
+            fileName: "6.jpg",
+            folderName: "G045重機吊飾+掛繩",
+            candidateCount: 5,
+            score: 700,
+          },
+        }),
+      }));
+    },
+  };
+
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${input}`);
+  };
+  const requestedNames = [];
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    LINE_ACTIVATION: {
+      idFromName(name) {
+        requestedNames.push(name);
+        return name;
+      },
+      get(id) {
+        const target = id === "shopee-reader-broker-v1" ? reader : schedule;
+        return { fetch(input, init) { return target.fetch(new Request(input, init)); } };
+      },
+    },
+  };
+
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "g045-query",
+      timestamp: Date.now(),
+      source: { type: "group", groupId: "g1", userId: "u1" },
+      message: { type: "text", text: "G045" },
+    }, env);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalWebSocket) globalThis.WebSocket = originalWebSocket;
+    else delete globalThis.WebSocket;
+  }
+
+  assert.equal(readerJobs, 1);
+  assert.ok(requestedNames.includes("shopee-reader-broker-v1"));
+  assert.equal(replies.length, 1);
+  assert.match(JSON.stringify(replies[0]), /product-images\/G045\?v=456/);
+
+  const cachedResponse = await schedule.fetch(new Request("https://line-schedule/warehouse-locations/query", {
+    method: "POST",
+    body: JSON.stringify({ sku: "G045" }),
+  }));
+  const cached = await cachedResponse.json();
+  assert.match(cached.item.imageUrl, /product-images\/G045\?v=456/);
+});
+
+test("authenticated G/K precache runs one NAS image job at a time and skips non-local SKUs", async () => {
+  const scheduleValues = new Map();
+  const readerValues = new Map();
+  let alarmAt = null;
+  const storage = (values, withAlarm = false) => ({
+    async put(key, value) { values.set(key, structuredClone(value)); },
+    async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+    async delete(key) { values.delete(key); },
+    ...(withAlarm ? {
+      async setAlarm(value) { alarmAt = Number(value); },
+      async getAlarm() { return alarmAt; },
+    } : {}),
+  });
+  const schedule = new LineActivation({ storage: storage(scheduleValues) });
+  const reader = new LineActivation({ storage: storage(readerValues, true) });
+  await schedule.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      items: [
+        { sku: "K017", name: "K product", available: 1, variants: [] },
+        { sku: "A235", name: "Shopee product", available: 1, variants: [] },
+        { sku: "G045", name: "G product", available: 1, variants: [] },
+      ],
+    }),
+  }));
+
+  const originalWebSocket = globalThis.WebSocket;
+  if (!globalThis.WebSocket) globalThis.WebSocket = { OPEN: 1 };
+  const jobs = [];
+  reader.readerSocket = {
+    readyState: globalThis.WebSocket.OPEN,
+    send(raw) {
+      const job = JSON.parse(raw);
+      jobs.push(job.sku);
+      queueMicrotask(() => reader.handleReaderMessage({
+        data: JSON.stringify({
+          id: job.id,
+          ok: true,
+          image: {
+            sku: job.sku,
+            imageUrl: `https://shopee-video-script-ai.jachou123-afk.workers.dev/product-images/${job.sku}?v=${jobs.length}`,
+            cachedAt: jobs.length,
+            contentType: "image/jpeg",
+            fileName: "1.jpg",
+            folderName: `${job.sku} product`,
+          },
+        }),
+      }));
+    },
+  };
+  const env = {
+    SHOPEE_READER_TOKEN: "reader-secret",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get(id) {
+        const target = id === "shopee-reader-broker-v1" ? reader : schedule;
+        return { fetch(input, init) { return target.fetch(new Request(input, init)); } };
+      },
+    },
+  };
+
+  try {
+    let response = await worker.fetch(new Request("https://worker.example/reader/precache", {
+      method: "POST",
+      headers: { Authorization: "Bearer reader-secret", "Content-Type": "application/json" },
+      body: "{}",
+    }), env, {});
+    assert.equal(response.status, 200);
+    let data = await response.json();
+    assert.equal(data.queued, 2);
+    assert.ok(alarmAt > Date.now());
+    assert.deepEqual(jobs, []);
+
+    await reader.alarm();
+    assert.deepEqual(jobs, ["G045"]);
+    await reader.alarm();
+    assert.deepEqual(jobs, ["G045", "K017"]);
+
+    response = await worker.fetch(new Request("https://worker.example/reader/precache", {
+      method: "GET",
+      headers: { Authorization: "Bearer reader-secret" },
+    }), env, {});
+    data = await response.json();
+    assert.equal(data.queue.itemCount, 2);
+    assert.equal(data.queue.nextIndex, 2);
+    assert.equal(data.queue.cachedCount, 2);
+    assert.ok(data.queue.completedAt);
+  } finally {
+    if (originalWebSocket) globalThis.WebSocket = originalWebSocket;
+    else delete globalThis.WebSocket;
   }
 });
 

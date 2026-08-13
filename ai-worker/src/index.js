@@ -20,6 +20,8 @@ const warehouseImageFetchMaxDelayMs = 75_000;
 const warehouseImageFetchBatchPauseMs = 15 * 60_000;
 const warehouseImageFailureBaseDelayMs = 30 * 60_000;
 const warehouseImageMaxBytes = 8 * 1024 * 1024;
+const nasImagePrecacheChunkSize = 100;
+const nasImagePrecacheOfflineDelayMs = 5 * 60_000;
 let profitWarehouseCatalogCache = { expiresAt: 0, token: "", products: new Map() };
 
 function corsHeaders(origin) {
@@ -260,6 +262,11 @@ function profitSkuMapFromDashboard(data) {
 
 function normalizeWarehouseSku(value) {
   return String(value || "").normalize("NFKC").replace(/\s+/g, "").trim().toUpperCase().slice(0, 80);
+}
+
+function isNasLocalImageSku(value) {
+  const sku = normalizeWarehouseSku(value);
+  return /^(?=[GK])(?=.*\d)[A-Z0-9._-]{2,32}$/u.test(sku);
 }
 
 function normalizeShopeeImageUrl(value) {
@@ -1161,7 +1168,7 @@ function lineActivationKey(event) {
 export class LineActivation {
   constructor(state, env) {
     this.storage = state.storage;
-    this.env = env;
+    this.env = env || {};
     this.readerSocket = null;
     this.readerHello = null;
     this.readerPending = new Map();
@@ -1219,27 +1226,70 @@ export class LineActivation {
     pending.resolve(Response.json(message, { status: message.ok ? 200 : 503 }));
   }
 
-  extractWithReader(request) {
+  dispatchReaderJob(payload, timeoutMs = 35000) {
     if (!this.readerSocket || this.readerSocket.readyState !== WebSocket.OPEN) {
       return Response.json({ ok: false, error: "SHOPEE_READER_OFFLINE" }, { status: 503 });
     }
-    return request.json().then(({ url }) => {
-      const id = crypto.randomUUID();
-      return new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          this.readerPending.delete(id);
-          resolve(Response.json({ ok: false, error: "SHOPEE_READER_TIMEOUT" }, { status: 504 }));
-        }, 35000);
-        this.readerPending.set(id, { resolve, timer });
-        try {
-          this.readerSocket.send(JSON.stringify({ type: "extract", id, url }));
-        } catch {
-          clearTimeout(timer);
-          this.readerPending.delete(id);
-          resolve(Response.json({ ok: false, error: "SHOPEE_READER_SEND_FAILED" }, { status: 503 }));
-        }
-      });
+    const id = crypto.randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.readerPending.delete(id);
+        resolve(Response.json({ ok: false, error: "SHOPEE_READER_TIMEOUT" }, { status: 504 }));
+      }, Math.min(45000, Math.max(1000, Number(timeoutMs) || 35000)));
+      this.readerPending.set(id, { resolve, timer });
+      try {
+        this.readerSocket.send(JSON.stringify({ ...payload, id }));
+      } catch {
+        clearTimeout(timer);
+        this.readerPending.delete(id);
+        resolve(Response.json({ ok: false, error: "SHOPEE_READER_SEND_FAILED" }, { status: 503 }));
+      }
     });
+  }
+
+  extractWithReader(request) {
+    return request.json().then(({ url }) => this.dispatchReaderJob({ type: "extract", url }, 35000));
+  }
+
+  async cacheNasImage(request) {
+    const { sku: rawSku } = await request.json();
+    const sku = normalizeWarehouseSku(rawSku);
+    if (!isNasLocalImageSku(sku)) {
+      return Response.json({ ok: false, error: "NAS_IMAGE_SKU_INVALID" }, { status: 400 });
+    }
+    let cached = await this.warehouseImageCacheRecord(sku);
+    if (!cached?.imageUrl) cached = await this.warehouseImageObjectRecord(sku);
+    if (cached?.source === "nas" && normalizeShopeeImageUrl(cached.imageUrl)) {
+      return Response.json({ ok: true, item: cached, cached: true });
+    }
+    const readerResponse = await this.dispatchReaderJob({ type: "local-image", sku }, 35000);
+    let result = null;
+    try {
+      result = await readerResponse.json();
+    } catch {}
+    if (!readerResponse.ok || !result?.ok || !normalizeShopeeImageUrl(result?.image?.imageUrl)) {
+      return Response.json(
+        { ok: false, error: String(result?.error || `NAS_IMAGE_READER_HTTP_${readerResponse.status}`).slice(0, 160) },
+        { status: readerResponse.status || 503 },
+      );
+    }
+    const record = {
+      sku,
+      productId: `nas:${sku}`,
+      productUrl: "",
+      imageUrl: result.image.imageUrl,
+      cachedAt: Number(result.image.cachedAt) || Date.now(),
+      contentType: String(result.image.contentType || "image/jpeg").slice(0, 80),
+      source: "nas",
+      fileName: String(result.image.fileName || "").slice(0, 300),
+      folderName: String(result.image.folderName || "").slice(0, 300),
+      sourceWidth: Number(result.image.sourceWidth) || 0,
+      sourceHeight: Number(result.image.sourceHeight) || 0,
+      candidateCount: Number(result.image.candidateCount) || 0,
+      score: Number(result.image.score) || 0,
+    };
+    await this.putWarehouseImageCacheRecord(record);
+    return Response.json({ ok: true, item: record, cached: false });
   }
 
   async addScheduleItems(request) {
@@ -1466,6 +1516,241 @@ export class LineActivation {
     const bucket = current && typeof current === "object" ? current : {};
     bucket[sku] = { ...record, sku };
     await this.storage.put(key, bucket);
+  }
+
+  async warehouseImageObjectRecord(rawSku) {
+    const sku = normalizeWarehouseSku(rawSku);
+    if (!isNasLocalImageSku(sku) || !this.env.PRODUCT_IMAGES) return null;
+    const object = await this.env.PRODUCT_IMAGES.getWithMetadata(warehouseImageObjectKey(sku), {
+      type: "arrayBuffer",
+      cacheTtl: 300,
+    });
+    if (!object?.value) return null;
+    const metadata = object.metadata && typeof object.metadata === "object" ? object.metadata : {};
+    const cachedAt = Math.max(0, Number(metadata.cachedAt) || Date.now());
+    const record = {
+      sku,
+      productId: String(metadata.productId || `nas:${sku}`).slice(0, 120),
+      productUrl: "",
+      imageUrl: warehouseImagePublicUrl(sku, cachedAt),
+      cachedAt,
+      contentType: String(metadata.contentType || "image/jpeg").slice(0, 80),
+      source: "nas",
+      fileName: String(metadata.fileName || "").slice(0, 300),
+      folderName: String(metadata.folderName || "").slice(0, 300),
+      sourceWidth: Math.max(0, Number(metadata.width) || 0),
+      sourceHeight: Math.max(0, Number(metadata.height) || 0),
+      candidateCount: Math.max(0, Number(metadata.candidateCount) || 0),
+      score: Number(metadata.score) || 0,
+    };
+    await this.putWarehouseImageCacheRecord(record);
+    return record;
+  }
+
+  async recordNasImage(request) {
+    const raw = await request.json();
+    const sku = normalizeWarehouseSku(raw?.sku);
+    const imageUrl = normalizeShopeeImageUrl(raw?.imageUrl);
+    if (!isNasLocalImageSku(sku) || !imageUrl) {
+      return Response.json({ ok: false, error: "NAS_IMAGE_RECORD_INVALID" }, { status: 400 });
+    }
+    const record = {
+      sku,
+      productId: `nas:${sku}`,
+      productUrl: "",
+      imageUrl,
+      cachedAt: Math.max(0, Number(raw?.cachedAt) || Date.now()),
+      contentType: String(raw?.contentType || "image/jpeg").slice(0, 80),
+      source: "nas",
+      fileName: String(raw?.fileName || "").slice(0, 300),
+      folderName: String(raw?.folderName || "").slice(0, 300),
+      sourceWidth: Math.max(0, Number(raw?.sourceWidth) || 0),
+      sourceHeight: Math.max(0, Number(raw?.sourceHeight) || 0),
+      candidateCount: Math.max(0, Number(raw?.candidateCount) || 0),
+      score: Number(raw?.score) || 0,
+    };
+    await this.putWarehouseImageCacheRecord(record);
+    return Response.json({ ok: true, item: record });
+  }
+
+  async localWarehouseImageSkus() {
+    const metadata = await this.storage.get("warehouse-location-active");
+    if (!metadata?.version) {
+      return Response.json({ ok: true, skus: [], itemCount: 0, metadata: metadata || null });
+    }
+    const skus = new Set();
+    const searchChunkCount = Math.min(1000, Math.max(0, Number(metadata.searchChunkCount) || 0));
+    if (searchChunkCount) {
+      const chunks = await Promise.all(Array.from({ length: searchChunkCount }, (_, index) =>
+        this.storage.get(`warehouse-location-search:${metadata.version}:${index}`)
+      ));
+      for (const chunk of chunks) {
+        for (const item of Array.isArray(chunk) ? chunk : []) {
+          const sku = normalizeWarehouseSku(item?.sku);
+          if (isNasLocalImageSku(sku)) skus.add(sku);
+        }
+      }
+    } else {
+      const bucketCount = Math.min(256, Math.max(1, Number(metadata.bucketCount) || 64));
+      const buckets = await Promise.all(Array.from({ length: bucketCount }, (_, index) =>
+        this.storage.get(`warehouse-location:${metadata.version}:${index}`)
+      ));
+      for (const bucket of buckets) {
+        for (const item of Object.values(bucket && typeof bucket === "object" ? bucket : {})) {
+          const sku = normalizeWarehouseSku(item?.sku);
+          if (isNasLocalImageSku(sku)) skus.add(sku);
+        }
+      }
+    }
+    return Response.json({
+      ok: true,
+      skus: [...skus].sort(),
+      itemCount: skus.size,
+      sourceVersion: metadata.version,
+      metadata,
+    });
+  }
+
+  async reconcileNasImagePrecache(request) {
+    const body = await request.json();
+    const skus = [...new Set((Array.isArray(body?.skus) ? body.skus : [])
+      .slice(0, 20000)
+      .map(normalizeWarehouseSku)
+      .filter(isNasLocalImageSku))].sort();
+    const current = await this.storage.get("nas-image-precache-queue");
+    const currentActive = current?.version && Number(current.nextIndex) < Number(current.itemCount);
+    if (!body?.force && currentActive) {
+      return Response.json({ ok: true, alreadyRunning: true, queue: current });
+    }
+    if (!body?.force && current?.sourceVersion && current.sourceVersion === String(body?.sourceVersion || "")) {
+      return Response.json({ ok: true, alreadyCompleted: true, queue: current });
+    }
+
+    const version = crypto.randomUUID();
+    const chunkCount = Math.ceil(skus.length / nasImagePrecacheChunkSize);
+    for (let index = 0; index < chunkCount; index += 1) {
+      await this.storage.put(
+        `nas-image-precache-queue:${version}:${index}`,
+        skus.slice(index * nasImagePrecacheChunkSize, (index + 1) * nasImagePrecacheChunkSize),
+      );
+    }
+    const queue = {
+      version,
+      sourceVersion: String(body?.sourceVersion || "").slice(0, 100),
+      itemCount: skus.length,
+      chunkCount,
+      nextIndex: 0,
+      cachedCount: 0,
+      skippedCount: 0,
+      failedCount: 0,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      completedAt: "",
+    };
+    await this.storage.put("nas-image-precache-queue", queue);
+    await this.storage.delete("nas-image-precache-runtime");
+    if (current?.version && current.version !== version) {
+      const previousChunkCount = Math.min(1000, Math.max(0, Number(current.chunkCount) || 0));
+      for (let index = 0; index < previousChunkCount; index += 1) {
+        await this.storage.delete(`nas-image-precache-queue:${current.version}:${index}`);
+      }
+    }
+    if (skus.length) await this.scheduleWarehouseImageAlarm(1_000, true);
+    return Response.json({ ok: true, queued: skus.length, chunkCount, queue });
+  }
+
+  async currentNasImagePrecacheSku() {
+    const queue = await this.storage.get("nas-image-precache-queue");
+    if (!queue?.version || Number(queue.nextIndex) >= Number(queue.itemCount)) {
+      return { sku: "", queue };
+    }
+    const index = Math.max(0, Number(queue.nextIndex) || 0);
+    const chunkIndex = Math.floor(index / nasImagePrecacheChunkSize);
+    const chunk = await this.storage.get(`nas-image-precache-queue:${queue.version}:${chunkIndex}`);
+    return {
+      sku: normalizeWarehouseSku(Array.isArray(chunk) ? chunk[index % nasImagePrecacheChunkSize] : ""),
+      queue,
+      index,
+    };
+  }
+
+  async advanceNasImagePrecache(current, outcome) {
+    const latest = await this.storage.get("nas-image-precache-queue");
+    if (latest?.version !== current.queue?.version || Number(latest.nextIndex) !== current.index) return;
+    latest.nextIndex = current.index + 1;
+    if (outcome === "cached") latest.cachedCount = Number(latest.cachedCount) + 1;
+    if (outcome === "skipped") latest.skippedCount = Number(latest.skippedCount) + 1;
+    if (outcome === "failed") latest.failedCount = Number(latest.failedCount) + 1;
+    latest.updatedAt = new Date().toISOString();
+    if (latest.nextIndex >= Number(latest.itemCount)) latest.completedAt = latest.updatedAt;
+    await this.storage.put("nas-image-precache-queue", latest);
+  }
+
+  async processNasImagePrecacheQueue() {
+    let current = await this.currentNasImagePrecacheSku();
+    if (!current.sku) return;
+
+    // Skip a small number of existing objects per alarm so one invocation never
+    // creates a large burst of KV reads.
+    for (let skipped = 0; skipped < 20 && current.sku; skipped += 1) {
+      const cached = await this.warehouseImageObjectRecord(current.sku);
+      if (!cached?.imageUrl) break;
+      await this.advanceNasImagePrecache(current, "skipped");
+      current = await this.currentNasImagePrecacheSku();
+    }
+    if (!current.sku) return;
+
+    const runtimeValue = await this.storage.get("nas-image-precache-runtime");
+    const runtime = runtimeValue && typeof runtimeValue === "object" ? runtimeValue : {};
+    if (!this.readerSocket || this.readerSocket.readyState !== WebSocket.OPEN) {
+      runtime.lastError = "SHOPEE_READER_OFFLINE";
+      runtime.lastFailureAt = new Date().toISOString();
+      await this.storage.put("nas-image-precache-runtime", runtime);
+      await this.scheduleWarehouseImageAlarm(nasImagePrecacheOfflineDelayMs, true);
+      return;
+    }
+
+    try {
+      const response = await this.cacheNasImage(new Request("https://shopee-reader/warehouse-images/cache-nas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sku: current.sku }),
+      }));
+      let result = null;
+      try {
+        result = await response.json();
+      } catch {}
+      if (!response.ok || !result?.ok || !normalizeShopeeImageUrl(result?.item?.imageUrl)) {
+        throw new Error(String(result?.error || `NAS_IMAGE_CACHE_HTTP_${response.status}`).slice(0, 160));
+      }
+      await this.advanceNasImagePrecache(current, "cached");
+      runtime.lastSku = current.sku;
+      runtime.lastSuccessAt = new Date().toISOString();
+      runtime.lastError = "";
+      await this.storage.put("nas-image-precache-runtime", runtime);
+      await this.scheduleWarehouseImageAlarm(warehouseImageDelay(), true);
+    } catch (error) {
+      const message = String(error?.message || error).slice(0, 200);
+      runtime.lastSku = current.sku;
+      runtime.lastError = message;
+      runtime.lastFailureAt = new Date().toISOString();
+      await this.storage.put("nas-image-precache-runtime", runtime);
+      if (/SHOPEE_READER_(?:OFFLINE|TIMEOUT|DISCONNECTED|SEND_FAILED)/u.test(message)) {
+        await this.scheduleWarehouseImageAlarm(nasImagePrecacheOfflineDelayMs, true);
+        return;
+      }
+      await this.advanceNasImagePrecache(current, "failed");
+      console.error("NAS_IMAGE_PRECACHE", current.sku, message);
+      await this.scheduleWarehouseImageAlarm(warehouseImageDelay(), true);
+    }
+  }
+
+  async nasImagePrecacheStatus() {
+    const [queue, runtime] = await Promise.all([
+      this.storage.get("nas-image-precache-queue"),
+      this.storage.get("nas-image-precache-runtime"),
+    ]);
+    return Response.json({ ok: true, queue: queue || null, runtime: runtime || null });
   }
 
   async scheduleWarehouseImageAlarm(delayMs, force = false) {
@@ -1718,6 +2003,11 @@ export class LineActivation {
   }
 
   async alarm() {
+    const nasQueue = await this.storage.get("nas-image-precache-queue");
+    if (nasQueue?.version && Number(nasQueue.nextIndex) < Number(nasQueue.itemCount)) {
+      await this.processNasImagePrecacheQueue();
+      return;
+    }
     await this.processWarehouseImageQueue();
   }
 
@@ -1790,7 +2080,10 @@ export class LineActivation {
       `warehouse-location:${metadata.version}:${warehouseLocationBucket(sku, bucketCount)}`,
     );
     const locationItem = bucket && typeof bucket === "object" ? bucket[sku] || null : null;
-    const cached = locationItem ? await this.warehouseImageCacheRecord(sku) : null;
+    let cached = locationItem ? await this.warehouseImageCacheRecord(sku) : null;
+    if (locationItem && !cached?.imageUrl && isNasLocalImageSku(sku)) {
+      cached = await this.warehouseImageObjectRecord(sku);
+    }
     return Response.json({
       ok: true,
       item: cached?.imageUrl ? {
@@ -1879,6 +2172,12 @@ export class LineActivation {
     if (url.pathname === "/extract" && request.method === "POST") {
       return this.extractWithReader(request);
     }
+    if (url.pathname === "/warehouse-images/cache-nas" && request.method === "POST") {
+      return this.cacheNasImage(request);
+    }
+    if (url.pathname === "/warehouse-images/record-nas" && request.method === "POST") {
+      return this.recordNasImage(request);
+    }
     if (url.pathname === "/schedule/add" && request.method === "POST") {
       return this.addScheduleItems(request);
     }
@@ -1912,6 +2211,9 @@ export class LineActivation {
     if (url.pathname === "/warehouse-locations/search" && request.method === "POST") {
       return this.searchWarehouseLocations(request);
     }
+    if (url.pathname === "/warehouse-locations/local-image-skus" && request.method === "GET") {
+      return this.localWarehouseImageSkus();
+    }
     if (url.pathname === "/warehouse-images/reconcile" && request.method === "POST") {
       return this.reconcileWarehouseImages(request);
     }
@@ -1920,6 +2222,12 @@ export class LineActivation {
     }
     if (url.pathname === "/warehouse-images/status" && request.method === "GET") {
       return this.warehouseImageStatus();
+    }
+    if (url.pathname === "/warehouse-images/reconcile-nas" && request.method === "POST") {
+      return this.reconcileNasImagePrecache(request);
+    }
+    if (url.pathname === "/warehouse-images/nas-status" && request.method === "GET") {
+      return this.nasImagePrecacheStatus();
     }
     if (url.pathname === "/arm" && request.method === "POST") {
       const { armedAt } = await request.json();
@@ -2151,6 +2459,38 @@ async function enqueueWarehouseImageCandidates(env, candidates) {
   return response.json();
 }
 
+async function cacheNasWarehouseImage(env, sku) {
+  if (!env.LINE_ACTIVATION || !isNasLocalImageSku(sku)) return null;
+  const response = await readerBrokerStub(env).fetch(
+    "https://shopee-reader/warehouse-images/cache-nas",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sku: normalizeWarehouseSku(sku) }),
+    },
+  );
+  let result = null;
+  try {
+    result = await response.json();
+  } catch {}
+  if (!response.ok || !result?.ok) {
+    throw new Error(String(result?.error || `NAS_IMAGE_CACHE_HTTP_${response.status}`).slice(0, 160));
+  }
+  const item = result.item || null;
+  if (item?.imageUrl) {
+    const indexResponse = await lineScheduleStub(env, globalLineScheduleName).fetch(
+      "https://line-schedule/warehouse-images/record-nas",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item),
+      },
+    );
+    if (!indexResponse.ok) throw new Error(`NAS_IMAGE_INDEX_HTTP_${indexResponse.status}`);
+  }
+  return item;
+}
+
 async function enrichWarehouseSearchItems(items, env) {
   const normalized = (Array.isArray(items) ? items : []).map((item) => ({ ...item }));
   if (!normalized.length) return normalized;
@@ -2171,8 +2511,30 @@ async function enrichWarehouseSearchItems(items, env) {
       imageUrl: cachedImageUrl || sourceImageUrl,
     };
   });
+  const localImageSkus = enriched
+    .filter((item) => !normalizeShopeeImageUrl(item.imageUrl) && isNasLocalImageSku(item.sku))
+    .map((item) => normalizeWarehouseSku(item.sku));
+  if (localImageSkus.length) {
+    const localResults = await Promise.allSettled(localImageSkus.map((sku) => cacheNasWarehouseImage(env, sku)));
+    const localImages = new Map();
+    for (let index = 0; index < localResults.length; index += 1) {
+      const result = localResults[index];
+      if (result.status === "fulfilled" && normalizeShopeeImageUrl(result.value?.imageUrl)) {
+        localImages.set(localImageSkus[index], result.value);
+      } else if (result.status === "rejected") {
+        console.error("WAREHOUSE_NAS_IMAGE", localImageSkus[index], result.reason?.message || result.reason);
+      }
+    }
+    for (const item of enriched) {
+      const cached = localImages.get(normalizeWarehouseSku(item.sku));
+      if (!cached) continue;
+      item.productId = cached.productId || item.productId;
+      item.productUrl = cached.productUrl || item.productUrl;
+      item.imageUrl = cached.imageUrl;
+    }
+  }
   const missingImages = normalized
-    .filter((item) => !normalizeShopeeImageUrl(item.imageUrl))
+    .filter((item) => !normalizeShopeeImageUrl(item.imageUrl) && !isNasLocalImageSku(item.sku))
     .map((item) => warehouseImageCandidate(
       item.sku,
       catalog.get(normalizeWarehouseSku(item.sku)) || item,
@@ -2670,6 +3032,130 @@ async function handleWarehouseImageStatus(request, env) {
   });
 }
 
+async function handleNasImagePrecache(request, env) {
+  const expected = String(env.SHOPEE_READER_TOKEN || "");
+  if (!expected || request.headers.get("Authorization") !== `Bearer ${expected}`) {
+    return Response.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
+  }
+  if (!env.LINE_ACTIVATION) {
+    return Response.json({ ok: false, error: "STORAGE_NOT_CONFIGURED" }, { status: 503 });
+  }
+  if (request.method === "GET") {
+    return readerBrokerStub(env).fetch("https://shopee-reader/warehouse-images/nas-status", { method: "GET" });
+  }
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {}
+  const sourceResponse = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/warehouse-locations/local-image-skus",
+    { method: "GET" },
+  );
+  if (!sourceResponse.ok) {
+    return Response.json({ ok: false, error: `LOCATION_SKU_HTTP_${sourceResponse.status}` }, { status: 503 });
+  }
+  const source = await sourceResponse.json();
+  return readerBrokerStub(env).fetch("https://shopee-reader/warehouse-images/reconcile-nas", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      skus: source.skus,
+      sourceVersion: source.sourceVersion,
+      force: Boolean(body?.force),
+    }),
+  });
+}
+
+function decodeReaderImageHeader(value) {
+  try {
+    return decodeURIComponent(String(value || "")).replace(/[\r\n]/g, " ").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function handleReaderImageUpload(request, env, rawSku) {
+  const expected = String(env.SHOPEE_READER_TOKEN || "");
+  if (!expected || request.headers.get("Authorization") !== `Bearer ${expected}`) {
+    return Response.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
+  }
+  const sku = normalizeWarehouseSku(rawSku);
+  if (!isNasLocalImageSku(sku)) {
+    return Response.json({ ok: false, error: "NAS_IMAGE_SKU_INVALID" }, { status: 400 });
+  }
+  if (!env.PRODUCT_IMAGES) {
+    return Response.json({ ok: false, error: "PRODUCT_IMAGE_STORAGE_NOT_CONFIGURED" }, { status: 503 });
+  }
+  const contentType = String(request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+  if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
+    return Response.json({ ok: false, error: "IMAGE_CONTENT_TYPE_INVALID" }, { status: 415 });
+  }
+  const declaredSize = Number(request.headers.get("Content-Length")) || 0;
+  if (declaredSize > warehouseImageMaxBytes) {
+    return Response.json({ ok: false, error: "IMAGE_TOO_LARGE" }, { status: 413 });
+  }
+  const bytes = await request.arrayBuffer();
+  if (!bytes.byteLength || bytes.byteLength > warehouseImageMaxBytes) {
+    return Response.json({ ok: false, error: "IMAGE_SIZE_INVALID" }, { status: 413 });
+  }
+  const cachedAt = Date.now();
+  const fileName = decodeReaderImageHeader(request.headers.get("X-Nas-Image-File")).slice(0, 300);
+  const folderName = decodeReaderImageHeader(request.headers.get("X-Nas-Image-Folder")).slice(0, 300);
+  const sourceWidth = Math.max(0, Number(request.headers.get("X-Nas-Image-Width")) || 0);
+  const sourceHeight = Math.max(0, Number(request.headers.get("X-Nas-Image-Height")) || 0);
+  const candidateCount = Math.max(0, Number(request.headers.get("X-Nas-Image-Candidates")) || 0);
+  const score = Number(request.headers.get("X-Nas-Image-Score")) || 0;
+  const imageUrl = warehouseImagePublicUrl(sku, cachedAt);
+  await env.PRODUCT_IMAGES.put(warehouseImageObjectKey(sku), bytes, {
+    metadata: {
+      contentType,
+      sku,
+      productId: `nas:${sku}`,
+      source: "nas",
+      cachedAt: String(cachedAt),
+      fileName,
+      folderName,
+      width: String(sourceWidth),
+      height: String(sourceHeight),
+      candidateCount: String(candidateCount),
+      score: String(score),
+    },
+  });
+  if (env.LINE_ACTIVATION) {
+    const indexResponse = await lineScheduleStub(env, globalLineScheduleName).fetch(
+      "https://line-schedule/warehouse-images/record-nas",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sku,
+          imageUrl,
+          cachedAt,
+          contentType,
+          fileName,
+          folderName,
+          sourceWidth,
+          sourceHeight,
+          candidateCount,
+          score,
+        }),
+      },
+    );
+    if (!indexResponse.ok) {
+      return Response.json({ ok: false, error: "IMAGE_INDEX_UPDATE_FAILED" }, { status: 503 });
+    }
+  }
+  return Response.json({
+    ok: true,
+    sku,
+    contentType,
+    cachedAt,
+    imageUrl,
+  });
+}
+
 async function serveWarehouseProductImage(request, env, rawSku) {
   const sku = normalizeWarehouseSku(rawSku);
   if (!sku || !env.PRODUCT_IMAGES) return new Response("Not found", { status: 404 });
@@ -2703,6 +3189,7 @@ export {
   isGroupSource,
   isLineHelpCommand,
   isLineScriptPromptCommand,
+  isNasLocalImageSku,
   isScheduleAddCommand,
   isSelfMentioned,
   lineHelpText,
@@ -2751,10 +3238,23 @@ export default {
       return serveWarehouseProductImage(request, env, sku);
     }
 
+    if (url.pathname.startsWith("/reader/images/")) {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      let sku = "";
+      try {
+        sku = decodeURIComponent(url.pathname.slice("/reader/images/".length));
+      } catch {}
+      return handleReaderImageUpload(request, env, sku);
+    }
+
     if (url.pathname === "/reader/connect" || url.pathname === "/reader/status") {
       if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
       const path = url.pathname === "/reader/connect" ? "/reader/connect" : "/reader/status";
       return readerBrokerStub(env).fetch(`https://shopee-reader${path}`, request);
+    }
+
+    if (url.pathname === "/reader/precache") {
+      return handleNasImagePrecache(request, env);
     }
 
     if (url.pathname === "/line/webhook") {
