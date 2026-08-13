@@ -2,7 +2,10 @@
 
 $ErrorActionPreference = "Stop"
 $assetDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$outputPath = Join-Path $assetDir "rich-menu-v2.png"
+$outputFile = if ($env:RICH_MENU_OUTPUT_FILE) { $env:RICH_MENU_OUTPUT_FILE } else { "rich-menu-v2.png" }
+$thirdLabel = if ($env:RICH_MENU_THIRD_LABEL) { $env:RICH_MENU_THIRD_LABEL } else { "新增排程" }
+$thirdSubtitle = if ($env:RICH_MENU_THIRD_SUBTITLE) { $env:RICH_MENU_THIRD_SUBTITLE } else { "貼上商品連結加入待拍" }
+$outputPath = Join-Path $assetDir $outputFile
 $width = 2500
 $height = 1686
 $rowHeight = 843
@@ -90,7 +93,7 @@ function Draw-Icon([System.Drawing.Graphics]$canvas, [string]$icon, [float]$cent
 $tiles = @(
   @{ Label = "查商品／儲位"; Subtitle = "輸入貨號或商品關鍵字"; Icon = "search"; Top = "#155A46"; Bottom = "#104637" },
   @{ Label = "要拍什麼"; Subtitle = "查看目前待拍清單"; Icon = "list"; Top = "#1B6851"; Bottom = "#14513F" },
-  @{ Label = "新增排程"; Subtitle = "貼上商品連結加入待拍"; Icon = "plus"; Top = "#28755E"; Bottom = "#1C5D49" },
+  @{ Label = $thirdLabel; Subtitle = $thirdSubtitle; Icon = "plus"; Top = "#28755E"; Bottom = "#1C5D49" },
   @{ Label = "已拍完"; Subtitle = "查看完成時間與明細"; Icon = "check"; Top = "#205F4D"; Bottom = "#174839" },
   @{ Label = "產生文案"; Subtitle = "40 秒 AI 標準版腳本"; Icon = "document"; Top = "#2C765F"; Bottom = "#1E5B49" },
   @{ Label = "使用說明"; Subtitle = "查看全部指令與快捷鍵"; Icon = "help"; Top = "#3A806A"; Bottom = "#28614F" }

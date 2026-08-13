@@ -42,14 +42,15 @@
 - Existing `PRODUCT_IMAGES` objects are skipped in small groups of at most 20 KV reads per alarm. A missing NAS folder or unusable material is counted as failed and the queue proceeds, so one SKU cannot stop the whole run. Re-running the protected start endpoint retries failures while immediately skipping images already cached.
 - The protected control endpoint is `POST /reader/precache`; `GET /reader/precache` reports progress. Both use the existing NAS reader bearer token and do not expose it. The production queue was started from the current ERP snapshot with 1,488 G/K SKUs. Initial verification advanced from `G001` to `G002`; both were correctly recorded as `NAS_IMAGE_SKU_FOLDER_NOT_FOUND`, proving missing folders do not block progress.
 
-## LINE rich menu (2026-08-13)
+## LINE rich menu (updated 2026-08-14)
 
-- A 2500 x 1686 six-button rich menu is active as the Messaging API default for `@037vajci` (`【長頸鹿】下單小幫手`). Its LINE ID is `richmenu-4e7e2a8351c483b285c2d8b0a1038473`.
-- The six message actions are `查`, `要拍什麼`, `廣告影片排程`, `已拍完`, `產生文案`, and `使用方法`.
-- The image source is `line-assets/rich-menu-v2.png`; regenerate it deterministically with `line-assets/build-rich-menu.ps1`.
+- A 2500 x 1686 six-button rich menu is active as the Messaging API default for `@059hdfyo` (`廣告文案小幫手`). Its LINE ID is `richmenu-26f08e00e3f4df577a775f9b7622bee6`.
+- The six message actions are `查`, `要拍什麼`, `改儲位`, `已拍完`, `產生文案`, and `使用方法`. The top-right action displays `改儲位` and sends exactly `改儲位`, which opens the eight-second SKU reply window.
+- The deployed image source is `line-assets/rich-menu-059.png`. Regenerate it deterministically with `line-assets/build-rich-menu.ps1` after setting `RICH_MENU_OUTPUT_FILE=rich-menu-059.png`, `RICH_MENU_THIRD_LABEL=改儲位`, and `RICH_MENU_THIRD_SUBTITLE=問答選擇新儲位` in the PowerShell process environment. With no overrides, the script still regenerates the previous `rich-menu-v2.png` asset.
+- The previous menu `richmenu-4e7e2a8351c483b285c2d8b0a1038473` remains in the `@059hdfyo` Messaging API account as a non-default rollback copy. The excluded account `@037vajci` was not changed.
 - `使用方法` and a mention-only message return six quick-reply shortcuts. `產生文案` asks for a Shopee product URL instead of falling through to ERP keyword search.
 - Rich menus appear in the LINE mobile app, not LINE for PC. After a change, reopen the chat; LINE may take up to one minute to refresh the default menu.
-- The menu was created through the official Messaging API because the Chrome extension could not pass a local file to LINE Official Account Manager. The temporary Cloudflare setup route and `RICH_MENU_SETUP_TOKEN` secret were removed immediately after activation. The unsaved Manager create form can be discarded.
+- The menu was created through the official Messaging API, so LINE Official Account Manager does not list it under its native rich-menu editor. The temporary Cloudflare setup route and `RICH_MENU_SETUP_TOKEN` secret were removed immediately after activation.
 
 ## LINE workflow
 
