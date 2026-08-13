@@ -4,10 +4,19 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `ffc973e5-a242-4165-8955-dde3c9f61f11`
+- Worker version at handoff: `43619ece-8675-4b61-bdcc-a2119eff5680`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: all 42 Worker tests and all 6 NAS reader tests pass.
+- Validation status: all 43 Worker tests and all 6 NAS reader tests pass.
+
+## Persistent product-image cache (2026-08-13)
+
+- Shopee first images are now copied into a dedicated Cloudflare Workers KV namespace (`PRODUCT_IMAGES`, namespace ID `a3dd5675565242ab939fc138030dba5f`) and served by the Worker at `/product-images/{sku}`. LINE cards use this stored copy, so an already-cached image does not depend on the NAS browser, Shopee login state, or the Shopee image URL remaining available at query time.
+- A successful ERP main-warehouse sync reconciles all SKUs that have a Shopee product mapping in the pure-profit dashboard. A LINE keyword search can also add the displayed uncached SKUs to the priority queue, but never waits for a live image fetch.
+- The image worker is a Durable Object alarm queue: exactly one product is processed per alarm, the randomized interval is 45-75 seconds, every 20 attempts is followed by a 15-minute pause, and the Taipei-day cap is 100 attempts. Errors use exponential backoff up to six hours; a single product is skipped after three failures so it cannot block the entire queue forever. A later ERP sync queues failed products again.
+- When the dashboard already exposes a Shopee image ID/URL, the Worker downloads that image without using the NAS. When it does not (for example A235 at diagnosis time), the alarm asks the authenticated NAS reader for the first image and then copies the resulting bytes into Cloudflare KV.
+- The protected queue status endpoint is `GET /erp/images/status` and uses the existing `X-Erp-Sync-Token` header. It reports queue progress, priority count, daily attempt count, and the last cache error/success.
+- R2 was intentionally not used because the Cloudflare account returned API code `10042` (R2 not enabled). Workers KV was already available, supports binary values, and avoids requiring a new Cloudflare billing/storage activation for this feature.
 
 ## LINE rich menu (2026-08-13)
 

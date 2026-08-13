@@ -27,6 +27,10 @@
     {
       "binding": "LINE_PENDING",
       "id": "e700b5845ec540868f0fa735c61e1c18"
+    },
+    {
+      "binding": "PRODUCT_IMAGES",
+      "id": "a3dd5675565242ab939fc138030dba5f"
     }
   ],
   "durable_objects": {

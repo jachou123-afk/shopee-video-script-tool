@@ -865,6 +865,102 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   assert.equal(data.item.name, "測試商品");
 });
 
+test("warehouse image cache downloads only one product per alarm and persists the LINE image", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  let alarmAt = null;
+  let imageRequests = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const storedImages = new Map();
+  const productImages = {
+    async put(key, value, options) {
+      storedImages.set(key, { value: value.slice(0), options: structuredClone(options) });
+    },
+    async getWithMetadata(key) {
+      const stored = storedImages.get(key);
+      return stored ? { value: stored.value, metadata: stored.options.metadata } : { value: null, metadata: null };
+    },
+  };
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+      async setAlarm(value) { alarmAt = Number(value); },
+      async getAlarm() { return alarmAt; },
+    },
+  }, {
+    PRODUCT_IMAGES: productImages,
+  });
+
+  await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      items: [
+        { sku: "A100", name: "商品一", available: 1, variants: [] },
+        { sku: "A200", name: "商品二", available: 2, variants: [] },
+      ],
+    }),
+  }));
+  const reconcile = await object.fetch(new Request("https://line-schedule/warehouse-images/reconcile", {
+    method: "POST",
+    body: JSON.stringify({
+      candidates: [
+        {
+          sku: "A100",
+          productUrl: "https://shopee.tw/product/52793230/100",
+          sourceImageUrl: "https://img.example.com/100.jpg",
+        },
+        {
+          sku: "A200",
+          productUrl: "https://shopee.tw/product/52793230/200",
+          sourceImageUrl: "https://img.example.com/200.jpg",
+        },
+      ],
+    }),
+  }));
+  assert.equal((await reconcile.json()).queued, 2);
+  assert.ok(alarmAt > Date.now());
+  assert.equal(imageRequests, 0, "sync should enqueue without downloading immediately");
+
+  globalThis.fetch = async (input) => {
+    imageRequests += 1;
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await Promise.resolve();
+    inFlight -= 1;
+    return new Response(new Uint8Array([1, 2, 3]), {
+      headers: { "Content-Type": "image/jpeg", "Content-Length": "3" },
+    });
+  };
+  try {
+    await object.alarm();
+    assert.equal(imageRequests, 1);
+    assert.equal(storedImages.size, 1);
+
+    let response = await object.fetch(new Request("https://line-schedule/warehouse-locations/search", {
+      method: "POST",
+      body: JSON.stringify({ keyword: "商品一" }),
+    }));
+    let data = await response.json();
+    assert.match(data.items[0].imageUrl, /\/product-images\/A100\?v=/);
+
+    await object.alarm();
+    assert.equal(imageRequests, 2);
+    assert.equal(storedImages.size, 2);
+    assert.equal(maxInFlight, 1);
+
+    response = await object.fetch(new Request("https://line-schedule/warehouse-images/status", { method: "GET" }));
+    data = await response.json();
+    assert.equal(data.queue.nextIndex, 2);
+    assert.equal(data.queue.cachedCount, 2);
+    assert.equal(data.rate.attempts, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("group users can query a warehouse location without mentioning the bot", async () => {
   const originalFetch = globalThis.fetch;
   const values = new Map();
