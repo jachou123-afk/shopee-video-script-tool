@@ -32,6 +32,8 @@ const warehousePositionWizardOptions = Object.freeze({
   levels: ["01", "02", "03", "04"],
   trays: ["T1", "T2", "T3", "T4"],
 });
+const warehousePositionVariantPageSize = 9;
+const warehousePositionAllVariantLimit = 10;
 let profitWarehouseCatalogCache = { expiresAt: 0, token: "", products: new Map() };
 let lineBotInfoCache = { expiresAt: 0, token: "", info: null };
 
@@ -941,7 +943,7 @@ function warehousePositionWizardPostback(state = {}) {
     step: String(state.step || "warehouse"),
     sku: String(state.sku || ""),
   });
-  for (const key of ["warehouse", "zone", "side", "shelf", "level", "tray"]) {
+  for (const key of ["variant", "warehouse", "zone", "side", "shelf", "level", "tray", "page"]) {
     if (state[key]) params.set(key, String(state[key]));
   }
   return params.toString();
@@ -959,32 +961,94 @@ function warehousePositionWizardQuickReplyItem(label, state, displayText = label
   };
 }
 
-function createWarehousePositionWizardMessage(state = {}, notice = "") {
+function warehousePositionIdentifiedVariants(item) {
+  const variants = Array.isArray(item?.variants) ? item.variants : [];
+  const seen = new Set();
+  const identified = [];
+  for (const variant of variants) {
+    const barcode = normalizeWarehouseSku(variant?.barcode);
+    if (!/^[A-Z0-9._-]{2,80}$/u.test(barcode) || seen.has(barcode)) return [];
+    seen.add(barcode);
+    identified.push({ barcode, variant });
+  }
+  return identified;
+}
+
+function warehousePositionVariantButtonLabel(sku, barcode) {
+  const normalizedSku = normalizeWarehouseSku(sku);
+  const normalizedBarcode = normalizeWarehouseSku(barcode);
+  const suffix = normalizedBarcode.startsWith(normalizedSku)
+    ? normalizedBarcode.slice(normalizedSku.length)
+    : "";
+  return (suffix && suffix.length <= 20 ? suffix : normalizedBarcode).slice(0, 20);
+}
+
+function createWarehousePositionWizardMessage(state = {}, notice = "", item = null) {
   const sku = parseWarehouseLocationCommand(state.sku);
   if (!sku) return null;
   const step = String(state.step || "warehouse");
-  const base = { sku, warehouse: state.warehouse, zone: state.zone, side: state.side, shelf: state.shelf, level: state.level };
+  const base = {
+    sku,
+    variant: state.variant,
+    warehouse: state.warehouse,
+    zone: state.zone,
+    side: state.side,
+    shelf: state.shelf,
+    level: state.level,
+  };
   let prompt = "";
   let choices = [];
 
-  if (step === "warehouse") {
+  if (step === "variant") {
+    const variants = warehousePositionIdentifiedVariants(item);
+    if (variants.length < 2) return null;
+    const requestedPage = Math.max(1, Number.parseInt(state.page, 10) || 1);
+    const pageCount = Math.ceil(variants.length / warehousePositionVariantPageSize);
+    const page = Math.min(requestedPage, pageCount);
+    const pageVariants = variants.slice(
+      (page - 1) * warehousePositionVariantPageSize,
+      page * warehousePositionVariantPageSize,
+    );
+    prompt = `貨號：${sku}\n請先選擇子貨號（${page}/${pageCount}）：`;
+    choices = pageVariants.map(({ barcode }) => warehousePositionWizardQuickReplyItem(
+      warehousePositionVariantButtonLabel(sku, barcode),
+      { step: "warehouse", sku, variant: barcode },
+      barcode,
+    ));
+    if (variants.length <= warehousePositionAllVariantLimit) {
+      choices.push(warehousePositionWizardQuickReplyItem("全部", { step: "warehouse", sku, variant: "*" }, `全部 ${variants.length} 個子貨號`));
+    }
+    if (page > 1) {
+      choices.push(warehousePositionWizardQuickReplyItem("上一頁", { step: "variant", sku, page: page - 1 }));
+    }
+    if (page < pageCount) {
+      choices.push(warehousePositionWizardQuickReplyItem("下一頁", { step: "variant", sku, page: page + 1 }));
+    }
+  } else if (step === "warehouse") {
     prompt = `貨號：${sku}\n請選擇倉庫：`;
     choices = [
-      warehousePositionWizardQuickReplyItem("A倉", { step: "zone", sku, warehouse: "A" }),
-      warehousePositionWizardQuickReplyItem("B倉", { step: "zone", sku, warehouse: "B" }),
+      warehousePositionWizardQuickReplyItem("A倉", { ...base, step: "zone", warehouse: "A" }),
+      warehousePositionWizardQuickReplyItem("B倉", { ...base, step: "zone", warehouse: "B" }),
     ];
+    if (state.variant) {
+      choices.push(warehousePositionWizardQuickReplyItem("重選子貨號", { step: "variant", sku, page: 1 }));
+    }
   } else if (step === "zone" && state.warehouse === "B") {
     prompt = `貨號：${sku}\n倉庫：B倉\n請選擇區號：`;
     choices = warehousePositionWizardOptions.zones.map((zone) =>
       warehousePositionWizardQuickReplyItem(zone, { ...base, step: "side", warehouse: "B", zone })
     );
-    choices.push(warehousePositionWizardQuickReplyItem("上一步", { step: "warehouse", sku }, "重新選倉庫"));
+    choices.push(warehousePositionWizardQuickReplyItem("上一步", {
+      step: "warehouse", sku, variant: state.variant,
+    }, "重新選倉庫"));
   } else if (step === "side" && state.warehouse === "B" && warehousePositionWizardOptions.zones.includes(state.zone)) {
     prompt = `貨號：${sku}\nB倉・區號 ${state.zone}\n請選擇層架方向：`;
     choices = [
       warehousePositionWizardQuickReplyItem("左邊 L", { ...base, step: "shelf", side: "L" }),
       warehousePositionWizardQuickReplyItem("右邊 R", { ...base, step: "shelf", side: "R" }),
-      warehousePositionWizardQuickReplyItem("上一步", { step: "zone", sku, warehouse: "B" }, "重選區號"),
+      warehousePositionWizardQuickReplyItem("上一步", {
+        step: "zone", sku, variant: state.variant, warehouse: "B",
+      }, "重選區號"),
     ];
   } else if (
     step === "shelf" && state.warehouse === "B"
@@ -996,7 +1060,7 @@ function createWarehousePositionWizardMessage(state = {}, notice = "") {
       warehousePositionWizardQuickReplyItem(`${state.side}${shelf}`, { ...base, step: "level", shelf })
     );
     choices.push(warehousePositionWizardQuickReplyItem("上一步", {
-      step: "side", sku, warehouse: "B", zone: state.zone,
+      step: "side", sku, variant: state.variant, warehouse: "B", zone: state.zone,
     }, "重選左右"));
   } else if (
     step === "level" && state.warehouse === "B"
@@ -1009,7 +1073,7 @@ function createWarehousePositionWizardMessage(state = {}, notice = "") {
       warehousePositionWizardQuickReplyItem(level, { ...base, step: "tray", level })
     );
     choices.push(warehousePositionWizardQuickReplyItem("上一步", {
-      step: "shelf", sku, warehouse: "B", zone: state.zone, side: state.side,
+      step: "shelf", sku, variant: state.variant, warehouse: "B", zone: state.zone, side: state.side,
     }, "重選層架"));
   } else if (
     step === "tray" && state.warehouse === "B"
@@ -1023,7 +1087,7 @@ function createWarehousePositionWizardMessage(state = {}, notice = "") {
       warehousePositionWizardQuickReplyItem(tray, { ...base, step: "preview", tray })
     );
     choices.push(warehousePositionWizardQuickReplyItem("上一步", {
-      step: "level", sku, warehouse: "B", zone: state.zone, side: state.side, shelf: state.shelf,
+      step: "level", sku, variant: state.variant, warehouse: "B", zone: state.zone, side: state.side, shelf: state.shelf,
     }, "重選層位"));
   } else {
     return null;
@@ -1040,15 +1104,19 @@ function createWarehousePositionWizardMessage(state = {}, notice = "") {
 function warehousePositionWizardState(params) {
   const sku = parseWarehouseLocationCommand(params.get("sku"));
   if (!sku || params.get("action") !== warehousePositionWizardAction) return null;
+  const rawVariant = String(params.get("variant") || "").normalize("NFKC").trim().toUpperCase();
+  if (rawVariant && rawVariant !== "*" && !/^[A-Z0-9._-]{2,80}$/u.test(rawVariant)) return null;
   return {
     step: String(params.get("step") || ""),
     sku,
+    variant: rawVariant,
     warehouse: String(params.get("warehouse") || ""),
     zone: String(params.get("zone") || ""),
     side: String(params.get("side") || ""),
     shelf: String(params.get("shelf") || ""),
     level: String(params.get("level") || ""),
     tray: String(params.get("tray") || ""),
+    page: String(params.get("page") || ""),
   };
 }
 
@@ -1141,7 +1209,8 @@ function lineHelpText() {
     "僅限私訊：改儲位 A12345",
     "接著用按鈕選擇 B倉、區號、左右層架、層位與箱位；A倉按鈕先保留但尚未開放。",
     "全部選完只讀取主倉快照並顯示修改預覽，不會寫入 ERP。",
-    "多規格商品會安全停止，不會自行猜測規格。",
+    "多規格商品會先顯示 ERP 實際子貨號，可選單一子貨號或最多 10 個的『全部』預覽。",
+    "子貨號空白、重複或資料已更新時會安全停止，不會自行猜測。",
     "",
     "排程相關指令不需要 @文案小幫手。",
     "儲位查詢也不需要 @文案小幫手。",
@@ -2639,7 +2708,7 @@ function warehousePositionVariantLabel(variant) {
   return parts.length ? parts.join("／") : "單一規格";
 }
 
-function createWarehousePositionDryRunPreview(item, metadata, newLocation, now = Date.now()) {
+function warehousePositionDryRunSnapshotError(item, metadata, now = Date.now()) {
   if (!metadata) {
     return "⚠️ 儲位修改演練已停止\n\nERP 主倉快照尚未完成第一次同步。\n\n本次沒有寫入 ERP。";
   }
@@ -2653,8 +2722,34 @@ function createWarehousePositionDryRunPreview(item, metadata, newLocation, now =
   if (!item) {
     return "⚠️ 儲位修改演練已停止\n\nERP 主倉查無此貨號，請確認貨號是否完整。\n\n本次沒有寫入 ERP。";
   }
+  return "";
+}
+
+function createWarehousePositionDryRunPreview(item, metadata, newLocation, now = Date.now(), selectedVariant = "") {
+  const snapshotError = warehousePositionDryRunSnapshotError(item, metadata, now);
+  if (snapshotError) return snapshotError;
   const variants = Array.isArray(item.variants) ? item.variants : [];
-  if (variants.length !== 1) {
+  const normalizedSelection = selectedVariant === "*" ? "*" : normalizeWarehouseSku(selectedVariant);
+  let selected = variants;
+  if (normalizedSelection && normalizedSelection !== "*") {
+    selected = variants.filter((variant) => normalizeWarehouseSku(variant?.barcode) === normalizedSelection);
+  } else if (!normalizedSelection && variants.length === 1) {
+    selected = variants;
+  } else if (!normalizedSelection) {
+    selected = [];
+  }
+  if (normalizedSelection === "*" && variants.length > warehousePositionAllVariantLimit) {
+    return [
+      "⚠️ 儲位修改演練已停止",
+      "",
+      `貨號：${item.sku}`,
+      `規格數：${variants.length}`,
+      `「全部」一次最多允許 ${warehousePositionAllVariantLimit} 個子貨號，請改選單一子貨號。`,
+      "",
+      "本次沒有寫入 ERP。",
+    ].join("\n");
+  }
+  if (selected.length !== 1 && normalizedSelection !== "*") {
     return [
       "⚠️ 儲位修改演練已停止",
       "",
@@ -2662,12 +2757,42 @@ function createWarehousePositionDryRunPreview(item, metadata, newLocation, now =
       `商品：${item.name}`,
       `規格數：${variants.length}`,
       "",
-      "目前演練模式只允許單一規格商品。多規格商品必須先加入明確的規格選擇，系統不會自行猜測。",
+      normalizedSelection
+        ? "找不到唯一符合的子貨號，可能是資料已更新或子貨號重複；系統不會自行猜測。"
+        : "多規格商品必須先選擇明確的子貨號或『全部』；系統不會自行猜測。",
       "",
       "本次沒有寫入 ERP。",
     ].join("\n");
   }
-  const variant = variants[0];
+  if (normalizedSelection === "*") {
+    const identified = warehousePositionIdentifiedVariants(item);
+    if (!variants.length || identified.length !== variants.length) {
+      return "⚠️ 儲位修改演練已停止\n\n部分子貨號空白或重複，不能安全建立『全部』預覽。\n\n本次沒有寫入 ERP。";
+    }
+    const lines = [
+      "🧪 全部子貨號儲位修改演練（不會寫入 ERP）",
+      "",
+      `貨號：${item.sku}`,
+      `商品：${item.name}`,
+      `子貨號數：${identified.length}`,
+      `倉庫：${metadata.warehouseName || "主倉"}（InventoryId=1）`,
+      `預計新儲位：${newLocation}`,
+      `快照時間：${metadata.updatedAt}`,
+      "",
+      "逐筆預覽：",
+    ];
+    for (const { barcode, variant } of identified) {
+      const oldLocation = String(variant.location || "").trim() || "尚未設定";
+      lines.push(`${barcode}｜${oldLocation} → ${newLocation}｜庫存 ${Number(variant.available) || 0}`);
+    }
+    lines.push(
+      "",
+      "安全檢查：全部子貨號都已列出；任何一筆資料不完整都會整批停止。",
+      "結果：演練完成，沒有建立確認碼，也沒有呼叫 ERP 寫入。",
+    );
+    return lines.join("\n");
+  }
+  const variant = selected[0];
   const oldLocation = String(variant.location || "").trim() || "尚未設定";
   if (oldLocation === newLocation) {
     return [
@@ -2675,6 +2800,7 @@ function createWarehousePositionDryRunPreview(item, metadata, newLocation, now =
       "",
       `貨號：${item.sku}`,
       `商品：${item.name}`,
+      ...(normalizedSelection ? [`子貨號：${normalizedSelection}`] : []),
       `目前儲位：${oldLocation}`,
       `輸入儲位：${newLocation}`,
       "",
@@ -2687,6 +2813,7 @@ function createWarehousePositionDryRunPreview(item, metadata, newLocation, now =
     "",
     `貨號：${item.sku}`,
     `商品：${item.name}`,
+    ...(normalizedSelection ? [`子貨號：${normalizedSelection}`] : []),
     `規格：${warehousePositionVariantLabel(variant)}`,
     `倉庫：${metadata.warehouseName || "主倉"}（InventoryId=1）`,
     `主倉可用庫存：${Number(variant.available) || 0}`,
@@ -2709,7 +2836,13 @@ async function replyWarehousePositionDryRun(event, command, env) {
     const result = await warehouseLocationRequest(env, command.sku, false);
     await replyLine(
       event.replyToken,
-      createWarehousePositionDryRunPreview(result?.item, result?.metadata, command.newLocation),
+      createWarehousePositionDryRunPreview(
+        result?.item,
+        result?.metadata,
+        command.newLocation,
+        Date.now(),
+        command.variant || "",
+      ),
       env,
     );
   } catch (error) {
@@ -2729,7 +2862,23 @@ async function replyWarehousePositionWizardStart(event, sku, env) {
       await replyLine(event.replyToken, access.message, env);
       return;
     }
-    await replyLine(event.replyToken, [createWarehousePositionWizardMessage({ step: "warehouse", sku })], env);
+    const result = await warehouseLocationRequest(env, sku, false);
+    const snapshotError = warehousePositionDryRunSnapshotError(result?.item, result?.metadata);
+    if (snapshotError) {
+      await replyLine(event.replyToken, snapshotError, env);
+      return;
+    }
+    const variants = Array.isArray(result.item?.variants) ? result.item.variants : [];
+    if (!variants.length) {
+      await replyLine(event.replyToken, "⚠️ 儲位修改演練已停止\n\n商品沒有可辨識的規格資料。\n\n本次沒有寫入 ERP。", env);
+      return;
+    }
+    if (variants.length > 1 && warehousePositionIdentifiedVariants(result.item).length !== variants.length) {
+      await replyLine(event.replyToken, "⚠️ 儲位修改演練已停止\n\n部分子貨號空白或重複，不能安全顯示選項。\n\n本次沒有寫入 ERP。", env);
+      return;
+    }
+    const state = variants.length > 1 ? { step: "variant", sku, page: 1 } : { step: "warehouse", sku };
+    await replyLine(event.replyToken, [createWarehousePositionWizardMessage(state, "", result.item)], env);
   } catch (error) {
     console.error("LINE warehouse position wizard start error", error?.message || error);
     await replyLine(
@@ -2758,9 +2907,24 @@ async function replyWarehousePositionWizard(event, params, env) {
     }
     if (state.step === "zone" && state.warehouse === "A") {
       await replyLine(event.replyToken, [createWarehousePositionWizardMessage(
-        { step: "warehouse", sku: state.sku },
+        { step: "warehouse", sku: state.sku, variant: state.variant },
         "A倉目前尚未開放，這一版請選擇 B倉。",
       )], env);
+      return;
+    }
+    if (state.step === "variant") {
+      const result = await warehouseLocationRequest(env, state.sku, false);
+      const snapshotError = warehousePositionDryRunSnapshotError(result?.item, result?.metadata);
+      if (snapshotError) {
+        await replyLine(event.replyToken, snapshotError, env);
+        return;
+      }
+      const message = createWarehousePositionWizardMessage(state, "", result.item);
+      if (!message) {
+        await replyLine(event.replyToken, "⚠️ 子貨號資料已更新或不完整，請重新輸入「改儲位 貨號」。\n\n本次沒有寫入 ERP。", env);
+        return;
+      }
+      await replyLine(event.replyToken, [message], env);
       return;
     }
     if (state.step === "preview") {
@@ -2772,6 +2936,7 @@ async function replyWarehousePositionWizard(event, params, env) {
       await replyWarehousePositionDryRun(event, {
         sku: state.sku,
         newLocation,
+        variant: state.variant,
       }, env);
       return;
     }

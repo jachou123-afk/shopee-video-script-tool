@@ -109,13 +109,14 @@ The separate NAS ERP project downloads both `InventoryId=-1` (不分倉, used by
 
 - Warehouse-position work is scoped only to `@059hdfyo` (`廣告文案小幫手`). `@037vajci` is a separate official account and must not receive this workflow.
 - Private-chat command: `改儲位 A861`. It opens LINE quick-reply buttons; the older full command `改儲位 A861 02-R04-01/T3` remains a read-only shortcut.
+- A multi-variant product such as `A823` first reads the current ERP snapshot and shows its real child SKUs (for example `-01` through `-06`) plus `全部`. A single child preview selects exactly one matching barcode. `全部` is offered only when there are at most 10 children and lists every old-to-new location line in the final preview. Missing or duplicate child IDs stop the entire flow.
 - A倉 remains visible but returns an unavailable notice. B倉 supports zone `01`-`06`, direction `L`/`R`, shelf `01`-`05`, level `01`-`04`, and tray `T1`-`T4`. For example, B倉 → `02` → `R` → `R04` → `01` → `T1` builds `02-R04-01/T1`.
 - The wizard is stateless: each LINE postback carries the already-selected values, every value is checked against an allowlist, and no selection is written to KV, Durable Object storage, or ERP.
 - The Worker calls LINE `GET /v2/bot/info` and refuses the command unless the active channel token reports Basic ID `@059hdfyo`. Group and room commands are refused.
 - This phase reads only the existing ERP main-warehouse cloud snapshot with image lookup disabled. It does not create a confirmation transaction, call an ERP write endpoint, or change Durable Object storage.
-- The preview fails closed unless the snapshot is `InventoryId=1`, is no more than 30 minutes old, and the product has exactly one variant. Multiple or missing variants are never guessed.
+- The preview fails closed unless the snapshot is `InventoryId=1`, is no more than 30 minutes old, and every requested child SKU still resolves uniquely when the final button is pressed. Missing, duplicate, or changed variants are never guessed.
 - The reply shows product, variant, stock, old location, proposed location, snapshot time, and states that only `DepotPosition` would be allowed to change in a later write phase.
-- Worker validation is 54/54 tests passing after this change, including the complete button path and an assertion that Durable Object storage remains unchanged.
+- Worker validation is 55/55 tests passing after this change, including single-child, `全部`, complete button paths, and assertions that Durable Object storage remains unchanged.
 
 ## Planned LINE-to-ERP warehouse-position writeback (investigated 2026-08-13; not implemented)
 

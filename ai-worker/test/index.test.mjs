@@ -171,6 +171,20 @@ test("warehouse position wizard starts from a SKU and only builds valid B wareho
   assert.equal(warehousePositionWizardLocation({
     warehouse: "B", zone: "02", side: "R", shelf: "99", level: "01", tray: "T1",
   }), "");
+
+  const multiVariantItem = {
+    sku: "A823",
+    variants: Array.from({ length: 6 }, (_, index) => ({ barcode: `A823-0${index + 1}` })),
+  };
+  const variantMessage = createWarehousePositionWizardMessage({ step: "variant", sku: "A823" }, "", multiVariantItem);
+  assert.deepEqual(variantMessage.quickReply.items.map((item) => item.action.label), [
+    "-01", "-02", "-03", "-04", "-05", "-06", "全部", "取消",
+  ]);
+  assert.ok(variantMessage.quickReply.items.every((item) => item.action.data.length <= 300));
+  assert.equal(createWarehousePositionWizardMessage({ step: "variant", sku: "A823" }, "", {
+    sku: "A823",
+    variants: [{ barcode: "A823-01" }, { barcode: "A823-01" }],
+  }), null, "duplicate child SKUs must fail closed");
 });
 
 test("warehouse position dry-run preview fails closed and never claims a write", () => {
@@ -199,6 +213,25 @@ test("warehouse position dry-run preview fails closed and never claims a write",
   assert.match(multiple, /規格數：2/);
   assert.match(multiple, /演練已停止/);
   assert.match(multiple, /本次沒有寫入 ERP/);
+
+  const multiItem = {
+    sku: "A823",
+    name: "多規格商品",
+    variants: [
+      { location: "01-L01-01/T1", style: "紅色", size: "小", barcode: "A823-01", available: 2 },
+      { location: "01-L01-01/T2", style: "藍色", size: "大", barcode: "A823-02", available: 3 },
+    ],
+  };
+  const selected = createWarehousePositionDryRunPreview(multiItem, metadata, "02-R04-01/T1", now, "A823-02");
+  assert.match(selected, /子貨號：A823-02/);
+  assert.match(selected, /原儲位：01-L01-01\/T2/);
+  assert.doesNotMatch(selected, /原儲位：01-L01-01\/T1/);
+
+  const all = createWarehousePositionDryRunPreview(multiItem, metadata, "02-R04-01/T1", now, "*");
+  assert.match(all, /全部子貨號儲位修改演練（不會寫入 ERP）/);
+  assert.match(all, /A823-01｜01-L01-01\/T1 → 02-R04-01\/T1/);
+  assert.match(all, /A823-02｜01-L01-01\/T2 → 02-R04-01\/T1/);
+  assert.match(all, /沒有呼叫 ERP 寫入/);
 
   const stale = createWarehousePositionDryRunPreview(item, {
     ...metadata,
@@ -1612,6 +1645,96 @@ test("warehouse position wizard uses buttons to build B warehouse preview withou
   assert.match(replies.at(-1).messages[0].text, /原儲位：02-L02-03\/T4/);
   assert.match(replies.at(-1).messages[0].text, /預計新儲位：02-R04-01\/T1/);
   assert.deepEqual([...values.entries()], before, "wizard must not persist selections or change warehouse storage");
+});
+
+test("warehouse position wizard asks for actual child SKU first and previews all variants without writing", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const variants = Array.from({ length: 6 }, (_, index) => ({
+    location: `01-L01-0${(index % 4) + 1}/T${(index % 4) + 1}`,
+    style: `款式${index + 1}`,
+    size: "",
+    barcode: `A823-0${index + 1}`,
+    available: index + 1,
+  }));
+  await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      warehouseId: 1,
+      warehouseName: "主倉",
+      items: [{ sku: "A823", name: "多規格測試商品", available: 21, variants }],
+    }),
+  }));
+  const before = structuredClone([...values.entries()]);
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url === "https://api.line.me/v2/bot/info") {
+      return Response.json({ basicId: "@059hdfyo", displayName: "廣告文案小幫手" });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "multi-wizard-line-token",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() { return { fetch(input, init) { return object.fetch(new Request(input, init)); } }; },
+    },
+  };
+  const eventBase = { timestamp: Date.now(), source: { type: "user", userId: "owner-user" } };
+  const press = async (label) => {
+    const message = replies.at(-1).messages[0];
+    const item = message.quickReply.items.find((candidate) => candidate.action.label === label);
+    assert.ok(item, `missing quick reply button: ${label}`);
+    await processLineEvent({
+      ...eventBase,
+      type: "postback",
+      replyToken: `multi-wizard-${replies.length}`,
+      postback: { data: item.action.data },
+    }, env);
+  };
+  try {
+    await processLineEvent({
+      ...eventBase,
+      type: "message",
+      replyToken: "multi-wizard-start",
+      message: { type: "text", text: "改儲位 A823" },
+    }, env);
+    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.map((item) => item.action.label), [
+      "-01", "-02", "-03", "-04", "-05", "-06", "全部", "取消",
+    ]);
+    await press("全部");
+    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.slice(0, 3).map((item) => item.action.label), [
+      "A倉", "B倉", "重選子貨號",
+    ]);
+    await press("B倉");
+    await press("02");
+    await press("右邊 R");
+    await press("R04");
+    await press("01");
+    await press("T1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const preview = replies.at(-1).messages[0].text;
+  assert.match(preview, /全部子貨號儲位修改演練（不會寫入 ERP）/);
+  assert.match(preview, /子貨號數：6/);
+  assert.match(preview, /A823-01｜.* → 02-R04-01\/T1/);
+  assert.match(preview, /A823-06｜.* → 02-R04-01\/T1/);
+  assert.match(preview, /沒有呼叫 ERP 寫入/);
+  assert.deepEqual([...values.entries()], before, "multi-variant wizard must remain read-only and stateless");
 });
 
 test("warehouse position dry run refuses a different LINE official account", async () => {
