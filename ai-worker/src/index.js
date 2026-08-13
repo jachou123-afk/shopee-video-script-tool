@@ -6,6 +6,7 @@ const allowedOrigins = new Set([
 
 const usage = new Map();
 const lineActivations = new Map();
+const warehousePositionPromptActivations = new Map();
 const encoder = new TextEncoder();
 const globalLineScheduleName = "line-schedule:global-v1";
 const profitDashboardDataUrl = "https://vicchou-profit-analysis.vicchou.chatgpt.site/api/dashboard-data";
@@ -24,6 +25,7 @@ const nasImagePrecacheChunkSize = 100;
 const nasImagePrecacheOfflineDelayMs = 5 * 60_000;
 const warehousePositionDryRunTargetBasicId = "@059hdfyo";
 const warehousePositionDryRunMaxSnapshotAgeMs = 30 * 60_000;
+const warehousePositionPromptTtlMs = 8_000;
 const warehousePositionWizardAction = "warehouse_position_dry_run";
 const warehousePositionWizardOptions = Object.freeze({
   zones: ["01", "02", "03", "04", "05", "06"],
@@ -911,6 +913,10 @@ function isWarehousePositionDryRunCommand(text) {
   return /^改儲位(?:\s|$)/u.test(String(text || "").normalize("NFKC").trim());
 }
 
+function isWarehousePositionPromptCommand(text) {
+  return String(text || "").normalize("NFKC").trim() === "改儲位";
+}
+
 function normalizeWarehousePosition(value) {
   const normalized = String(value || "")
     .normalize("NFKC")
@@ -1206,6 +1212,7 @@ function lineHelpText() {
     "回覆相關商品圖片、貨號、主要儲位與庫存；點『完整儲位』可查看所有規格。",
     "",
     "【儲位修改演練】",
+    "功能選單：點『📦 改儲位』後，在 8 秒內回覆貨號。",
     "僅限私訊：改儲位 A12345",
     "接著用按鈕選擇 B倉、區號、左右層架、層位與箱位；A倉按鈕先保留但尚未開放。",
     "全部選完只讀取主倉快照並顯示修改預覽，不會寫入 ERP。",
@@ -1222,7 +1229,7 @@ function lineHelpQuickReplyItems() {
     { label: "🔍 查商品", text: "查" },
     { label: "📍 查儲位", text: "儲位" },
     { label: "🎬 要拍什麼", text: "要拍什麼" },
-    { label: "➕ 新增排程", text: "廣告影片排程" },
+    { label: "📦 改儲位", text: "改儲位" },
     { label: "✅ 已拍完", text: "已拍完" },
     { label: "📝 產生文案", text: "產生文案" },
   ].map((item) => ({
@@ -2486,6 +2493,23 @@ export class LineActivation {
       const elapsed = Number(now) - Number(armedAt);
       return Response.json({ valid: Boolean(armedAt) && elapsed >= 0 && elapsed <= 10000 });
     }
+    if (url.pathname === "/warehouse-position-prompt/arm" && request.method === "POST") {
+      const { armedAt } = await request.json();
+      await this.storage.put("warehousePositionPrompt", { armedAt: Number(armedAt) });
+      return Response.json({ armed: true });
+    }
+    if (url.pathname === "/warehouse-position-prompt/take" && request.method === "POST") {
+      const { now } = await request.json();
+      const prompt = await this.storage.get("warehousePositionPrompt");
+      await this.storage.delete("warehousePositionPrompt");
+      if (!prompt?.armedAt) return Response.json({ valid: false, existed: false });
+      const elapsed = Number(now) - Number(prompt.armedAt);
+      return Response.json({
+        valid: elapsed >= 0 && elapsed <= warehousePositionPromptTtlMs,
+        existed: true,
+        elapsed,
+      });
+    }
     return new Response("Not found", { status: 404 });
   }
 }
@@ -2558,6 +2582,58 @@ async function takeLineGroupActivation(event, env) {
   const valid = elapsed >= 0 && elapsed <= 10000;
   console.log("LINE_GATE", JSON.stringify({ storage: "kv", valid, elapsed }));
   return valid;
+}
+
+function warehousePositionPromptKey(event) {
+  return `line-warehouse-position-prompt:${event?.source?.userId || "unknown-user"}`;
+}
+
+async function durableWarehousePositionPrompt(event, env, action, timestamp) {
+  if (!env.LINE_ACTIVATION || !event?.source?.userId) return null;
+  try {
+    const id = env.LINE_ACTIVATION.idFromName(warehousePositionPromptKey(event));
+    const stub = env.LINE_ACTIVATION.get(id);
+    const response = await stub.fetch(`https://line-activation/warehouse-position-prompt/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(action === "arm" ? { armedAt: timestamp } : { now: timestamp }),
+    });
+    if (!response.ok) return null;
+    return response.json();
+  } catch (error) {
+    console.error("LINE warehouse position prompt Durable Object error", error?.message || error);
+    return null;
+  }
+}
+
+async function armWarehousePositionPrompt(event, env) {
+  const key = warehousePositionPromptKey(event);
+  const armedAt = Number(event.timestamp) || Date.now();
+  const durable = await durableWarehousePositionPrompt(event, env, "arm", armedAt);
+  if (durable?.armed) return true;
+  warehousePositionPromptActivations.set(key, armedAt);
+  if (warehousePositionPromptActivations.size > 1000) {
+    for (const [activationKey, timestamp] of warehousePositionPromptActivations) {
+      if (armedAt - timestamp > 60_000) warehousePositionPromptActivations.delete(activationKey);
+    }
+  }
+  return true;
+}
+
+async function takeWarehousePositionPrompt(event, env) {
+  const now = Number(event.timestamp) || Date.now();
+  const durable = await durableWarehousePositionPrompt(event, env, "take", now);
+  if (typeof durable?.valid === "boolean" && typeof durable?.existed === "boolean") return durable;
+  const key = warehousePositionPromptKey(event);
+  const armedAt = warehousePositionPromptActivations.get(key);
+  warehousePositionPromptActivations.delete(key);
+  if (!armedAt) return { valid: false, existed: false };
+  const elapsed = now - Number(armedAt);
+  return {
+    valid: elapsed >= 0 && elapsed <= warehousePositionPromptTtlMs,
+    existed: true,
+    elapsed,
+  };
 }
 
 async function savePendingLineProduct(event, productUrl, productName, env) {
@@ -2847,6 +2923,29 @@ async function replyWarehousePositionDryRun(event, command, env) {
     );
   } catch (error) {
     console.error("LINE warehouse position dry run error", error?.message || error);
+    await replyLine(
+      event.replyToken,
+      `⚠️ 儲位修改演練已停止：${error?.message || "請稍後再試"}\n\n本次沒有寫入 ERP。`,
+      env,
+    );
+  }
+}
+
+async function replyWarehousePositionPrompt(event, env) {
+  try {
+    const access = await warehousePositionDryRunAccess(event, env);
+    if (!access.ok) {
+      await replyLine(event.replyToken, access.message, env);
+      return;
+    }
+    await armWarehousePositionPrompt(event, env);
+    await replyLine(
+      event.replyToken,
+      "🧪 改儲位純演練\n\n請在 8 秒內回覆貨號，例如：A823\n收到貨號後會開啟子貨號與 B倉位置選單。\n\n目前不會寫入 ERP。",
+      env,
+    );
+  } catch (error) {
+    console.error("LINE warehouse position prompt error", error?.message || error);
     await replyLine(
       event.replyToken,
       `⚠️ 儲位修改演練已停止：${error?.message || "請稍後再試"}\n\n本次沒有寫入 ERP。`,
@@ -3316,6 +3415,10 @@ async function processLineEvent(event, env) {
   }));
 
   if (isWarehousePositionDryRunCommand(text)) {
+    if (isWarehousePositionPromptCommand(text)) {
+      await replyWarehousePositionPrompt(event, env);
+      return;
+    }
     const command = parseWarehousePositionDryRunCommand(text);
     const wizardSku = parseWarehousePositionDryRunStartCommand(text);
     if (wizardSku) {
@@ -3352,6 +3455,28 @@ async function processLineEvent(event, env) {
       await replyLine(event.replyToken, `目前無法讀取廣告影片排程：${error?.message || "請稍後再試"}`, env);
     }
     return;
+  }
+
+  const possiblePromptSku = parseWarehouseLocationCommand(text);
+  const normalizedPromptText = normalizeScheduleDigits(text).normalize("NFKC").trim().toUpperCase();
+  if (
+    event.source?.type === "user"
+    && possiblePromptSku
+    && normalizedPromptText === possiblePromptSku
+  ) {
+    const prompt = await takeWarehousePositionPrompt(event, env);
+    if (prompt.valid) {
+      await replyWarehousePositionWizardStart(event, possiblePromptSku, env);
+      return;
+    }
+    if (prompt.existed) {
+      await replyLine(
+        event.replyToken,
+        "⌛ 已超過 8 秒，這次改儲位演練已失效。\n\n請再點一次功能選單的「改儲位」。\n本次沒有寫入 ERP。",
+        env,
+      );
+      return;
+    }
   }
 
   const warehouseDetailSku = parseWarehouseLocationDetailCommand(text);

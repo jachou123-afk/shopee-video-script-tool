@@ -674,6 +674,7 @@ test("LINE help command recognizes simple usage requests", () => {
     assert.match(help, new RegExp(command));
   }
   assert.match(help, /不必重貼連結/);
+  assert.match(help, /8 秒內回覆貨號/);
   assert.equal(isLineScriptPromptCommand("產生文案"), true);
   assert.equal(isLineScriptPromptCommand("商品文案"), true);
   assert.equal(isLineScriptPromptCommand("洗衣袋"), false);
@@ -683,8 +684,9 @@ test("LINE help command recognizes simple usage requests", () => {
   assert.equal(message.quickReply.items.length, 6);
   assert.deepEqual(
     message.quickReply.items.map((item) => item.action.text),
-    ["查", "儲位", "要拍什麼", "廣告影片排程", "已拍完", "產生文案"],
+    ["查", "儲位", "要拍什麼", "改儲位", "已拍完", "產生文案"],
   );
+  assert.equal(message.quickReply.items[3].action.label, "📦 改儲位");
 });
 
 test("mentioning the helper alone lists every command and keeps the ten-second link window", async () => {
@@ -824,6 +826,42 @@ test("LineActivation provides strongly consistent one-time activation", async ()
     body: JSON.stringify({ now: 20000 }),
   }));
   assert.equal((await response.json()).valid, false);
+});
+
+test("LineActivation enforces a one-time eight-second warehouse prompt", async () => {
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  let response = await object.fetch(new Request("https://line-activation/warehouse-position-prompt/arm", {
+    method: "POST",
+    body: JSON.stringify({ armedAt: 1000 }),
+  }));
+  assert.equal((await response.json()).armed, true);
+  response = await object.fetch(new Request("https://line-activation/warehouse-position-prompt/take", {
+    method: "POST",
+    body: JSON.stringify({ now: 9000 }),
+  }));
+  assert.deepEqual(await response.json(), { valid: true, existed: true, elapsed: 8000 });
+
+  await object.fetch(new Request("https://line-activation/warehouse-position-prompt/arm", {
+    method: "POST",
+    body: JSON.stringify({ armedAt: 1000 }),
+  }));
+  response = await object.fetch(new Request("https://line-activation/warehouse-position-prompt/take", {
+    method: "POST",
+    body: JSON.stringify({ now: 9001 }),
+  }));
+  assert.deepEqual(await response.json(), { valid: false, existed: true, elapsed: 8001 });
+  response = await object.fetch(new Request("https://line-activation/warehouse-position-prompt/take", {
+    method: "POST",
+    body: JSON.stringify({ now: 9002 }),
+  }));
+  assert.deepEqual(await response.json(), { valid: false, existed: false });
 });
 
 test("LineActivation stores pending schedules and keeps completed history", async () => {
@@ -1735,6 +1773,127 @@ test("warehouse position wizard asks for actual child SKU first and previews all
   assert.match(preview, /A823-06｜.* → 02-R04-01\/T1/);
   assert.match(preview, /沒有呼叫 ERP 寫入/);
   assert.deepEqual([...values.entries()], before, "multi-variant wizard must remain read-only and stateless");
+});
+
+test("warehouse menu prompt accepts a private SKU for eight seconds and expires safely", async () => {
+  const originalFetch = globalThis.fetch;
+  const scheduleValues = new Map();
+  const schedule = new LineActivation({
+    storage: {
+      async put(key, value) { scheduleValues.set(key, structuredClone(value)); },
+      async get(key) { return scheduleValues.has(key) ? structuredClone(scheduleValues.get(key)) : undefined; },
+      async delete(key) { scheduleValues.delete(key); },
+    },
+  });
+  await schedule.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      warehouseId: 1,
+      warehouseName: "主倉",
+      items: [{
+        sku: "A823",
+        name: "選單測試商品",
+        available: 6,
+        variants: [
+          { location: "01-L01-01/T1", barcode: "A823-01", available: 3 },
+          { location: "01-L01-01/T2", barcode: "A823-02", available: 3 },
+        ],
+      }],
+    }),
+  }));
+  const before = structuredClone([...scheduleValues.entries()]);
+  const promptObjects = new Map();
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url === "https://api.line.me/v2/bot/info") {
+      return Response.json({ basicId: "@059hdfyo", displayName: "廣告文案小幫手" });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "menu-prompt-line-token",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get(name) {
+        if (name === "line-schedule:global-v1") {
+          return { fetch(input, init) { return schedule.fetch(new Request(input, init)); } };
+        }
+        if (!promptObjects.has(name)) {
+          const values = new Map();
+          promptObjects.set(name, {
+            values,
+            object: new LineActivation({
+              storage: {
+                async put(key, value) { values.set(key, structuredClone(value)); },
+                async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+                async delete(key) { values.delete(key); },
+              },
+            }),
+          });
+        }
+        const entry = promptObjects.get(name);
+        return { fetch(input, init) { return entry.object.fetch(new Request(input, init)); } };
+      },
+    },
+  };
+  const privateSource = { type: "user", userId: "menu-owner" };
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "menu-prompt",
+      timestamp: 10_000,
+      source: privateSource,
+      message: { type: "text", text: "改儲位" },
+    }, env);
+    assert.match(replies.at(-1).messages[0].text, /請在 8 秒內回覆貨號/);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "menu-sku-valid",
+      timestamp: 18_000,
+      source: privateSource,
+      message: { type: "text", text: "a823" },
+    }, env);
+    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.slice(0, 3).map((item) => item.action.label), [
+      "-01", "-02", "全部",
+    ]);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "menu-prompt-expiring",
+      timestamp: 20_000,
+      source: privateSource,
+      message: { type: "text", text: "改儲位" },
+    }, env);
+    await processLineEvent({
+      type: "message",
+      replyToken: "menu-sku-expired",
+      timestamp: 28_001,
+      source: privateSource,
+      message: { type: "text", text: "A823" },
+    }, env);
+    assert.match(replies.at(-1).messages[0].text, /已超過 8 秒/);
+    assert.match(replies.at(-1).messages[0].text, /本次沒有寫入 ERP/);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "menu-group-blocked",
+      timestamp: 30_000,
+      source: { type: "group", groupId: "g1", userId: "menu-owner" },
+      message: { type: "text", text: "改儲位" },
+    }, env);
+    assert.match(replies.at(-1).messages[0].text, /只能在 @059hdfyo 私訊中使用/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual([...scheduleValues.entries()], before, "menu prompt and timeout must not change warehouse data");
+  assert.ok([...promptObjects.values()].every((entry) => entry.values.size === 0), "one-time prompt state must be consumed");
 });
 
 test("warehouse position dry run refuses a different LINE official account", async () => {
