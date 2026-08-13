@@ -17,10 +17,12 @@ import {
   formatWarehouseLocation,
   isGroupSource,
   isLineHelpCommand,
+  isLineScriptPromptCommand,
   isScheduleAddCommand,
   isSelfMentioned,
   LineActivation,
   lineHelpText,
+  createLineHelpMessage,
   lineInput,
   lineActivationKey,
   linePendingKey,
@@ -549,6 +551,17 @@ test("LINE help command recognizes simple usage requests", () => {
     assert.match(help, new RegExp(command));
   }
   assert.match(help, /不必重貼連結/);
+  assert.equal(isLineScriptPromptCommand("產生文案"), true);
+  assert.equal(isLineScriptPromptCommand("商品文案"), true);
+  assert.equal(isLineScriptPromptCommand("洗衣袋"), false);
+
+  const message = createLineHelpMessage();
+  assert.equal(message.type, "text");
+  assert.equal(message.quickReply.items.length, 6);
+  assert.deepEqual(
+    message.quickReply.items.map((item) => item.action.text),
+    ["查", "儲位", "要拍什麼", "廣告影片排程", "已拍完", "產生文案"],
+  );
 });
 
 test("mentioning the helper alone lists every command and keeps the ten-second link window", async () => {
@@ -584,7 +597,34 @@ test("mentioning the helper alone lists every command and keeps the ten-second l
   assert.equal(replies.length, 1);
   assert.match(replies[0].messages[0].text, /文案小幫手指令說明/);
   assert.match(replies[0].messages[0].text, /取消完成1/);
+  assert.equal(replies[0].messages[0].quickReply.items.length, 6);
   assert.equal(await takeLineGroupActivation({ ...event, timestamp: 55_000 }, {}), true);
+});
+
+test("LINE rich-menu script action asks for a product link instead of searching ERP", async () => {
+  const originalFetch = globalThis.fetch;
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${input}`);
+  };
+
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "rich-menu-script",
+      source: { type: "group", groupId: "menu-group", userId: "menu-user" },
+      message: { type: "text", text: "產生文案" },
+    }, { LINE_CHANNEL_ACCESS_TOKEN: "test-line-token" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].messages[0].text, /請貼上蝦皮商品連結/);
 });
 
 test("removeLineMentions keeps the product link and user instructions", () => {

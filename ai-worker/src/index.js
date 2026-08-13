@@ -811,6 +811,10 @@ function isLineHelpCommand(text) {
   return /^(?:使用方法|使用說明|如何使用|怎麼用|說明|help)$/iu.test(String(text || "").trim());
 }
 
+function isLineScriptPromptCommand(text) {
+  return /^(?:產生文案|商品文案|寫文案)$/u.test(String(text || "").trim());
+}
+
 function parseWarehouseLocationCommand(text) {
   const normalized = normalizeScheduleDigits(text).trim();
   const prefixed = normalized.match(/^儲位\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/iu);
@@ -900,6 +904,32 @@ function lineHelpText() {
     "排程相關指令不需要 @文案小幫手。",
     "儲位查詢也不需要 @文案小幫手。",
   ].join("\n");
+}
+
+function lineHelpQuickReplyItems() {
+  return [
+    { label: "🔍 查商品", text: "查" },
+    { label: "📍 查儲位", text: "儲位" },
+    { label: "🎬 要拍什麼", text: "要拍什麼" },
+    { label: "➕ 新增排程", text: "廣告影片排程" },
+    { label: "✅ 已拍完", text: "已拍完" },
+    { label: "📝 產生文案", text: "產生文案" },
+  ].map((item) => ({
+    type: "action",
+    action: {
+      type: "message",
+      label: item.label,
+      text: item.text,
+    },
+  }));
+}
+
+function createLineHelpMessage() {
+  return {
+    type: "text",
+    text: lineHelpText().slice(0, 5000),
+    quickReply: { items: lineHelpQuickReplyItems() },
+  };
 }
 
 function normalizeWarehouseLocationItem(rawItem) {
@@ -2067,7 +2097,16 @@ async function processLineEvent(event, env) {
     if (mentionOnly) await armLineGroup(event, env);
     await replyLine(
       event.replyToken,
-      lineHelpText(),
+      [createLineHelpMessage()],
+      env,
+    );
+    return;
+  }
+
+  if (isLineScriptPromptCommand(text)) {
+    await replyLine(
+      event.replyToken,
+      "請貼上蝦皮商品連結。收到後會直接產生 40 秒標準版腳本，拍攝重點由 AI 自動判斷。",
       env,
     );
     return;
@@ -2194,9 +2233,11 @@ export {
   formatPendingSchedule,
   isGroupSource,
   isLineHelpCommand,
+  isLineScriptPromptCommand,
   isScheduleAddCommand,
   isSelfMentioned,
   lineHelpText,
+  createLineHelpMessage,
   lineInput,
   lineActivationKey,
   linePendingKey,

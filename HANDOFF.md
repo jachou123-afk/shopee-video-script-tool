@@ -4,10 +4,19 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `aea7aa96-bb7a-4524-8e98-0daa4ae9e3b2`
+- Worker version at handoff: `6fccdb88-d635-4c07-a4e2-cb51776e0067`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: all 41 Worker tests and all 6 NAS reader tests pass.
+- Validation status: all 42 Worker tests and all 6 NAS reader tests pass.
+
+## LINE rich menu (2026-08-13)
+
+- A 2500 x 1686 six-button rich menu is active as the Messaging API default for `@037vajci` (`【長頸鹿】下單小幫手`). Its LINE ID is `richmenu-4e7e2a8351c483b285c2d8b0a1038473`.
+- The six message actions are `查`, `要拍什麼`, `廣告影片排程`, `已拍完`, `產生文案`, and `使用方法`.
+- The image source is `line-assets/rich-menu-v2.png`; regenerate it deterministically with `line-assets/build-rich-menu.ps1`.
+- `使用方法` and a mention-only message return six quick-reply shortcuts. `產生文案` asks for a Shopee product URL instead of falling through to ERP keyword search.
+- Rich menus appear in the LINE mobile app, not LINE for PC. After a change, reopen the chat; LINE may take up to one minute to refresh the default menu.
+- The menu was created through the official Messaging API because the Chrome extension could not pass a local file to LINE Official Account Manager. The temporary Cloudflare setup route and `RICH_MENU_SETUP_TOKEN` secret were removed immediately after activation. The unsaved Manager create form can be discarded.
 
 ## LINE workflow
 
