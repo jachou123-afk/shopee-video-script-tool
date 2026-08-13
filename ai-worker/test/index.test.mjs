@@ -5,6 +5,7 @@ import worker, {
   canonicalShopeeUrl,
   createLineFocusPanel,
   createLinePanel,
+  createWarehousePositionDryRunPreview,
   createWarehouseSearchMessage,
   enrichScheduleItemsWithProfitSkus,
   extractShopeePageContent,
@@ -31,6 +32,7 @@ import worker, {
   parseLineFollowup,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
+  parseWarehousePositionDryRunCommand,
   parseWarehouseSearchCommand,
   parseScheduleCompletion,
   parseScheduleSelection,
@@ -130,6 +132,56 @@ test("warehouse location command accepts common LINE input forms", () => {
   assert.equal(parseWarehouseLocationDetailCommand("完整儲位 A725"), "A725");
   assert.equal(parseWarehouseLocationDetailCommand("儲位明細：p063"), "P063");
   assert.equal(parseWarehouseLocationDetailCommand("A725"), null);
+});
+
+test("warehouse position dry-run command requires a SKU and safe new location", () => {
+  assert.deepEqual(parseWarehousePositionDryRunCommand("改儲位 A861 02-R04-01/T3"), {
+    sku: "A861",
+    newLocation: "02-R04-01/T3",
+  });
+  assert.deepEqual(parseWarehousePositionDryRunCommand("改儲位 ａ８６１ Ａ區-０１"), {
+    sku: "A861",
+    newLocation: "A區-01",
+  });
+  assert.equal(parseWarehousePositionDryRunCommand("改儲位 A861"), null);
+  assert.equal(parseWarehousePositionDryRunCommand("改儲位 洗衣袋 A區-01"), null);
+  assert.equal(parseWarehousePositionDryRunCommand("改儲位 A861 <script>"), null);
+  assert.equal(parseWarehousePositionDryRunCommand("儲位 A861"), null);
+});
+
+test("warehouse position dry-run preview fails closed and never claims a write", () => {
+  const now = Date.parse("2026-08-13T20:00:00+08:00");
+  const metadata = {
+    warehouseId: 1,
+    warehouseName: "主倉",
+    updatedAt: "2026-08-13T19:50:00+08:00",
+  };
+  const item = {
+    sku: "A861",
+    name: "測試商品",
+    variants: [{ location: "02-R04-01/T4", style: "紅色", size: "大", barcode: "A861-01", available: 12 }],
+  };
+  const preview = createWarehousePositionDryRunPreview(item, metadata, "02-R04-01/T3", now);
+  assert.match(preview, /演練（不會寫入 ERP）/);
+  assert.match(preview, /原儲位：02-R04-01\/T4/);
+  assert.match(preview, /預計新儲位：02-R04-01\/T3/);
+  assert.match(preview, /只允許 DepotPosition 這一個欄位/);
+  assert.match(preview, /沒有呼叫 ERP 寫入/);
+
+  const multiple = createWarehousePositionDryRunPreview({
+    ...item,
+    variants: [item.variants[0], { ...item.variants[0], barcode: "A861-02" }],
+  }, metadata, "02-R04-01/T3", now);
+  assert.match(multiple, /規格數：2/);
+  assert.match(multiple, /演練已停止/);
+  assert.match(multiple, /本次沒有寫入 ERP/);
+
+  const stale = createWarehousePositionDryRunPreview(item, {
+    ...metadata,
+    updatedAt: "2026-08-13T18:00:00+08:00",
+  }, "02-R04-01/T3", now);
+  assert.match(stale, /快照超過 30 分鐘/);
+  assert.match(stale, /本次沒有寫入 ERP/);
 });
 
 test("warehouse location formatter shows variants and missing locations", () => {
@@ -1372,6 +1424,116 @@ test("group users can query a warehouse location without mentioning the bot", as
   assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 A12345");
   assert.match(replies[1].messages[0].text, /A12345｜測試商品/);
   assert.match(replies[1].messages[0].text, /A區-01/);
+});
+
+test("warehouse position dry run is private, account-bound, and read-only", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      warehouseId: 1,
+      warehouseName: "主倉",
+      items: [{
+        sku: "A861",
+        name: "測試商品",
+        available: 12,
+        variants: [{ location: "02-R04-01/T4", style: "紅色", size: "大", barcode: "A861-01", available: 12 }],
+      }],
+    }),
+  }));
+  const before = structuredClone([...values.entries()]);
+  const replies = [];
+  let botInfoRequests = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url === "https://api.line.me/v2/bot/info") {
+      botInfoRequests += 1;
+      assert.equal(init.headers.Authorization, "Bearer dry-run-line-token");
+      return Response.json({ basicId: "@059hdfyo", displayName: "廣告文案小幫手" });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "dry-run-line-token",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() { return { fetch(input, init) { return object.fetch(new Request(input, init)); } }; },
+    },
+  };
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "dry-run-private",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      message: { type: "text", text: "改儲位 A861 02-R04-01/T3" },
+    }, env);
+    await processLineEvent({
+      type: "message",
+      replyToken: "dry-run-group",
+      timestamp: Date.now(),
+      source: { type: "group", groupId: "g1", userId: "owner-user" },
+      message: { type: "text", text: "改儲位 A861 02-R04-01/T3" },
+    }, env);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(botInfoRequests, 1);
+  assert.equal(replies.length, 2);
+  assert.match(replies[0].messages[0].text, /儲位修改演練（不會寫入 ERP）/);
+  assert.match(replies[0].messages[0].text, /原儲位：02-R04-01\/T4/);
+  assert.match(replies[0].messages[0].text, /預計新儲位：02-R04-01\/T3/);
+  assert.match(replies[1].messages[0].text, /只能在 @059hdfyo 私訊中使用/);
+  assert.deepEqual([...values.entries()], before, "dry run must not change Durable Object storage");
+});
+
+test("warehouse position dry run refuses a different LINE official account", async () => {
+  const originalFetch = globalThis.fetch;
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url === "https://api.line.me/v2/bot/info") {
+      return Response.json({ basicId: "@037vajci", displayName: "另一個帳號" });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "wrong-account",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      message: { type: "text", text: "改儲位 A861 A區-01" },
+    }, {
+      LINE_CHANNEL_ACCESS_TOKEN: "wrong-account-token",
+      LINE_ACTIVATION: {
+        idFromName(name) { return name; },
+        get() { throw new Error("warehouse lookup must not run for the wrong account"); },
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].messages[0].text, /目前 LINE 官方帳號不是 @059hdfyo/);
+  assert.match(replies[0].messages[0].text, /本次沒有寫入 ERP/);
 });
 
 test("group users can search warehouse products by a bare keyword without mentioning the bot", async () => {

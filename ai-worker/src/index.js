@@ -22,7 +22,10 @@ const warehouseImageFailureBaseDelayMs = 30 * 60_000;
 const warehouseImageMaxBytes = 8 * 1024 * 1024;
 const nasImagePrecacheChunkSize = 100;
 const nasImagePrecacheOfflineDelayMs = 5 * 60_000;
+const warehousePositionDryRunTargetBasicId = "@059hdfyo";
+const warehousePositionDryRunMaxSnapshotAgeMs = 30 * 60_000;
 let profitWarehouseCatalogCache = { expiresAt: 0, token: "", products: new Map() };
+let lineBotInfoCache = { expiresAt: 0, token: "", info: null };
 
 function corsHeaders(origin) {
   return {
@@ -894,6 +897,30 @@ function parseWarehouseLocationDetailCommand(text) {
   return match ? parseWarehouseLocationCommand(String(match[1] || "")) : null;
 }
 
+function isWarehousePositionDryRunCommand(text) {
+  return /^改儲位(?:\s|$)/u.test(String(text || "").normalize("NFKC").trim());
+}
+
+function normalizeWarehousePosition(value) {
+  const normalized = String(value || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized || normalized.length > 80 || /[\u0000-\u001f\u007f]/u.test(normalized)) return "";
+  return /^[\p{L}\p{N}._/+#:()（）-]+(?: [\p{L}\p{N}._/+#:()（）-]+)*$/u.test(normalized)
+    ? normalized
+    : "";
+}
+
+function parseWarehousePositionDryRunCommand(text) {
+  const normalized = normalizeScheduleDigits(text).normalize("NFKC").replace(/\s+/g, " ").trim();
+  const match = normalized.match(/^改儲位\s+([^\s]+)\s+(.+)$/u);
+  if (!match) return null;
+  const sku = parseWarehouseLocationCommand(match[1]);
+  const newLocation = normalizeWarehousePosition(match[2]);
+  return sku && newLocation ? { sku, newLocation } : null;
+}
+
 function normalizeWarehouseSearchText(value) {
   return String(value || "")
     .normalize("NFKC")
@@ -966,6 +993,11 @@ function lineHelpText() {
     "直接輸入商品關鍵字，例如：洗衣袋",
     "「查 洗衣袋」或「儲位 洗衣袋」也可以使用。",
     "回覆相關商品圖片、貨號、主要儲位與庫存；點『完整儲位』可查看所有規格。",
+    "",
+    "【儲位修改演練】",
+    "僅限私訊：改儲位 A12345 02-R04-01/T3",
+    "目前只讀取主倉快照並顯示修改預覽，不會寫入 ERP。",
+    "多規格商品會安全停止，不會自行猜測規格。",
     "",
     "排程相關指令不需要 @文案小幫手。",
     "儲位查詢也不需要 @文案小幫手。",
@@ -2069,7 +2101,7 @@ export class LineActivation {
   }
 
   async queryWarehouseLocation(request) {
-    const { sku: rawSku } = await request.json();
+    const { sku: rawSku, includeImage = true } = await request.json();
     const sku = String(rawSku || "").replace(/\s+/g, "").trim().toUpperCase().slice(0, 80);
     const metadata = await this.storage.get("warehouse-location-active");
     if (!metadata?.version || !sku) {
@@ -2080,8 +2112,8 @@ export class LineActivation {
       `warehouse-location:${metadata.version}:${warehouseLocationBucket(sku, bucketCount)}`,
     );
     const locationItem = bucket && typeof bucket === "object" ? bucket[sku] || null : null;
-    let cached = locationItem ? await this.warehouseImageCacheRecord(sku) : null;
-    if (locationItem && !cached?.imageUrl && isNasLocalImageSku(sku)) {
+    let cached = includeImage !== false && locationItem ? await this.warehouseImageCacheRecord(sku) : null;
+    if (includeImage !== false && locationItem && !cached?.imageUrl && isNasLocalImageSku(sku)) {
       cached = await this.warehouseImageObjectRecord(sku);
     }
     return Response.json({
@@ -2412,16 +2444,129 @@ async function releaseLineScheduleGeneration(env, token) {
   }
 }
 
-async function warehouseLocationRequest(env, sku) {
+async function warehouseLocationRequest(env, sku, includeImage = true) {
   if (!env.LINE_ACTIVATION) throw httpError("ERP 儲位查詢服務尚未設定", 503);
   const stub = lineScheduleStub(env, globalLineScheduleName);
   const response = await stub.fetch("https://line-schedule/warehouse-locations/query", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sku }),
+    body: JSON.stringify({ sku, includeImage }),
   });
   if (!response.ok) throw httpError("ERP 儲位查詢暫時無法使用", 503);
   return response.json();
+}
+
+async function lineBotInfo(env) {
+  const token = String(env.LINE_CHANNEL_ACCESS_TOKEN || "");
+  if (!token) throw httpError("LINE 帳號尚未設定", 503);
+  if (lineBotInfoCache.token === token && lineBotInfoCache.expiresAt > Date.now() && lineBotInfoCache.info) {
+    return lineBotInfoCache.info;
+  }
+  const response = await fetch("https://api.line.me/v2/bot/info", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) throw httpError("無法核對目前 LINE 官方帳號", 503);
+  const info = await response.json();
+  lineBotInfoCache = { token, info, expiresAt: Date.now() + 10 * 60_000 };
+  return info;
+}
+
+function warehousePositionVariantLabel(variant) {
+  const parts = [variant?.style, variant?.size, variant?.barcode]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return parts.length ? parts.join("／") : "單一規格";
+}
+
+function createWarehousePositionDryRunPreview(item, metadata, newLocation, now = Date.now()) {
+  if (!metadata) {
+    return "⚠️ 儲位修改演練已停止\n\nERP 主倉快照尚未完成第一次同步。\n\n本次沒有寫入 ERP。";
+  }
+  if (Number(metadata.warehouseId) !== 1) {
+    return "⚠️ 儲位修改演練已停止\n\n目前快照不是主倉（InventoryId=1），不能建立預覽。\n\n本次沒有寫入 ERP。";
+  }
+  const updatedAtMs = Date.parse(String(metadata.updatedAt || ""));
+  if (!Number.isFinite(updatedAtMs) || now - updatedAtMs > warehousePositionDryRunMaxSnapshotAgeMs || updatedAtMs > now + 5 * 60_000) {
+    return `⚠️ 儲位修改演練已停止\n\nERP 主倉快照超過 30 分鐘或時間無效，請先確認同步正常。\n快照時間：${metadata.updatedAt || "未知"}\n\n本次沒有寫入 ERP。`;
+  }
+  if (!item) {
+    return "⚠️ 儲位修改演練已停止\n\nERP 主倉查無此貨號，請確認貨號是否完整。\n\n本次沒有寫入 ERP。";
+  }
+  const variants = Array.isArray(item.variants) ? item.variants : [];
+  if (variants.length !== 1) {
+    return [
+      "⚠️ 儲位修改演練已停止",
+      "",
+      `貨號：${item.sku}`,
+      `商品：${item.name}`,
+      `規格數：${variants.length}`,
+      "",
+      "目前演練模式只允許單一規格商品。多規格商品必須先加入明確的規格選擇，系統不會自行猜測。",
+      "",
+      "本次沒有寫入 ERP。",
+    ].join("\n");
+  }
+  const variant = variants[0];
+  const oldLocation = String(variant.location || "").trim() || "尚未設定";
+  if (oldLocation === newLocation) {
+    return [
+      "ℹ️ 儲位修改演練",
+      "",
+      `貨號：${item.sku}`,
+      `商品：${item.name}`,
+      `目前儲位：${oldLocation}`,
+      `輸入儲位：${newLocation}`,
+      "",
+      "新舊儲位相同，不需要修改。",
+      "本次沒有寫入 ERP。",
+    ].join("\n");
+  }
+  return [
+    "🧪 儲位修改演練（不會寫入 ERP）",
+    "",
+    `貨號：${item.sku}`,
+    `商品：${item.name}`,
+    `規格：${warehousePositionVariantLabel(variant)}`,
+    `倉庫：${metadata.warehouseName || "主倉"}（InventoryId=1）`,
+    `主倉可用庫存：${Number(variant.available) || 0}`,
+    `原儲位：${oldLocation}`,
+    `預計新儲位：${newLocation}`,
+    `快照時間：${metadata.updatedAt}`,
+    "",
+    "安全檢查：預計只允許 DepotPosition 這一個欄位改變。",
+    "結果：演練完成，沒有建立確認碼，也沒有呼叫 ERP 寫入。",
+  ].join("\n");
+}
+
+async function replyWarehousePositionDryRun(event, command, env) {
+  if (event.source?.type !== "user" || !event.source?.userId) {
+    await replyLine(event.replyToken, "🔒 為了避免誤改資料，『改儲位』演練只能在 @059hdfyo 私訊中使用。\n\n本次沒有寫入 ERP。", env);
+    return;
+  }
+  try {
+    const info = await lineBotInfo(env);
+    if (String(info?.basicId || "").toLowerCase() !== warehousePositionDryRunTargetBasicId.toLowerCase()) {
+      await replyLine(
+        event.replyToken,
+        `🔒 儲位功能已停止：目前 LINE 官方帳號不是 ${warehousePositionDryRunTargetBasicId}。\n\n本次沒有寫入 ERP。`,
+        env,
+      );
+      return;
+    }
+    const result = await warehouseLocationRequest(env, command.sku, false);
+    await replyLine(
+      event.replyToken,
+      createWarehousePositionDryRunPreview(result?.item, result?.metadata, command.newLocation),
+      env,
+    );
+  } catch (error) {
+    console.error("LINE warehouse position dry run error", error?.message || error);
+    await replyLine(
+      event.replyToken,
+      `⚠️ 儲位修改演練已停止：${error?.message || "請稍後再試"}\n\n本次沒有寫入 ERP。`,
+      env,
+    );
+  }
 }
 
 async function warehouseSearchRequest(env, keyword) {
@@ -2778,6 +2923,20 @@ async function processLineEvent(event, env) {
     productUrlDetected: Boolean(productUrl),
     textLength: text.length,
   }));
+
+  if (isWarehousePositionDryRunCommand(text)) {
+    const command = parseWarehousePositionDryRunCommand(text);
+    if (!command) {
+      await replyLine(
+        event.replyToken,
+        "🧪 儲位修改演練格式：\n改儲位 貨號 新儲位\n\n例如：改儲位 A861 02-R04-01/T3\n目前只做預覽，不會寫入 ERP。",
+        env,
+      );
+      return;
+    }
+    await replyWarehousePositionDryRun(event, command, env);
+    return;
+  }
 
   if (isScheduleAddCommand(text)) {
     try {
@@ -3201,6 +3360,7 @@ export {
   parseLineFollowup,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
+  parseWarehousePositionDryRunCommand,
   parseWarehouseSearchCommand,
   parseScheduleCompletion,
   parseScheduleSelection,
@@ -3214,6 +3374,7 @@ export {
   shopeeProductId,
   splitLineText,
   formatWarehouseLocation,
+  createWarehousePositionDryRunPreview,
   warehouseLocationBucket,
   warehouseSearchScore,
   withAbortTimeout,
