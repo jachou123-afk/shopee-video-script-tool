@@ -881,6 +881,12 @@ function parseWarehouseLocationCommand(text) {
   return isBareSku ? sku : null;
 }
 
+function parseWarehouseLocationDetailCommand(text) {
+  const normalized = normalizeScheduleDigits(text).replace(/\s+/g, " ").trim();
+  const match = normalized.match(/^(?:完整儲位|儲位明細)\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/u);
+  return match ? parseWarehouseLocationCommand(String(match[1] || "")) : null;
+}
+
 function normalizeWarehouseSearchText(value) {
   return String(value || "")
     .normalize("NFKC")
@@ -947,7 +953,8 @@ function lineHelpText() {
     "【查詢 ERP 主倉儲位】",
     "直接輸入貨號，例如：A12345",
     "原本的「儲位 A12345」也可以使用。",
-    "回覆商品名稱、主倉儲位與主倉可用庫存。",
+    "回覆商品圖片、貨號、商品名稱、主要儲位與主倉可用庫存。",
+    "點卡片中的「完整儲位」可查看所有規格明細。",
     "",
     "直接輸入商品關鍵字，例如：洗衣袋",
     "「查 洗衣袋」或「儲位 洗衣袋」也可以使用。",
@@ -1091,7 +1098,7 @@ function createWarehouseSearchMessage(items, keyword, totalCount = items.length)
           style: "primary",
           color: "#174B3A",
           height: "sm",
-          action: { type: "message", label: "完整儲位", text: item.sku },
+          action: { type: "message", label: "完整儲位", text: `完整儲位 ${item.sku}` },
         }],
       },
     };
@@ -1782,9 +1789,16 @@ export class LineActivation {
     const bucket = await this.storage.get(
       `warehouse-location:${metadata.version}:${warehouseLocationBucket(sku, bucketCount)}`,
     );
+    const locationItem = bucket && typeof bucket === "object" ? bucket[sku] || null : null;
+    const cached = locationItem ? await this.warehouseImageCacheRecord(sku) : null;
     return Response.json({
       ok: true,
-      item: bucket && typeof bucket === "object" ? bucket[sku] || null : null,
+      item: cached?.imageUrl ? {
+        ...locationItem,
+        productId: cached.productId,
+        productUrl: cached.productUrl,
+        imageUrl: cached.imageUrl,
+      } : locationItem,
       metadata,
     });
   }
@@ -2169,13 +2183,19 @@ async function enrichWarehouseSearchItems(items, env) {
   return enriched;
 }
 
-async function replyWarehouseLocation(event, sku, env) {
+async function replyWarehouseLocation(event, sku, env, showDetails = false) {
   try {
     const result = await warehouseLocationRequest(env, sku);
-    const text = result?.metadata
-      ? formatWarehouseLocation(result.item, result.metadata)
-      : "ERP 主倉儲位資料尚未完成第一次同步，請稍後再試。";
-    await replyLine(event.replyToken, text, env);
+    if (!result?.metadata) {
+      await replyLine(event.replyToken, "ERP 主倉儲位資料尚未完成第一次同步，請稍後再試。", env);
+      return;
+    }
+    if (showDetails || !result.item) {
+      await replyLine(event.replyToken, formatWarehouseLocation(result.item, result.metadata), env);
+      return;
+    }
+    const [item] = await enrichWarehouseSearchItems([result.item], env);
+    await replyLine(event.replyToken, [createWarehouseSearchMessage([item], sku, 1)], env);
   } catch (error) {
     console.error("LINE warehouse location error", error?.message || error);
     await replyLine(event.replyToken, `目前無法查詢 ERP 儲位：${error?.message || "請稍後再試"}`, env);
@@ -2410,6 +2430,12 @@ async function processLineEvent(event, env) {
       console.error("LINE schedule list error", error?.message || error);
       await replyLine(event.replyToken, `目前無法讀取廣告影片排程：${error?.message || "請稍後再試"}`, env);
     }
+    return;
+  }
+
+  const warehouseDetailSku = parseWarehouseLocationDetailCommand(text);
+  if (warehouseDetailSku) {
+    await replyWarehouseLocation(event, warehouseDetailSku, env, true);
     return;
   }
 
@@ -2682,6 +2708,7 @@ export {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
   parseWarehouseSearchCommand,
   parseScheduleCompletion,

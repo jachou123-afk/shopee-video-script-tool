@@ -28,6 +28,7 @@ import {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
   parseWarehouseSearchCommand,
   parseScheduleCompletion,
@@ -118,6 +119,9 @@ test("warehouse location command accepts common LINE input forms", () => {
   assert.equal(parseWarehouseSearchCommand("搜 襪"), "襪");
   assert.equal(parseWarehouseSearchCommand("儲位：洗衣袋"), "洗衣袋");
   assert.equal(parseWarehouseSearchCommand("A725"), null);
+  assert.equal(parseWarehouseLocationDetailCommand("完整儲位 A725"), "A725");
+  assert.equal(parseWarehouseLocationDetailCommand("儲位明細：p063"), "P063");
+  assert.equal(parseWarehouseLocationDetailCommand("A725"), null);
 });
 
 test("warehouse location formatter shows variants and missing locations", () => {
@@ -153,7 +157,7 @@ test("warehouse keyword search ranks matches and builds image cards", () => {
   }], "洗衣袋", 1);
   assert.equal(message.type, "flex");
   assert.equal(message.contents.contents[0].hero.url, "https://example.com/laundry-bag.jpg");
-  assert.equal(message.contents.contents[0].footer.contents[0].action.text, "A725");
+  assert.equal(message.contents.contents[0].footer.contents[0].action.text, "完整儲位 A725");
   assert.match(message.altText, /找到 1 項/);
 });
 
@@ -946,6 +950,13 @@ test("warehouse image cache downloads only one product per alarm and persists th
     let data = await response.json();
     assert.match(data.items[0].imageUrl, /\/product-images\/A100\?v=/);
 
+    response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query", {
+      method: "POST",
+      body: JSON.stringify({ sku: "A100" }),
+    }));
+    data = await response.json();
+    assert.match(data.item.imageUrl, /\/product-images\/A100\?v=/);
+
     await object.alarm();
     assert.equal(imageRequests, 2);
     assert.equal(storedImages.size, 2);
@@ -1008,12 +1019,22 @@ test("group users can query a warehouse location without mentioning the bot", as
       source: { type: "group", groupId: "g1", userId: "u1" },
       message: { type: "text", text: "A12345" },
     }, env);
+    await processLineEvent({
+      type: "message",
+      replyToken: "warehouse-details",
+      timestamp: Date.now(),
+      source: { type: "group", groupId: "g1", userId: "u1" },
+      message: { type: "text", text: "完整儲位 A12345" },
+    }, env);
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.equal(replies.length, 1);
-  assert.match(replies[0].messages[0].text, /A12345｜測試商品/);
-  assert.match(replies[0].messages[0].text, /A區-01/);
+  assert.equal(replies.length, 2);
+  assert.equal(replies[0].messages[0].type, "flex");
+  assert.match(replies[0].messages[0].altText, /A12345.*找到 1 項/);
+  assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 A12345");
+  assert.match(replies[1].messages[0].text, /A12345｜測試商品/);
+  assert.match(replies[1].messages[0].text, /A區-01/);
 });
 
 test("group users can search warehouse products by a bare keyword without mentioning the bot", async () => {
@@ -1070,7 +1091,7 @@ test("group users can search warehouse products by a bare keyword without mentio
   assert.equal(replies.length, 1);
   assert.equal(replies[0].messages[0].type, "flex");
   assert.match(replies[0].messages[0].altText, /洗衣袋.*找到 1 項/);
-  assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "A100");
+  assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 A100");
 });
 
 test("formatLineScript creates a readable LINE reply", () => {

@@ -4,7 +4,7 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `43619ece-8675-4b61-bdcc-a2119eff5680`
+- Worker version at handoff: `3cbfe7da-1e85-460e-825d-727c7a1303b1`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
 - Validation status: all 43 Worker tests and all 6 NAS reader tests pass.
@@ -36,8 +36,9 @@
 - `完成2`: move pending item 2 to completed.
 - `已拍完`: list completed details, employee, and completion time.
 - `取消完成1`: move completed item 1 back to pending.
-- `A12345`: directly return the ERP 主倉 location and available quantity; no mention is required. Lowercase input is normalized to uppercase.
+- `A12345`: return the same product card as a keyword search, including the cached image when available, stock, and primary ERP 主倉 locations; no mention is required. Lowercase input is normalized to uppercase.
 - `儲位 A12345`: remains supported for backward compatibility.
+- `完整儲位 A12345`: return the full text location details for every variant. Product-card buttons emit this command so exact-SKU cards do not loop back into themselves.
 - A bare product keyword such as `洗衣袋`: search the ERP catalog without mentioning the bot and return up to ten Flex cards with product image (when available), SKU, name, stock, primary locations, a full-location button, and a Shopee product button.
 - Single-character keywords are supported, so `襪`, `搜 襪`, and `查 襪` all search the existing ERP catalog index.
 - `查 洗衣袋` and `儲位 洗衣袋`: explicit keyword-search forms with the same result. These forms work in private chats and groups.
