@@ -25,6 +25,18 @@ export function cleanText(value, limit = 12000) {
     .slice(0, limit);
 }
 
+export function normalizeShopeeImageUrl(value) {
+  const raw = typeof value === "object" && value
+    ? value.url || value.imageUrl || value.image_url || value.id || value.image_id || ""
+    : value;
+  const text = String(raw || "").trim();
+  if (/^https:\/\/[^\s]+$/iu.test(text)) return text.slice(0, 2000);
+  if (/^[A-Za-z0-9_-]{10,300}$/u.test(text)) {
+    return `https://down-tw.img.susercontent.com/file/${text}`;
+  }
+  return "";
+}
+
 function attributeLines(attributes) {
   if (!Array.isArray(attributes)) return [];
   return attributes.flatMap((attribute) => {
@@ -62,9 +74,15 @@ export function normalizePdpResponse(payload) {
     description,
     details.length ? `商品細節\n${details.join("\n")}` : "",
   ].filter(Boolean).join("\n\n"));
+  const imageUrl = normalizeShopeeImageUrl(
+    (Array.isArray(item.images) ? item.images[0] : "")
+      || item.image
+      || item.image_url
+      || item.cover,
+  );
 
   if (!title && !combined) return null;
-  return { title, description: combined, source: "authenticated_api" };
+  return { title, description: combined, imageUrl, source: "authenticated_api" };
 }
 
 export function normalizeMetaContent(snapshot) {
@@ -73,7 +91,12 @@ export function normalizeMetaContent(snapshot) {
     .trim();
   const description = cleanText(snapshot?.ogDescription || snapshot?.description, 12000);
   if (!title && !description) return null;
-  return { title, description, source: "authenticated_meta" };
+  return {
+    title,
+    description,
+    imageUrl: normalizeShopeeImageUrl(snapshot?.ogImage || snapshot?.imageUrl),
+    source: "authenticated_meta",
+  };
 }
 
 export function looksLikeLoginWall(snapshot) {

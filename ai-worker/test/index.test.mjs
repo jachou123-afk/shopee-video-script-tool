@@ -5,6 +5,7 @@ import {
   canonicalShopeeUrl,
   createLineFocusPanel,
   createLinePanel,
+  createWarehouseSearchMessage,
   enrichScheduleItemsWithProfitSkus,
   extractShopeePageContent,
   fetchShopeePageContent,
@@ -26,11 +27,13 @@ import {
   panelPostback,
   parseLineFollowup,
   parseWarehouseLocationCommand,
+  parseWarehouseSearchCommand,
   parseScheduleCompletion,
   parseScheduleSelection,
   parseScheduleUndoCompletion,
   processLineEvent,
   productTitle,
+  profitWarehouseProductMapFromDashboard,
   profitSkuMapFromDashboard,
   removeLineMentions,
   scheduleItemsFromText,
@@ -39,6 +42,7 @@ import {
   takeLineGroupActivation,
   verifyLineSignature,
   warehouseLocationBucket,
+  warehouseSearchScore,
   withAbortTimeout,
 } from "../src/index.js";
 
@@ -105,6 +109,11 @@ test("warehouse location command accepts common LINE input forms", () => {
   assert.equal(parseWarehouseLocationCommand("要拍什麼"), null);
   assert.equal(parseWarehouseLocationCommand("儲位"), null);
   assert.equal(parseWarehouseLocationCommand("查儲位 A12345"), null);
+  assert.equal(parseWarehouseLocationCommand("儲位 洗衣袋"), null);
+  assert.equal(parseWarehouseSearchCommand("洗衣袋"), "洗衣袋");
+  assert.equal(parseWarehouseSearchCommand("查 洗衣袋"), "洗衣袋");
+  assert.equal(parseWarehouseSearchCommand("儲位：洗衣袋"), "洗衣袋");
+  assert.equal(parseWarehouseSearchCommand("A725"), null);
 });
 
 test("warehouse location formatter shows variants and missing locations", () => {
@@ -123,6 +132,42 @@ test("warehouse location formatter shows variants and missing locations", () => 
   assert.match(text, /更新：2026\/08\/12/);
   assert.match(formatWarehouseLocation({ sku: "B1", name: "無儲位", available: 0, variants: [] }), /尚未設定儲位/);
   assert.equal(warehouseLocationBucket("A12345"), warehouseLocationBucket("A12345"));
+});
+
+test("warehouse keyword search ranks matches and builds image cards", () => {
+  assert.equal(warehouseSearchScore({ sku: "A1", name: "洗衣袋" }, "洗衣袋"), 1);
+  assert.equal(warehouseSearchScore({ sku: "A2", name: "洗衣袋 加厚款" }, "洗衣袋"), 2);
+  assert.equal(warehouseSearchScore({ sku: "A3", name: "旅行用細網洗衣袋" }, "洗衣袋"), 3);
+  assert.equal(warehouseSearchScore({ sku: "A4", name: "收納袋" }, "洗衣袋"), null);
+  const message = createWarehouseSearchMessage([{
+    sku: "A725",
+    name: "細網洗衣袋",
+    available: 12,
+    imageUrl: "https://example.com/laundry-bag.jpg",
+    productUrl: "https://shopee.tw/product/52793230/123",
+    variants: [{ location: "A區-01" }, { location: "B區-02" }],
+  }], "洗衣袋", 1);
+  assert.equal(message.type, "flex");
+  assert.equal(message.contents.contents[0].hero.url, "https://example.com/laundry-bag.jpg");
+  assert.equal(message.contents.contents[0].footer.contents[0].action.text, "A725");
+  assert.match(message.altText, /找到 1 項/);
+});
+
+test("pure-profit products provide Shopee URLs and image URLs for warehouse cards", () => {
+  const mapping = profitWarehouseProductMapFromDashboard({
+    current: {
+      products: [{
+        pid: "27127565611",
+        skuLabel: "a725",
+        image: "tw-11134207-product-image-id",
+      }],
+    },
+  });
+  assert.deepEqual(mapping.get("A725"), {
+    productId: "27127565611",
+    productUrl: "https://shopee.tw/product/52793230/27127565611",
+    imageUrl: "https://down-tw.img.susercontent.com/file/tw-11134207-product-image-id",
+  });
 });
 
 test("schedule list formatters include pending and completed details", () => {
@@ -748,6 +793,15 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   assert.equal(data.item.variants[0].location, "A區-01");
   assert.equal(data.metadata.warehouseName, "主倉");
 
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/search", {
+    method: "POST",
+    body: JSON.stringify({ keyword: "測試商品" }),
+  }));
+  data = await response.json();
+  assert.equal(data.totalCount, 1);
+  assert.equal(data.items[0].sku, "A12345");
+  assert.equal(data.items[0].variants[0].location, "A區-01");
+
   response = await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
     method: "POST",
     body: JSON.stringify({ items: [] }),
@@ -814,6 +868,63 @@ test("group users can query a warehouse location without mentioning the bot", as
   assert.equal(replies.length, 1);
   assert.match(replies[0].messages[0].text, /A12345｜測試商品/);
   assert.match(replies[0].messages[0].text, /A區-01/);
+});
+
+test("group users can search warehouse products by a bare keyword without mentioning the bot", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: "2026-08-13T09:00:00+08:00",
+      items: [
+        {
+          sku: "A100",
+          name: "細網洗衣袋",
+          available: 8,
+          variants: [{ location: "A區-01", available: 8 }],
+        },
+        { sku: "B200", name: "收納盒", available: 3, variants: [] },
+      ],
+    }),
+  }));
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${input}`);
+  };
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() { return { fetch(input, init) { return object.fetch(new Request(input, init)); } }; },
+    },
+  };
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "warehouse-keyword",
+      timestamp: Date.now(),
+      source: { type: "group", groupId: "g1", userId: "u1" },
+      message: { type: "text", text: "洗衣袋" },
+    }, env);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].messages[0].type, "flex");
+  assert.match(replies[0].messages[0].altText, /洗衣袋.*找到 1 項/);
+  assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "A100");
 });
 
 test("formatLineScript creates a readable LINE reply", () => {

@@ -9,6 +9,8 @@ const lineActivations = new Map();
 const encoder = new TextEncoder();
 const globalLineScheduleName = "line-schedule:global-v1";
 const profitDashboardDataUrl = "https://vicchou-profit-analysis.vicchou.chatgpt.site/api/dashboard-data";
+const defaultShopeeShopId = "52793230";
+let profitWarehouseCatalogCache = { expiresAt: 0, token: "", products: new Map() };
 
 function corsHeaders(origin) {
   return {
@@ -140,7 +142,14 @@ function normalizeReaderProduct(product) {
     .replace(/\n{3,}/g, "\n\n")
     .trim()
     .slice(0, 12000);
-  return { title, description, source: String(product?.source || "nas_browser").slice(0, 80) };
+  const normalized = {
+    title,
+    description,
+    source: String(product?.source || "nas_browser").slice(0, 80),
+  };
+  const imageUrl = normalizeShopeeImageUrl(product?.imageUrl || product?.image_url || product?.image);
+  if (imageUrl) normalized.imageUrl = imageUrl;
+  return normalized;
 }
 
 function readerBrokerStub(env) {
@@ -237,6 +246,76 @@ function profitSkuMapFromDashboard(data) {
     if (productId && skuLabel) mapping.set(productId, skuLabel);
   }
   return mapping;
+}
+
+function normalizeWarehouseSku(value) {
+  return String(value || "").normalize("NFKC").replace(/\s+/g, "").trim().toUpperCase().slice(0, 80);
+}
+
+function normalizeShopeeImageUrl(value) {
+  const raw = typeof value === "object" && value
+    ? value.url || value.imageUrl || value.image_url || value.id || value.image_id || ""
+    : value;
+  const text = String(raw || "").trim();
+  if (/^https:\/\/[^\s]+$/iu.test(text)) return text.slice(0, 2000);
+  if (/^[A-Za-z0-9_-]{10,300}$/u.test(text)) {
+    return `https://down-tw.img.susercontent.com/file/${text}`;
+  }
+  return "";
+}
+
+function profitWarehouseProductMapFromDashboard(data) {
+  const products = Array.isArray(data?.current?.products) ? data.current.products : [];
+  const mapping = new Map();
+  for (const product of products) {
+    const sku = normalizeWarehouseSku(product?.skuLabel || product?.sku || product?.itemSku);
+    const productId = String(product?.pid || product?.productId || product?.itemId || "").trim();
+    if (!sku || !productId || mapping.has(sku)) continue;
+    const shopId = String(product?.shopId || product?.shop_id || defaultShopeeShopId).trim() || defaultShopeeShopId;
+    const imageCandidate = product?.imageUrl
+      || product?.image_url
+      || product?.thumbnailUrl
+      || product?.thumbnail
+      || product?.coverImage
+      || product?.cover
+      || product?.image
+      || (Array.isArray(product?.images) ? product.images[0] : "");
+    mapping.set(sku, {
+      productId,
+      productUrl: `https://shopee.tw/product/${shopId}/${productId}`,
+      imageUrl: normalizeShopeeImageUrl(imageCandidate),
+    });
+  }
+  return mapping;
+}
+
+async function profitWarehouseProductMap(env) {
+  const bypassToken = String(env?.PROFIT_DASHBOARD_BYPASS_TOKEN || "").trim();
+  if (!bypassToken) return new Map();
+  if (
+    profitWarehouseCatalogCache.token === bypassToken
+    && profitWarehouseCatalogCache.expiresAt > Date.now()
+  ) {
+    return profitWarehouseCatalogCache.products;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+  try {
+    const response = await fetch(profitDashboardDataUrl, {
+      headers: { "OAI-Sites-Authorization": `Bearer ${bypassToken}` },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    const products = profitWarehouseProductMapFromDashboard(await response.json());
+    profitWarehouseCatalogCache = {
+      token: bypassToken,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      products,
+    };
+    return products;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function enrichScheduleItemsWithProfitSkus(items, env) {
@@ -737,12 +816,43 @@ function parseWarehouseLocationCommand(text) {
   const prefixed = normalized.match(/^儲位\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/iu);
   if (prefixed) {
     const sku = String(prefixed[1] || "").replace(/[，,。；;]+$/u, "").trim().toUpperCase();
-    return sku && sku.length <= 80 ? sku : null;
+    const isPrefixedSku = /^(?=[A-Z0-9._-]{2,80}$)(?=[A-Z0-9._-]*[A-Z])(?=[A-Z0-9._-]*\d)[A-Z0-9._-]+$/u.test(sku);
+    return isPrefixedSku ? sku : null;
   }
 
   const sku = normalized.toUpperCase();
   const isBareSku = /^(?=[A-Z0-9._-]{2,80}$)(?=[A-Z0-9._-]*[A-Z])(?=[A-Z0-9._-]*\d)[A-Z0-9._-]+$/u.test(sku);
   return isBareSku ? sku : null;
+}
+
+function normalizeWarehouseSearchText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toUpperCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, "")
+    .slice(0, 160);
+}
+
+function parseWarehouseSearchCommand(text) {
+  const normalized = normalizeScheduleDigits(text).replace(/\s+/g, " ").trim();
+  if (!normalized || /https?:\/\/|shopee/iu.test(normalized)) return null;
+  const prefixed = normalized.match(/^(?:儲位|查詢?|搜尋)\s*(?:[+＋:：]\s*)?(.+)$/iu);
+  const keyword = String(prefixed?.[1] || normalized).trim().slice(0, 80);
+  const searchable = normalizeWarehouseSearchText(keyword);
+  if (searchable.length < 2 || parseWarehouseLocationCommand(keyword)) return null;
+  return keyword;
+}
+
+function warehouseSearchScore(item, keyword) {
+  const query = normalizeWarehouseSearchText(keyword);
+  const sku = normalizeWarehouseSearchText(item?.sku);
+  const name = normalizeWarehouseSearchText(item?.name);
+  if (!query || (!sku.includes(query) && !name.includes(query))) return null;
+  if (sku === query) return 0;
+  if (name === query) return 1;
+  if (name.startsWith(query)) return 2;
+  if (name.includes(query)) return 3;
+  return 4;
 }
 
 function lineHelpText() {
@@ -782,6 +892,10 @@ function lineHelpText() {
     "直接輸入貨號，例如：A12345",
     "原本的「儲位 A12345」也可以使用。",
     "回覆商品名稱、主倉儲位與主倉可用庫存。",
+    "",
+    "直接輸入商品關鍵字，例如：洗衣袋",
+    "「查 洗衣袋」或「儲位 洗衣袋」也可以使用。",
+    "回覆相關商品圖片、貨號、主要儲位與庫存；點『完整儲位』可查看所有規格。",
     "",
     "排程相關指令不需要 @文案小幫手。",
     "儲位查詢也不需要 @文案小幫手。",
@@ -847,6 +961,91 @@ function formatWarehouseLocation(item, metadata = {}) {
   }
   if (metadata.updatedAt) lines.push(`更新：${formatTaipeiDate(Date.parse(metadata.updatedAt))}`);
   return lines.join("\n");
+}
+
+function warehouseSearchLocations(item) {
+  const unique = [];
+  for (const variant of Array.isArray(item?.variants) ? item.variants : []) {
+    const location = String(variant?.location || "").replace(/\s+/g, " ").trim();
+    if (location && !unique.includes(location)) unique.push(location);
+    if (unique.length >= 2) break;
+  }
+  return unique;
+}
+
+function createWarehouseSearchMessage(items, keyword, totalCount = items.length) {
+  const shown = (Array.isArray(items) ? items : []).slice(0, 10);
+  const bubbles = shown.map((item) => {
+    const imageUrl = normalizeShopeeImageUrl(item?.imageUrl);
+    const locations = warehouseSearchLocations(item);
+    const bubble = {
+      type: "bubble",
+      size: "kilo",
+      body: {
+        type: "box",
+        layout: "vertical",
+        spacing: "sm",
+        contents: [
+          { type: "text", text: `【${item.sku}】`, weight: "bold", color: "#174B3A", size: "lg" },
+          { type: "text", text: String(item.name || "ERP 商品"), wrap: true, maxLines: 3, weight: "bold", size: "md" },
+          { type: "separator", margin: "md" },
+          { type: "text", text: `主倉可用：${Number(item.available) || 0}`, margin: "md", size: "sm" },
+          {
+            type: "text",
+            text: locations.length ? `主要儲位：${locations.join("、")}` : "主要儲位：尚未設定",
+            wrap: true,
+            maxLines: 2,
+            size: "sm",
+            color: "#555555",
+          },
+        ],
+      },
+      footer: {
+        type: "box",
+        layout: "vertical",
+        spacing: "sm",
+        contents: [{
+          type: "button",
+          style: "primary",
+          color: "#174B3A",
+          height: "sm",
+          action: { type: "message", label: "完整儲位", text: item.sku },
+        }],
+      },
+    };
+    if (item.productUrl) {
+      bubble.footer.contents.push({
+        type: "button",
+        style: "link",
+        height: "sm",
+        action: { type: "uri", label: "查看蝦皮商品", uri: item.productUrl },
+      });
+    }
+    if (imageUrl) {
+      bubble.hero = {
+        type: "image",
+        url: imageUrl,
+        size: "full",
+        aspectRatio: "1:1",
+        aspectMode: "cover",
+      };
+    } else {
+      bubble.header = {
+        type: "box",
+        layout: "vertical",
+        backgroundColor: "#E9F2EE",
+        paddingAll: "16px",
+        contents: [{ type: "text", text: "📦 ERP 商品", align: "center", color: "#174B3A", weight: "bold" }],
+      };
+    }
+    return bubble;
+  });
+  const extra = totalCount > shown.length ? `，顯示前 ${shown.length} 項` : "";
+  return {
+    type: "flex",
+    altText: `「${keyword}」找到 ${totalCount} 項商品${extra}`.slice(0, 1500),
+    contents: { type: "carousel", contents: bubbles },
+  };
 }
 
 function parseLineFollowup(text) {
@@ -1168,11 +1367,13 @@ export class LineActivation {
     }
     const bucketCount = 64;
     const buckets = Array.from({ length: bucketCount }, () => ({}));
+    const searchItems = [];
     let itemCount = 0;
     for (const rawItem of body.items.slice(0, 20000)) {
       const item = normalizeWarehouseLocationItem(rawItem);
       if (!item) continue;
       buckets[warehouseLocationBucket(item.sku, bucketCount)][item.sku] = item;
+      searchItems.push({ sku: item.sku, name: item.name });
       itemCount += 1;
     }
     if (!itemCount) {
@@ -1184,10 +1385,19 @@ export class LineActivation {
     for (let index = 0; index < bucketCount; index += 1) {
       await this.storage.put(`warehouse-location:${version}:${index}`, buckets[index]);
     }
+    const searchChunkSize = 300;
+    const searchChunkCount = Math.ceil(searchItems.length / searchChunkSize);
+    for (let index = 0; index < searchChunkCount; index += 1) {
+      await this.storage.put(
+        `warehouse-location-search:${version}:${index}`,
+        searchItems.slice(index * searchChunkSize, (index + 1) * searchChunkSize),
+      );
+    }
     const metadata = {
       version,
       bucketCount,
       itemCount,
+      searchChunkCount,
       warehouseId: Number(body?.warehouseId) || 1,
       warehouseName: String(body?.warehouseName || "主倉").slice(0, 80),
       updatedAt: String(body?.updatedAt || new Date().toISOString()).slice(0, 80),
@@ -1198,6 +1408,10 @@ export class LineActivation {
       const previousCount = Math.min(256, Math.max(1, Number(previous.bucketCount) || bucketCount));
       for (let index = 0; index < previousCount; index += 1) {
         await this.storage.delete(`warehouse-location:${previous.version}:${index}`);
+      }
+      const previousSearchCount = Math.min(1000, Math.max(0, Number(previous.searchChunkCount) || 0));
+      for (let index = 0; index < previousSearchCount; index += 1) {
+        await this.storage.delete(`warehouse-location-search:${previous.version}:${index}`);
       }
     }
     return Response.json({ ok: true, itemCount, updatedAt: metadata.updatedAt });
@@ -1219,6 +1433,54 @@ export class LineActivation {
       item: bucket && typeof bucket === "object" ? bucket[sku] || null : null,
       metadata,
     });
+  }
+
+  async searchWarehouseLocations(request) {
+    const { keyword: rawKeyword, limit: rawLimit } = await request.json();
+    const keyword = String(rawKeyword || "").trim().slice(0, 80);
+    const normalizedKeyword = normalizeWarehouseSearchText(keyword);
+    const metadata = await this.storage.get("warehouse-location-active");
+    if (!metadata?.version || normalizedKeyword.length < 2) {
+      return Response.json({ ok: true, items: [], totalCount: 0, metadata: metadata || null });
+    }
+
+    const chunkCount = Math.min(1000, Math.max(0, Number(metadata.searchChunkCount) || 0));
+    let chunks;
+    if (chunkCount) {
+      chunks = await Promise.all(Array.from({ length: chunkCount }, (_, index) =>
+        this.storage.get(`warehouse-location-search:${metadata.version}:${index}`)
+      ));
+    } else {
+      const bucketCount = Math.min(256, Math.max(1, Number(metadata.bucketCount) || 64));
+      const legacyBuckets = await Promise.all(Array.from({ length: bucketCount }, (_, index) =>
+        this.storage.get(`warehouse-location:${metadata.version}:${index}`)
+      ));
+      chunks = [legacyBuckets.flatMap((bucket) => Object.values(bucket && typeof bucket === "object" ? bucket : {})
+        .map((item) => ({ sku: item.sku, name: item.name })) )];
+    }
+    const matches = [];
+    for (const chunk of chunks) {
+      for (const item of Array.isArray(chunk) ? chunk : []) {
+        const score = warehouseSearchScore(item, normalizedKeyword);
+        if (score === null) continue;
+        matches.push({ sku: item.sku, name: item.name, score });
+      }
+    }
+    matches.sort((a, b) => a.score - b.score || a.name.length - b.name.length || a.sku.localeCompare(b.sku));
+    const limit = Math.min(10, Math.max(1, Number(rawLimit) || 10));
+    const selected = matches.slice(0, limit);
+    const bucketCount = Math.min(256, Math.max(1, Number(metadata.bucketCount) || 64));
+    const bucketIndexes = [...new Set(selected.map((item) => warehouseLocationBucket(item.sku, bucketCount)))];
+    const bucketEntries = await Promise.all(bucketIndexes.map(async (index) => [
+      index,
+      await this.storage.get(`warehouse-location:${metadata.version}:${index}`),
+    ]));
+    const buckets = new Map(bucketEntries);
+    const items = selected.map((match) => {
+      const bucket = buckets.get(warehouseLocationBucket(match.sku, bucketCount));
+      return bucket && typeof bucket === "object" ? bucket[match.sku] || null : null;
+    }).filter(Boolean);
+    return Response.json({ ok: true, items, totalCount: matches.length, metadata });
   }
 
   async fetch(request) {
@@ -1265,6 +1527,9 @@ export class LineActivation {
     }
     if (url.pathname === "/warehouse-locations/query" && request.method === "POST") {
       return this.queryWarehouseLocation(request);
+    }
+    if (url.pathname === "/warehouse-locations/search" && request.method === "POST") {
+      return this.searchWarehouseLocations(request);
     }
     if (url.pathname === "/arm" && request.method === "POST") {
       const { armedAt } = await request.json();
@@ -1461,6 +1726,51 @@ async function warehouseLocationRequest(env, sku) {
   return response.json();
 }
 
+async function warehouseSearchRequest(env, keyword) {
+  if (!env.LINE_ACTIVATION) throw httpError("ERP 儲位查詢服務尚未設定", 503);
+  const stub = lineScheduleStub(env, globalLineScheduleName);
+  const response = await stub.fetch("https://line-schedule/warehouse-locations/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ keyword, limit: 10 }),
+  });
+  if (!response.ok) throw httpError("ERP 商品搜尋暫時無法使用", 503);
+  return response.json();
+}
+
+async function enrichWarehouseSearchItems(items, env) {
+  const normalized = (Array.isArray(items) ? items : []).map((item) => ({ ...item }));
+  if (!normalized.length) return normalized;
+  let catalog = new Map();
+  try {
+    catalog = await profitWarehouseProductMap(env);
+  } catch (error) {
+    console.error("WAREHOUSE_PROFIT_CATALOG", error?.message || error);
+  }
+  const enriched = normalized.map((item) => ({
+    ...item,
+    ...(catalog.get(normalizeWarehouseSku(item.sku)) || {}),
+  }));
+  const missingImages = enriched.filter((item) => item.productUrl && !item.imageUrl).slice(0, 10);
+  if (!missingImages.length) return enriched;
+  try {
+    await withAbortTimeout(async (signal) => {
+      await Promise.all(missingImages.map(async (item) => {
+        try {
+          const product = await fetchFromNasReader(item.productUrl, env, signal);
+          item.imageUrl = normalizeShopeeImageUrl(product.imageUrl);
+        } catch (error) {
+          if (signal.aborted) return;
+          console.error("WAREHOUSE_IMAGE_LOOKUP", item.sku, error?.message || error);
+        }
+      }));
+    }, 12000, "商品圖片讀取逾時");
+  } catch (error) {
+    console.error("WAREHOUSE_IMAGE_BATCH", error?.message || error);
+  }
+  return enriched;
+}
+
 async function replyWarehouseLocation(event, sku, env) {
   try {
     const result = await warehouseLocationRequest(env, sku);
@@ -1471,6 +1781,31 @@ async function replyWarehouseLocation(event, sku, env) {
   } catch (error) {
     console.error("LINE warehouse location error", error?.message || error);
     await replyLine(event.replyToken, `目前無法查詢 ERP 儲位：${error?.message || "請稍後再試"}`, env);
+  }
+}
+
+async function replyWarehouseSearch(event, keyword, env) {
+  try {
+    const result = await warehouseSearchRequest(env, keyword);
+    if (!result?.metadata) {
+      await replyLine(event.replyToken, "ERP 主倉儲位資料尚未完成第一次同步，請稍後再試。", env);
+      return;
+    }
+    if (!Array.isArray(result.items) || !result.items.length) {
+      await replyLine(
+        event.replyToken,
+        `🔎 找不到與「${keyword}」相關的 ERP 商品。\n請改用較短或不同的商品名稱再試一次。`,
+        env,
+      );
+      return;
+    }
+    const items = await enrichWarehouseSearchItems(result.items, env);
+    await replyLine(event.replyToken, [
+      createWarehouseSearchMessage(items, keyword, Number(result.totalCount) || items.length),
+    ], env);
+  } catch (error) {
+    console.error("LINE warehouse search error", error?.message || error);
+    await replyLine(event.replyToken, `目前無法搜尋 ERP 商品：${error?.message || "請稍後再試"}`, env);
   }
 }
 
@@ -1686,7 +2021,11 @@ async function processLineEvent(event, env) {
     return;
   }
   if (/^儲位\s*(?:[+＋:：]\s*)?$/u.test(text)) {
-    await replyLine(event.replyToken, "請在『儲位』後面加上貨號，例如：儲位 A12345", env);
+    await replyLine(event.replyToken, "請在『儲位』後面加上貨號或商品關鍵字，例如：儲位 A12345、儲位 洗衣袋", env);
+    return;
+  }
+  if (/^(?:查詢?|搜尋)\s*$/u.test(text)) {
+    await replyLine(event.replyToken, "請在『查』後面加上商品關鍵字，例如：查 洗衣袋", env);
     return;
   }
 
@@ -1746,6 +2085,12 @@ async function processLineEvent(event, env) {
           focus: followup.focus,
         }, env);
       }
+    }
+
+    const warehouseKeyword = parseWarehouseSearchCommand(text);
+    if (warehouseKeyword) {
+      await replyWarehouseSearch(event, warehouseKeyword, env);
+      return;
     }
 
     if (groupMessage) {
@@ -1838,6 +2183,7 @@ export {
   canonicalShopeeUrl,
   createLineFocusPanel,
   createLinePanel,
+  createWarehouseSearchMessage,
   extractShopeePageContent,
   enrichScheduleItemsWithProfitSkus,
   fetchShopeePageContent,
@@ -1857,11 +2203,13 @@ export {
   panelPostback,
   parseLineFollowup,
   parseWarehouseLocationCommand,
+  parseWarehouseSearchCommand,
   parseScheduleCompletion,
   parseScheduleSelection,
   parseScheduleUndoCompletion,
   processLineEvent,
   productTitle,
+  profitWarehouseProductMapFromDashboard,
   profitSkuMapFromDashboard,
   removeLineMentions,
   scheduleItemsFromText,
@@ -1869,6 +2217,7 @@ export {
   splitLineText,
   formatWarehouseLocation,
   warehouseLocationBucket,
+  warehouseSearchScore,
   withAbortTimeout,
   armLineGroup,
   takeLineGroupActivation,

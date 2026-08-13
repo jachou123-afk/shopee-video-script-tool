@@ -41,6 +41,7 @@ async function pageSnapshot(page) {
     title: document.title || "",
     ogTitle: document.querySelector('meta[property="og:title"]')?.content || "",
     ogDescription: document.querySelector('meta[property="og:description"]')?.content || "",
+    ogImage: document.querySelector('meta[property="og:image"]')?.content || "",
     description: document.querySelector('meta[name="description"]')?.content || "",
     bodyText: document.body?.innerText?.slice(0, 3000) || "",
   }));

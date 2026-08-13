@@ -4,10 +4,10 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `9f027c84-c0a8-41d3-ad4a-8344c661bdf5`
+- Worker version at handoff: `aea7aa96-bb7a-4524-8e98-0daa4ae9e3b2`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: all 38 Worker tests and all 5 NAS reader tests pass.
+- Validation status: all 41 Worker tests and all 6 NAS reader tests pass.
 
 ## LINE workflow
 
@@ -20,12 +20,16 @@
 - `取消完成1`: move completed item 1 back to pending.
 - `A12345`: directly return the ERP 主倉 location and available quantity; no mention is required. Lowercase input is normalized to uppercase.
 - `儲位 A12345`: remains supported for backward compatibility.
+- A bare product keyword such as `洗衣袋`: search the ERP catalog without mentioning the bot and return up to ten Flex cards with product image (when available), SKU, name, stock, primary locations, a full-location button, and a Shopee product button.
+- `查 洗衣袋` and `儲位 洗衣袋`: explicit keyword-search forms with the same result. These forms work in private chats and groups.
 
 All groups and private chats share one global schedule. When an older chat first uses a schedule command, its previous per-chat records are merged into the global queue.
 
 Pending and completed schedule lists extract the Shopee product ID from `/product/{shopId}/{productId}` and query the current pure-profit dashboard data. When a match is available, the item is displayed as `【貨號】商品名稱`, for example `【A725】水垢魔力擦`. Existing schedule records do not need to be re-added.
 
 The pure-profit lookup uses the `PROFIT_DASHBOARD_BYPASS_TOKEN` Cloudflare Worker secret. The value is intentionally not committed. Lookup failures fall back to the original product name so schedule listing remains available.
+
+ERP keyword search is backed by the same atomic Durable Object snapshot as direct SKU lookup. New location syncs publish compact search chunks; the deployed Worker can also search the existing 64 legacy location buckets immediately, so no forced ERP re-sync is required for this release. Product IDs, Shopee URLs, and available image fields are enriched from the private pure-profit dashboard. Missing images use the authenticated NAS reader as a best-effort fallback, and cards still render without an image when Shopee blocks the fallback.
 
 ## LINE schedule generation concurrency
 
@@ -39,6 +43,8 @@ Sending two schedule numbers almost simultaneously previously overloaded the sin
 - The NAS fast path was deployed on 2026-08-12. The host source and running container both had SHA-256 `aa7e0733d92545546a4cb47033690d077dcf029d2bae5945aaad4b7204939ad8`; `.env` and `data/profile` were preserved. Because rebuilding the full Playwright base image exceeded ten minutes on the NAS, production uses a safe incremental image layer based on the existing image. A future normal full build from the committed source will contain the same code.
 - Production benchmarks after deployment all returned HTTP 200 with `pageContentRead: true`: 7.17 seconds for the first request, 5.43 seconds for the repeated cached request, and 5.50 seconds for a different uncached product. Before the NAS fast path, the same workflow took 27.76 seconds.
 - The pre-deployment reader source is retained on the NAS as `src/browser.mjs.bak-20260812-173917`. The temporary root SSH key and temporary build context were removed after verification.
+- The keyword-card image update was deployed to the NAS on 2026-08-13. The host source and running container both match SHA-256 `f5de4f3527471bb66909446371701e92208efbe0d5d230eb5b120c1ad9b9b138` for `browser.mjs` and `b3df5e3ff9625daa04bb32aa61de3e4d47a212cc0a0c71db7bf4125d75a20544` for `shopee.mjs`. Backups are `src/browser.mjs.bak-20260813-130701` and `src/shopee.mjs.bak-20260813-130701`; `.env` and `data/profile` were preserved. The temporary root SSH key and incremental build context were removed after verification.
+- Operational note at this handoff: the NAS health endpoint is up and connected to the Worker, but the persistent Shopee control page is currently on a Shopee CAPTCHA URL. A production script request therefore returned HTTP 503 until that CAPTCHA/login check is completed through the NAS noVNC page. This does not prevent ERP keyword text/location results; it only affects authenticated product-content reads and best-effort missing-image fallback.
 
 ## Continue from another computer
 

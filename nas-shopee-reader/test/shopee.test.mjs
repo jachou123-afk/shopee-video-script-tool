@@ -4,6 +4,7 @@ import {
   looksLikeLoginWall,
   normalizeMetaContent,
   normalizePdpResponse,
+  normalizeShopeeImageUrl,
   normalizeShopeeUrl,
   parseShopeeIds,
 } from "../src/shopee.mjs";
@@ -41,11 +42,21 @@ test("normalizePdpResponse adds attributes and variations", () => {
         description: "舒適減壓好坐",
         attributes: [{ name: "材質", values: [{ name: "珍珠棉" }] }],
         tier_variations: [{ name: "顏色", options: ["黑色", "灰色"] }],
+        images: ["tw-11134207-product-image-id"],
       },
     },
   });
   assert.match(result.description, /材質：珍珠棉/);
   assert.match(result.description, /顏色：黑色、灰色/);
+  assert.equal(result.imageUrl, "https://down-tw.img.susercontent.com/file/tw-11134207-product-image-id");
+});
+
+test("normalizeShopeeImageUrl accepts CDN URLs and image ids", () => {
+  assert.equal(normalizeShopeeImageUrl("https://example.com/product.jpg"), "https://example.com/product.jpg");
+  assert.equal(
+    normalizeShopeeImageUrl("tw-11134207-product-image-id"),
+    "https://down-tw.img.susercontent.com/file/tw-11134207-product-image-id",
+  );
 });
 
 test("looksLikeLoginWall recognizes Shopee login interstitials", () => {
