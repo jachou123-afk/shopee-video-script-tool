@@ -840,10 +840,10 @@ function normalizeWarehouseSearchText(value) {
 function parseWarehouseSearchCommand(text) {
   const normalized = normalizeScheduleDigits(text).replace(/\s+/g, " ").trim();
   if (!normalized || /https?:\/\/|shopee/iu.test(normalized)) return null;
-  const prefixed = normalized.match(/^(?:儲位|查詢?|搜尋)\s*(?:[+＋:：]\s*)?(.+)$/iu);
+  const prefixed = normalized.match(/^(?:儲位|查詢?|搜(?:尋)?)\s*(?:[+＋:：]\s*)?(.+)$/iu);
   const keyword = String(prefixed?.[1] || normalized).trim().slice(0, 80);
   const searchable = normalizeWarehouseSearchText(keyword);
-  if (searchable.length < 2 || parseWarehouseLocationCommand(keyword)) return null;
+  if (!searchable || parseWarehouseLocationCommand(keyword)) return null;
   return keyword;
 }
 
@@ -1470,7 +1470,7 @@ export class LineActivation {
     const keyword = String(rawKeyword || "").trim().slice(0, 80);
     const normalizedKeyword = normalizeWarehouseSearchText(keyword);
     const metadata = await this.storage.get("warehouse-location-active");
-    if (!metadata?.version || normalizedKeyword.length < 2) {
+    if (!metadata?.version || !normalizedKeyword) {
       return Response.json({ ok: true, items: [], totalCount: 0, metadata: metadata || null });
     }
 
@@ -2054,7 +2054,7 @@ async function processLineEvent(event, env) {
     await replyLine(event.replyToken, "請在『儲位』後面加上貨號或商品關鍵字，例如：儲位 A12345、儲位 洗衣袋", env);
     return;
   }
-  if (/^(?:查詢?|搜尋)\s*$/u.test(text)) {
+  if (/^(?:查詢?|搜(?:尋)?)\s*$/u.test(text)) {
     await replyLine(event.replyToken, "請在『查』後面加上商品關鍵字，例如：查 洗衣袋", env);
     return;
   }

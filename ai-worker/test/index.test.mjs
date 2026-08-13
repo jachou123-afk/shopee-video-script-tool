@@ -114,6 +114,8 @@ test("warehouse location command accepts common LINE input forms", () => {
   assert.equal(parseWarehouseLocationCommand("儲位 洗衣袋"), null);
   assert.equal(parseWarehouseSearchCommand("洗衣袋"), "洗衣袋");
   assert.equal(parseWarehouseSearchCommand("查 洗衣袋"), "洗衣袋");
+  assert.equal(parseWarehouseSearchCommand("襪"), "襪");
+  assert.equal(parseWarehouseSearchCommand("搜 襪"), "襪");
   assert.equal(parseWarehouseSearchCommand("儲位：洗衣袋"), "洗衣袋");
   assert.equal(parseWarehouseSearchCommand("A725"), null);
 });
@@ -841,6 +843,14 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   assert.equal(data.totalCount, 1);
   assert.equal(data.items[0].sku, "A12345");
   assert.equal(data.items[0].variants[0].location, "A區-01");
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/search", {
+    method: "POST",
+    body: JSON.stringify({ keyword: "測" }),
+  }));
+  data = await response.json();
+  assert.equal(data.totalCount, 1);
+  assert.equal(data.items[0].sku, "A12345");
 
   response = await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
     method: "POST",

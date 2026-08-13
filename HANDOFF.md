@@ -4,7 +4,7 @@
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `6fccdb88-d635-4c07-a4e2-cb51776e0067`
+- Worker version at handoff: `ffc973e5-a242-4165-8955-dde3c9f61f11`
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
 - Validation status: all 42 Worker tests and all 6 NAS reader tests pass.
@@ -30,6 +30,7 @@
 - `A12345`: directly return the ERP 主倉 location and available quantity; no mention is required. Lowercase input is normalized to uppercase.
 - `儲位 A12345`: remains supported for backward compatibility.
 - A bare product keyword such as `洗衣袋`: search the ERP catalog without mentioning the bot and return up to ten Flex cards with product image (when available), SKU, name, stock, primary locations, a full-location button, and a Shopee product button.
+- Single-character keywords are supported, so `襪`, `搜 襪`, and `查 襪` all search the existing ERP catalog index.
 - `查 洗衣袋` and `儲位 洗衣袋`: explicit keyword-search forms with the same result. These forms work in private chats and groups.
 
 All groups and private chats share one global schedule. When an older chat first uses a schedule command, its previous per-chat records are merged into the global queue.
