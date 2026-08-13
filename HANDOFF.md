@@ -1,13 +1,29 @@
 # Shopee Video Script Tool — Handoff
 
+## 下一台電腦開始工作前（必須先執行）
+
+下一位 Codex 在公司電腦讀到本文件後，必須先同步本交接分支，再進行任何修改；不需要使用者自行輸入指令：
+
+```powershell
+git status -sb
+git fetch origin
+git switch agent/line-schedule-handoff
+git pull --ff-only origin agent/line-schedule-handoff
+```
+
+- 同步後確認 `git rev-parse HEAD` 至少包含本次交接提交，並重新讀取完整 `HANDOFF.md`。
+- 如果 `git status -sb` 顯示公司電腦有未提交或未追蹤的內容，不可覆蓋、重設或刪除；先檢查差異並向使用者回報，再安全整合。
+- 工作目標帳號是 `@059hdfyo`。`@037vajci` 是使用者另外使用的帳號，不可修改。
+- 正式功能目前仍是純演練版：只預覽儲位，不得寫入 ERP。除非使用者之後明確同意進入下一階段，否則維持唯讀。
+
 ## Current production state
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Worker version at handoff: `4b261311-1537-4ceb-8c9f-647c0a93a68a`
+- Last explicit production code deployment: `31c3cc23-1a0f-4a64-bf35-8b4234f2c7e9`; the temporary rich-menu setup secret was deleted immediately afterward.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: all 48 Worker tests and all 9 NAS reader tests pass.
+- Validation status: all 57 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
 
 ## Persistent product-image cache (2026-08-13)
 
