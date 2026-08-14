@@ -32,7 +32,7 @@ const warehousePositionWizardOptions = Object.freeze({
   sides: ["L", "R"],
   shelves: ["01", "02", "03", "04", "05"],
   levels: ["01", "02", "03", "04"],
-  trays: ["T1", "T2", "T3", "T4"],
+  trays: ["T1", "T2", "T3", "T4", "NONE"],
 });
 const warehousePositionVariantPageSize = 9;
 const warehousePositionAllVariantLimit = 10;
@@ -1089,9 +1089,10 @@ function createWarehousePositionWizardMessage(state = {}, notice = "", item = nu
     && warehousePositionWizardOptions.levels.includes(state.level)
   ) {
     prompt = `貨號：${sku}\n已選：${state.zone}-${state.side}${state.shelf}-${state.level}\n請選擇箱位：`;
-    choices = warehousePositionWizardOptions.trays.map((tray) =>
-      warehousePositionWizardQuickReplyItem(tray, { ...base, step: "preview", tray })
-    );
+    choices = warehousePositionWizardOptions.trays.map((tray) => {
+      const label = tray === "NONE" ? "無 T" : tray;
+      return warehousePositionWizardQuickReplyItem(label, { ...base, step: "preview", tray });
+    });
     choices.push(warehousePositionWizardQuickReplyItem("上一步", {
       step: "level", sku, variant: state.variant, warehouse: "B", zone: state.zone, side: state.side, shelf: state.shelf,
     }, "重選層位"));
@@ -1135,7 +1136,8 @@ function warehousePositionWizardLocation(state) {
     || !warehousePositionWizardOptions.levels.includes(state.level)
     || !warehousePositionWizardOptions.trays.includes(state.tray)
   ) return "";
-  return `${state.zone}-${state.side}${state.shelf}-${state.level}/${state.tray}`;
+  const traySuffix = state.tray === "NONE" ? "" : `/${state.tray}`;
+  return `${state.zone}-${state.side}${state.shelf}-${state.level}${traySuffix}`;
 }
 
 function normalizeWarehouseSearchText(value) {

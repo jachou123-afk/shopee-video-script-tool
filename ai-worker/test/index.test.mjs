@@ -166,6 +166,9 @@ test("warehouse position wizard starts from a SKU and only builds valid B wareho
     warehouse: "B", zone: "02", side: "R", shelf: "04", level: "01", tray: "T1",
   }), "02-R04-01/T1");
   assert.equal(warehousePositionWizardLocation({
+    warehouse: "B", zone: "05", side: "R", shelf: "04", level: "03", tray: "NONE",
+  }), "05-R04-03");
+  assert.equal(warehousePositionWizardLocation({
     warehouse: "A", zone: "02", side: "R", shelf: "04", level: "01", tray: "T1",
   }), "");
   assert.equal(warehousePositionWizardLocation({
@@ -1674,14 +1677,15 @@ test("warehouse position wizard uses buttons to build B warehouse preview withou
     await press("R04");
     assert.deepEqual(replies.at(-1).messages[0].quickReply.items.slice(0, 4).map((item) => item.action.label), ["01", "02", "03", "04"]);
     await press("01");
-    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.slice(0, 4).map((item) => item.action.label), ["T1", "T2", "T3", "T4"]);
-    await press("T1");
+    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.slice(0, 5).map((item) => item.action.label), ["T1", "T2", "T3", "T4", "無 T"]);
+    await press("無 T");
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.match(replies.at(-1).messages[0].text, /儲位修改演練（不會寫入 ERP）/);
   assert.match(replies.at(-1).messages[0].text, /原儲位：02-L02-03\/T4/);
-  assert.match(replies.at(-1).messages[0].text, /預計新儲位：02-R04-01\/T1/);
+  assert.match(replies.at(-1).messages[0].text, /預計新儲位：02-R04-01(?:\n|$)/);
+  assert.doesNotMatch(replies.at(-1).messages[0].text, /預計新儲位：02-R04-01\/T/);
   assert.deepEqual([...values.entries()], before, "wizard must not persist selections or change warehouse storage");
 });
 
