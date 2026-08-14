@@ -16,11 +16,20 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 工作目標帳號是 `@059hdfyo`。`@037vajci` 是使用者另外使用的帳號，不可修改。
 - 正式功能目前仍是純演練版：只預覽儲位，不得寫入 ERP。除非使用者之後明確同意進入下一階段，否則維持唯讀。
 
+## 交接文件維護規則（永久執行）
+
+- 每次修改程式、設定、測試、LINE 選單、Cloudflare Worker、NAS、ERP 整合或操作流程，都必須在同一次工作中主動更新本 `HANDOFF.md`，不需要等待使用者另外下指令。
+- 交接更新至少記錄：台北時間日期、修改內容與原因、影響帳號／服務、安全限制、測試結果、是否已部署、部署版本或提交，以及尚未完成或被阻擋的事項。
+- 如果修改尚未發布，必須明確寫「尚未部署」；如果已發布，必須記錄可核對的部署版本。不可讓交接文件把本機修改誤寫成正式上線。
+- 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
+- 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
+
 ## Current production state
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Last explicit production code deployment: `31c3cc23-1a0f-4a64-bf35-8b4234f2c7e9`; the temporary rich-menu setup secret was deleted immediately afterward.
+- Latest feature source commit before this documentation update: `97b81c214ac4a472d12d6c474acde197c4cd2b97` (`Allow warehouse positions without tray suffix`).
+- Latest production deployment: `04e4dea9-29be-4cce-ba56-09cbf0cb2871` at 2026-08-14 14:06:58 +08:00. It was deployed immediately before the matching source commit was created at 14:07:19.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
 - Validation status: all 57 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
@@ -128,13 +137,20 @@ The separate NAS ERP project downloads both `InventoryId=-1` (不分倉, used by
 - Private-chat command: `改儲位 A861`. It opens LINE quick-reply buttons; the older full command `改儲位 A861 02-R04-01/T3` remains a read-only shortcut.
 - The `@059hdfyo` help/function quick reply previously labeled `➕ 新增排程` is now `📦 改儲位` and sends the bare command `改儲位`. The bot then accepts one bare SKU reply for exactly eight seconds. The one-time per-user activation timestamp is kept in a separate Durable Object and consumed on reply; expiry produces a safe timeout message. This does not change the independent `@037vajci` rich menu.
 - A multi-variant product such as `A823` first reads the current ERP snapshot and shows its real child SKUs (for example `-01` through `-06`) plus `全部`. A single child preview selects exactly one matching barcode. `全部` is offered only when there are at most 10 children and lists every old-to-new location line in the final preview. Missing or duplicate child IDs stop the entire flow.
-- A倉 remains visible but returns an unavailable notice. B倉 supports zone `01`-`06`, direction `L`/`R`, shelf `01`-`05`, level `01`-`04`, and tray `T1`-`T4`. For example, B倉 → `02` → `R` → `R04` → `01` → `T1` builds `02-R04-01/T1`.
+- A倉 remains visible but returns an unavailable notice. B倉 supports zone `01`-`06`, direction `L`/`R`, shelf `01`-`05`, level `01`-`04`, and tray `T1`-`T4` or `無 T`. For example, B倉 → `02` → `R` → `R04` → `01` → `T1` builds `02-R04-01/T1`; choosing `無 T` builds `02-R04-01` without a tray suffix.
 - The wizard is stateless: each LINE postback carries the already-selected values, every value is checked against an allowlist, and no selection is written to KV, Durable Object storage, or ERP.
 - The Worker calls LINE `GET /v2/bot/info` and refuses the command unless the active channel token reports Basic ID `@059hdfyo`. Group and room commands are refused.
 - This phase reads only the existing ERP main-warehouse cloud snapshot with image lookup disabled. It does not create a confirmation transaction, call an ERP write endpoint, or change Durable Object storage.
 - The preview fails closed unless the snapshot is `InventoryId=1`, is no more than 30 minutes old, and every requested child SKU still resolves uniquely when the final button is pressed. Missing, duplicate, or changed variants are never guessed.
 - The reply shows product, variant, stock, old location, proposed location, snapshot time, and states that only `DepotPosition` would be allowed to change in a later write phase.
 - Worker validation is 57/57 tests passing after this change, including the exact eight-second one-time window, timeout handling, single-child, `全部`, complete button paths, and assertions that warehouse data remains unchanged.
+
+### Current ERP snapshot blocker (checked 2026-08-14)
+
+- LINE accepted the eight-second SKU reply correctly, but the dry run stopped because the latest main-warehouse snapshot was `2026-08-14T00:01:43+08:00`, older than the 30-minute safety limit.
+- The snapshot comes from the separate NAS `nas-erp-sync` project, which directly signs in to uSale and exports `商品管理／商品資料` for `InventoryId=1`; no browser workbench needs to remain open.
+- The most likely fault is that the NAS container/scheduler stopped after midnight or later ERP login, main-warehouse export, or location push attempts failed. The NAS DSM/QuickConnect session was not available during the external check, so container logs remain unverified.
+- Do not weaken or remove the 30-minute fail-closed check to work around this outage. Restore and verify the NAS sync first.
 
 ## Planned LINE-to-ERP warehouse-position writeback (investigated 2026-08-13; not implemented)
 
