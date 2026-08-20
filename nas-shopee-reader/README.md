@@ -20,6 +20,6 @@ The compose project mounts these NAS folders read-only:
 - `/volume1/圖片區/G類-娃娃機吊飾` as `/nas-images/G`
 - `/volume1/圖片區/K類-娃娃機吊飾2` as `/nas-images/K`
 
-For a requested G/K SKU, the reader finds the folder whose name starts with the normalized SKU, ignores non-image material, and ranks up to 80 JPG/PNG/WebP candidates. Cover-like names (`主圖`, `首圖`, `封面`, `01.jpg`) are preferred; detail, size, price, instruction, QR, logo, video, and packaging names are penalized. Resolution, aspect ratio, file size, sharpness, entropy, and exposure contribute to the final score.
+For a requested G/K SKU, the reader finds the folder whose name starts with the normalized SKU, ignores non-image material, and ranks up to 80 JPG/PNG/WebP candidates. Ready-made priced composites (`文字圖`, `價格圖`, `售價圖`, `報價圖`, `價目圖`, `價錢圖`) take first priority. When none exists, cover-like names (`主圖`, `首圖`, `封面`, `01.jpg`) are preferred; detail, size, ordinary price, instruction, QR, logo, video, and packaging names are penalized. Resolution, aspect ratio, file size, sharpness, entropy, and exposure contribute to the final score.
 
 The selected source is auto-rotated and converted to a 1200×1200 JPEG on a white canvas. Only that derivative is uploaded to the authenticated Worker endpoint and copied into Cloudflare `PRODUCT_IMAGES`; the source NAS file is never changed and no NAS URL is exposed to LINE.

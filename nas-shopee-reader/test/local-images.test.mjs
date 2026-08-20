@@ -26,6 +26,22 @@ test("prefers a named cover image over a larger detail graphic", () => {
   assert.ok(cover > closeup);
 });
 
+test("prefers a priced composite image over a normal cover for G/K products", () => {
+  const pricedComposite = localImageBaseScore({
+    fileName: "K501_文字圖.jpg",
+    width: 1000,
+    height: 1000,
+    size: 600_000,
+  });
+  const cover = localImageBaseScore({
+    fileName: "01.jpg",
+    width: 3000,
+    height: 3000,
+    size: 3_000_000,
+  });
+  assert.ok(pricedComposite > cover);
+});
+
 test("finds a SKU folder and produces a square LINE image", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "nas-local-image-"));
   try {
@@ -53,6 +69,28 @@ test("finds a SKU folder and produces a square LINE image", async () => {
     assert.equal(selected.contentType, "image/jpeg");
     assert.ok(selected.bytes.byteLength > 10_000);
     assert.equal(selected.candidateCount, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("selects the priced composite image when the SKU folder contains one", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "nas-local-priced-image-"));
+  try {
+    const folder = path.join(root, "K501頭盔小鴨吊飾");
+    await mkdir(folder, { recursive: true });
+    await sharp({ create: { width: 1800, height: 1800, channels: 3, background: "#f4dfb8" } })
+      .jpeg({ quality: 88 })
+      .toFile(path.join(folder, "01.jpg"));
+    await sharp({ create: { width: 1000, height: 1000, channels: 3, background: "#ffffff" } })
+      .composite([{ input: Buffer.from('<svg width="1000" height="1000"><rect width="1000" height="500" fill="#f2d05e"/><text x="40" y="650" font-size="72">K501 30個720元</text></svg>') }])
+      .jpeg({ quality: 88 })
+      .toFile(path.join(folder, "K501_文字圖.jpg"));
+
+    const selected = await selectLocalProductImage("K501", { root });
+    assert.equal(selected.fileName, "K501_文字圖.jpg");
+    assert.equal(selected.width, 1200);
+    assert.equal(selected.height, 1200);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

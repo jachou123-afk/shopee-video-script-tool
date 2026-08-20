@@ -4,6 +4,7 @@ import sharp from "sharp";
 
 const imageExtensions = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const preferredNamePattern = /(主圖|首圖|封面|商品圖|展示圖)/iu;
+const pricedCompositeNamePattern = /(文字圖|價格圖|售價圖|報價圖|價目圖|價錢圖)/iu;
 const discouragedNamePattern = /(詳情|尺寸|規格|價格|售價|說明|步驟|注意|證書|檢驗|條碼|qrcode|qr|logo|影片|包裝)/iu;
 
 export function normalizeLocalImageSku(value) {
@@ -80,12 +81,14 @@ export function localImageBaseScore(candidate) {
     .normalize("NFKC")
     .replace(/\s+/g, "");
   const lowerStem = stem.toLowerCase();
+  const isPricedComposite = pricedCompositeNamePattern.test(stem);
   let score = 0;
+  if (isPricedComposite) score += 2400;
   if (preferredNamePattern.test(stem)) score += 520;
   if (/^0+1$/u.test(lowerStem)) score += 460;
   else if (lowerStem === "1") score += 170;
   else if (/^0+2$/u.test(lowerStem)) score += 100;
-  if (discouragedNamePattern.test(stem)) score -= 520;
+  if (!isPricedComposite && discouragedNamePattern.test(stem)) score -= 520;
   if (!width || !height || Math.min(width, height) < 400) score -= 700;
   const pixels = width * height;
   if (pixels > 0) score += Math.min(190, Math.max(0, Math.log2(pixels / 250_000) * 35));
