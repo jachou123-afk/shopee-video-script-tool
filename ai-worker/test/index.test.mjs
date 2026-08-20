@@ -259,6 +259,31 @@ test("warehouse location formatter shows variants and missing locations", () => 
   assert.match(text, /紅色／大：A區-01/);
   assert.match(text, /更新：2026\/08\/12/);
   assert.match(formatWarehouseLocation({ sku: "B1", name: "無儲位", available: 0, variants: [] }), /尚未設定儲位/);
+  const privateCost = formatWarehouseLocation({
+    sku: "K501",
+    name: "頭盔小鴨吊飾",
+    available: 30,
+    costMin: 23,
+    costMax: 24.5,
+    variants: [],
+  }, {}, { showCost: true });
+  assert.match(privateCost, /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
+  assert.doesNotMatch(formatWarehouseLocation({
+    sku: "K501",
+    name: "頭盔小鴨吊飾",
+    available: 30,
+    costMin: 23,
+    costMax: 24.5,
+    variants: [],
+  }), /存貨成本|NT\$/);
+  assert.match(formatWarehouseLocation({
+    sku: "G888",
+    name: "未設定成本商品",
+    available: 1,
+    costMin: 0,
+    costMax: 0,
+    variants: [],
+  }, {}, { showCost: true }), /🔒 單個存貨成本：未設定/);
   assert.equal(warehouseLocationBucket("A12345"), warehouseLocationBucket("A12345"));
 });
 
@@ -279,6 +304,35 @@ test("warehouse keyword search ranks matches and builds image cards", () => {
   assert.equal(message.contents.contents[0].hero.url, "https://example.com/laundry-bag.jpg");
   assert.equal(message.contents.contents[0].footer.contents[0].action.text, "完整儲位 A725");
   assert.match(message.altText, /找到 1 項/);
+
+  const privateCostMessage = createWarehouseSearchMessage([{
+    sku: "K501",
+    name: "頭盔小鴨吊飾",
+    available: 30,
+    costMin: 23,
+    costMax: 23,
+    variants: [],
+  }], "K501", 1, { showCost: true });
+  const privateCostBody = JSON.stringify(privateCostMessage.contents.contents[0].body.contents);
+  assert.match(privateCostBody, /🔒 單個存貨成本：NT\$23／個/);
+  const groupCostBody = JSON.stringify(createWarehouseSearchMessage([{
+    sku: "K501",
+    name: "頭盔小鴨吊飾",
+    available: 30,
+    costMin: 23,
+    costMax: 23,
+    variants: [],
+  }], "K501", 1).contents.contents[0].body.contents);
+  assert.doesNotMatch(groupCostBody, /存貨成本|NT\$/);
+  const nonGkBody = JSON.stringify(createWarehouseSearchMessage([{
+    sku: "A725",
+    name: "細網洗衣袋",
+    available: 12,
+    costMin: 99,
+    costMax: 99,
+    variants: [],
+  }], "A725", 1, { showCost: true }).contents.contents[0].body.contents);
+  assert.doesNotMatch(nonGkBody, /存貨成本|NT\$/);
 });
 
 test("pure-profit products provide Shopee URLs and image URLs for warehouse cards", () => {
@@ -980,13 +1034,22 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
         sku: "a12345",
         name: "測試商品",
         available: 8,
+        costMin: 999,
+        costMax: 999,
         variants: [{ location: "A區-01", style: "紅色", size: "大", barcode: "4711", available: 8 }],
+      }, {
+        sku: "k501",
+        name: "頭盔小鴨吊飾",
+        available: 30,
+        costMin: 23,
+        costMax: 24.5,
+        variants: [],
       }],
     }),
   }));
   let data = await response.json();
   assert.equal(data.ok, true);
-  assert.equal(data.itemCount, 1);
+  assert.equal(data.itemCount, 2);
 
   response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query", {
     method: "POST",
@@ -995,7 +1058,17 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   data = await response.json();
   assert.equal(data.item.sku, "A12345");
   assert.equal(data.item.variants[0].location, "A區-01");
+  assert.equal(data.item.costMin, undefined);
+  assert.equal(data.item.costMax, undefined);
   assert.equal(data.metadata.warehouseName, "主倉");
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query", {
+    method: "POST",
+    body: JSON.stringify({ sku: "K501" }),
+  }));
+  data = await response.json();
+  assert.equal(data.item.costMin, 23);
+  assert.equal(data.item.costMax, 24.5);
 
   response = await object.fetch(new Request("https://line-schedule/warehouse-locations/search", {
     method: "POST",
@@ -1474,10 +1547,12 @@ test("group users can query a warehouse location without mentioning the bot", as
     body: JSON.stringify({
       updatedAt: "2026-08-12T14:30:00+08:00",
       items: [{
-        sku: "A12345",
-        name: "測試商品",
-        available: 8,
-        variants: [{ location: "A區-01", style: "", size: "", available: 8 }],
+        sku: "K501",
+        name: "頭盔小鴨吊飾",
+        available: 30,
+        costMin: 23,
+        costMax: 24.5,
+        variants: [{ location: "K區-01", style: "", size: "", available: 30 }],
       }],
     }),
   }));
@@ -1504,24 +1579,42 @@ test("group users can query a warehouse location without mentioning the bot", as
       replyToken: "warehouse-query",
       timestamp: Date.now(),
       source: { type: "group", groupId: "g1", userId: "u1" },
-      message: { type: "text", text: "A12345" },
+      message: { type: "text", text: "K501" },
     }, env);
     await processLineEvent({
       type: "message",
       replyToken: "warehouse-details",
       timestamp: Date.now(),
       source: { type: "group", groupId: "g1", userId: "u1" },
-      message: { type: "text", text: "完整儲位 A12345" },
+      message: { type: "text", text: "完整儲位 K501" },
+    }, env);
+    await processLineEvent({
+      type: "message",
+      replyToken: "warehouse-private-query",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "u1" },
+      message: { type: "text", text: "K501" },
+    }, env);
+    await processLineEvent({
+      type: "message",
+      replyToken: "warehouse-private-details",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "u1" },
+      message: { type: "text", text: "完整儲位 K501" },
     }, env);
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.equal(replies.length, 2);
+  assert.equal(replies.length, 4);
   assert.equal(replies[0].messages[0].type, "flex");
-  assert.match(replies[0].messages[0].altText, /A12345.*找到 1 項/);
-  assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 A12345");
-  assert.match(replies[1].messages[0].text, /A12345｜測試商品/);
-  assert.match(replies[1].messages[0].text, /A區-01/);
+  assert.match(replies[0].messages[0].altText, /K501.*找到 1 項/);
+  assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 K501");
+  assert.doesNotMatch(JSON.stringify(replies[0]), /存貨成本|NT\$/);
+  assert.match(replies[1].messages[0].text, /K501｜頭盔小鴨吊飾/);
+  assert.match(replies[1].messages[0].text, /K區-01/);
+  assert.doesNotMatch(replies[1].messages[0].text, /存貨成本|NT\$/);
+  assert.match(JSON.stringify(replies[2]), /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
+  assert.match(replies[3].messages[0].text, /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
 });
 
 test("warehouse position dry run is private, account-bound, and read-only", async () => {

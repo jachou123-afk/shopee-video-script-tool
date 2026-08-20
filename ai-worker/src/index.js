@@ -1269,12 +1269,38 @@ function normalizeWarehouseLocationItem(rawItem) {
       available: Math.trunc(Number(rawVariant?.available) || 0),
     });
   }
-  return {
+  const item = {
     sku,
     name: String(rawItem?.name || "ERP 商品").replace(/\s+/g, " ").trim().slice(0, 200) || "ERP 商品",
     available: Math.trunc(Number(rawItem?.available) || 0),
     variants,
   };
+  if (isNasLocalImageSku(sku)) {
+    item.costMin = normalizeWarehouseUnitCost(rawItem?.costMin);
+    item.costMax = normalizeWarehouseUnitCost(rawItem?.costMax);
+  }
+  return item;
+}
+
+function normalizeWarehouseUnitCost(value) {
+  const cost = Number(value);
+  return Number.isFinite(cost) && cost > 0 ? Math.round(cost * 10000) / 10000 : 0;
+}
+
+function formatWarehouseUnitCost(value) {
+  const rounded = Math.round(normalizeWarehouseUnitCost(value) * 100) / 100;
+  return Number.isInteger(rounded) ? `NT$${rounded}` : `NT$${rounded.toFixed(2)}`;
+}
+
+function warehouseUnitCostText(item) {
+  if (!isNasLocalImageSku(item?.sku)) return "";
+  const minimum = normalizeWarehouseUnitCost(item?.costMin);
+  const maximum = normalizeWarehouseUnitCost(item?.costMax);
+  if (!minimum && !maximum) return "🔒 單個存貨成本：未設定";
+  const low = minimum || maximum;
+  const high = maximum || minimum;
+  if (low === high) return `🔒 單個存貨成本：${formatWarehouseUnitCost(low)}／個`;
+  return `🔒 單個存貨成本：${formatWarehouseUnitCost(low)}～${formatWarehouseUnitCost(high)}／個`;
 }
 
 function warehouseLocationBucket(sku, bucketCount = 64) {
@@ -1286,7 +1312,7 @@ function warehouseLocationBucket(sku, bucketCount = 64) {
   return (hash >>> 0) % bucketCount;
 }
 
-function formatWarehouseLocation(item, metadata = {}) {
+function formatWarehouseLocation(item, metadata = {}, options = {}) {
   if (!item) {
     const updated = metadata.updatedAt ? `\n儲位資料更新：${formatTaipeiDate(Date.parse(metadata.updatedAt))}` : "";
     return `🔎 ERP 主倉查無此貨號。\n請確認貨號是否完整，例如：A12345${updated}`;
@@ -1294,8 +1320,10 @@ function formatWarehouseLocation(item, metadata = {}) {
   const lines = [
     `📦 ${item.sku}｜${item.name}`,
     `主倉可用庫存：${Number(item.available) || 0}`,
-    "儲位：",
   ];
+  const costText = options.showCost === true ? warehouseUnitCostText(item) : "";
+  if (costText) lines.push(costText);
+  lines.push("儲位：");
   const variants = Array.isArray(item.variants) ? item.variants : [];
   const located = variants.filter((variant) => String(variant.location || "").trim());
   if (!located.length) {
@@ -1323,11 +1351,35 @@ function warehouseSearchLocations(item) {
   return unique;
 }
 
-function createWarehouseSearchMessage(items, keyword, totalCount = items.length) {
+function createWarehouseSearchMessage(items, keyword, totalCount = items.length, options = {}) {
   const shown = (Array.isArray(items) ? items : []).slice(0, 10);
   const bubbles = shown.map((item) => {
     const imageUrl = normalizeShopeeImageUrl(item?.imageUrl);
     const locations = warehouseSearchLocations(item);
+    const costText = options.showCost === true ? warehouseUnitCostText(item) : "";
+    const bodyContents = [
+      { type: "text", text: `【${item.sku}】`, weight: "bold", color: "#174B3A", size: "lg" },
+      { type: "text", text: String(item.name || "ERP 商品"), wrap: true, maxLines: 3, weight: "bold", size: "md" },
+      { type: "separator", margin: "md" },
+      { type: "text", text: `主倉可用：${Number(item.available) || 0}`, margin: "md", size: "sm" },
+      {
+        type: "text",
+        text: locations.length ? `主要儲位：${locations.join("、")}` : "主要儲位：尚未設定",
+        wrap: true,
+        maxLines: 2,
+        size: "sm",
+        color: "#555555",
+      },
+    ];
+    if (costText) {
+      bodyContents.splice(4, 0, {
+        type: "text",
+        text: costText,
+        wrap: true,
+        size: "sm",
+        color: "#9A6700",
+      });
+    }
     const bubble = {
       type: "bubble",
       size: "kilo",
@@ -1335,20 +1387,7 @@ function createWarehouseSearchMessage(items, keyword, totalCount = items.length)
         type: "box",
         layout: "vertical",
         spacing: "sm",
-        contents: [
-          { type: "text", text: `【${item.sku}】`, weight: "bold", color: "#174B3A", size: "lg" },
-          { type: "text", text: String(item.name || "ERP 商品"), wrap: true, maxLines: 3, weight: "bold", size: "md" },
-          { type: "separator", margin: "md" },
-          { type: "text", text: `主倉可用：${Number(item.available) || 0}`, margin: "md", size: "sm" },
-          {
-            type: "text",
-            text: locations.length ? `主要儲位：${locations.join("、")}` : "主要儲位：尚未設定",
-            wrap: true,
-            maxLines: 2,
-            size: "sm",
-            color: "#555555",
-          },
-        ],
+        contents: bodyContents,
       },
       footer: {
         type: "box",
@@ -3189,12 +3228,21 @@ async function replyWarehouseLocation(event, sku, env, showDetails = false) {
       await replyLine(event.replyToken, "ERP 主倉儲位資料尚未完成第一次同步，請稍後再試。", env);
       return;
     }
+    const showCost = event.source?.type === "user";
     if (showDetails || !result.item) {
-      await replyLine(event.replyToken, formatWarehouseLocation(result.item, result.metadata), env);
+      await replyLine(
+        event.replyToken,
+        formatWarehouseLocation(result.item, result.metadata, { showCost }),
+        env,
+      );
       return;
     }
     const [item] = await enrichWarehouseSearchItems([result.item], env);
-    await replyLine(event.replyToken, [createWarehouseSearchMessage([item], sku, 1)], env);
+    await replyLine(
+      event.replyToken,
+      [createWarehouseSearchMessage([item], sku, 1, { showCost })],
+      env,
+    );
   } catch (error) {
     console.error("LINE warehouse location error", error?.message || error);
     await replyLine(event.replyToken, `目前無法查詢 ERP 儲位：${error?.message || "請稍後再試"}`, env);
@@ -3217,8 +3265,14 @@ async function replyWarehouseSearch(event, keyword, env) {
       return;
     }
     const items = await enrichWarehouseSearchItems(result.items, env);
+    const showCost = event.source?.type === "user";
     await replyLine(event.replyToken, [
-      createWarehouseSearchMessage(items, keyword, Number(result.totalCount) || items.length),
+      createWarehouseSearchMessage(
+        items,
+        keyword,
+        Number(result.totalCount) || items.length,
+        { showCost },
+      ),
     ], env);
   } catch (error) {
     console.error("LINE warehouse search error", error?.message || error);
