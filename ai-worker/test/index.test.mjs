@@ -34,6 +34,7 @@ import worker, {
   parseLineFollowup,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
+  parseWarehouseStorageLocationCandidate,
   parseWarehouseStorageLocationCommand,
   parseWarehousePositionDryRunCommand,
   parseWarehousePositionDryRunStartCommand,
@@ -150,6 +151,11 @@ test("warehouse storage-location command accepts exact tray and no-tray location
   assert.equal(parseWarehouseStorageLocationCommand("A區-01"), null);
   assert.equal(parseWarehouseStorageLocationCommand("04-R05-02/T"), null);
   assert.equal(normalizeWarehouseStorageLocation(" ０４－ｒ０５－０２／ｔ５ "), "04-R05-02/T5");
+  assert.equal(parseWarehouseStorageLocationCandidate("AR01-03"), "AR01-03");
+  assert.equal(parseWarehouseStorageLocationCandidate("儲位 ar01-03"), "AR01-03");
+  assert.equal(parseWarehouseStorageLocationCandidate("A區-01"), "A區-01");
+  assert.equal(parseWarehouseStorageLocationCandidate("洗衣袋"), "洗衣袋");
+  assert.equal(parseWarehouseStorageLocationCandidate("https://example.com/AR01-03"), null);
 });
 
 test("warehouse storage-location reply paginates and flags unavailable and stale stock", () => {
@@ -2302,7 +2308,7 @@ test("group users can search warehouse products by a bare keyword without mentio
   assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 A100");
 });
 
-test("private LINE users can page through a storage location while groups receive no inventory list", async () => {
+test("private LINE users can page through ERP-known storage locations while groups receive no inventory list", async () => {
   const originalFetch = globalThis.fetch;
   const values = new Map();
   const object = new LineActivation({
@@ -2317,18 +2323,32 @@ test("private LINE users can page through a storage location while groups receiv
     body: JSON.stringify({
       updatedAt: new Date().toISOString(),
       warehouseName: "主倉",
-      items: Array.from({ length: 12 }, (_, index) => ({
-        sku: `P${index + 1}`,
-        name: `儲位商品 ${index + 1}`,
-        available: index - 1,
-        variants: [{
-          location: "04-R05-02/T5",
-          style: `款 ${index + 1}`,
-          size: "",
-          barcode: `P${index + 1}-01`,
+      items: [
+        ...Array.from({ length: 12 }, (_, index) => ({
+          sku: `P${index + 1}`,
+          name: `儲位商品 ${index + 1}`,
           available: index - 1,
-        }],
-      })),
+          variants: [{
+            location: "04-R05-02/T5",
+            style: `款 ${index + 1}`,
+            size: "",
+            barcode: `P${index + 1}-01`,
+            available: index - 1,
+          }],
+        })),
+        ...Array.from({ length: 12 }, (_, index) => ({
+          sku: `ARITEM${index + 1}`,
+          name: `AR 儲位商品 ${index + 1}`,
+          available: index + 1,
+          variants: [{
+            location: "AR01-03",
+            style: `AR 款 ${index + 1}`,
+            size: "",
+            barcode: `ARITEM${index + 1}-01`,
+            available: index + 1,
+          }],
+        })),
+      ],
     }),
   }));
   const replies = [];
@@ -2381,6 +2401,58 @@ test("private LINE users can page through a storage location while groups receiv
     assert.match(replies[1].messages[0].text, /第 2\/2 頁/);
     assert.match(replies[1].messages[0].text, /11\. P11｜儲位商品 11/);
     assert.deepEqual(replies[1].messages[0].quickReply.items.map((item) => item.action.label), ["⬅️ 上一頁"]);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "erp-known-location-bare",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      message: { type: "text", text: "AR01-03" },
+    }, env);
+    assert.equal(replies.length, 3);
+    assert.match(replies[2].messages[0].text, /📍 主倉｜AR01-03/);
+    assert.match(replies[2].messages[0].text, /共 12 個貨號、12 個品項｜第 1\/2 頁/);
+    const arNextPageData = replies[2].messages[0].quickReply.items[0].action.data;
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "erp-known-location-prefixed",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      message: { type: "text", text: "儲位 ar01-03" },
+    }, env);
+    assert.equal(replies.length, 4);
+    assert.match(replies[3].messages[0].text, /📍 主倉｜AR01-03/);
+
+    await processLineEvent({
+      type: "postback",
+      replyToken: "erp-known-location-page-2",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      postback: { data: arNextPageData },
+    }, env);
+    assert.equal(replies.length, 5);
+    assert.match(replies[4].messages[0].text, /第 2\/2 頁/);
+    assert.match(replies[4].messages[0].text, /11\. ARITEM11｜AR 儲位商品 11/);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "erp-known-location-group",
+      timestamp: Date.now(),
+      source: { type: "group", groupId: "g1", userId: "owner-user" },
+      message: { type: "text", text: "AR01-03" },
+    }, env);
+    assert.equal(replies.length, 5, "ERP-known storage locations must stay private even with an unrecognized shape");
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "unknown-location-falls-back-to-sku",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      message: { type: "text", text: "AR99-99" },
+    }, env);
+    assert.equal(replies.length, 6);
+    assert.match(replies[5].messages[0].text, /ERP 主倉查無此貨號/);
   } finally {
     globalThis.fetch = originalFetch;
   }

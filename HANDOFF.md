@@ -33,6 +33,13 @@ git pull --ff-only origin agent/line-schedule-handoff
 - Validation: all 62 Worker tests pass and `node --check ai-worker/src/index.js` passes. Cloudflare Worker version `e0a87ea9-dcdd-415a-a56b-047ec39cf475` was deployed at 2026-08-26 12:15:54 +08:00 with 100% traffic; the public endpoint returned the expected HTTP 405 JSON response for a root GET after deployment.
 - A fresh private-chat LINE query still needs to be sent by the user to confirm the final user-facing reply with live warehouse data. The pre-index compatibility scan means the exact-location query can work immediately; the next normal NAS snapshot sync will replace that fallback with the reverse index.
 
+### Pending ERP-driven location recognition follow-up (2026-08-26)
+
+- The user confirmed that any normalized input exactly present in the current ERP main-warehouse `倉庫儲位` values must be treated as a storage location, rather than relying only on the original numeric pattern. This covers `AR01-03`, `A區-01`, and future ERP-defined shapes without adding one regular expression per format.
+- The pending Worker change probes the exact reverse index before SKU and keyword routing. A matching ERP location wins; a miss falls back to the existing SKU or keyword behavior, preserving commands such as `儲位 A725` and ordinary product searches. Pagination postbacks now accept the normalized ERP location value instead of reapplying the old numeric-only parser. Physical-location lists remain private-chat only.
+- Validation: all 62 Worker tests and `node --check ai-worker/src/index.js` pass. Regression coverage includes bare and prefixed `AR01-03`, two-page results, the AR-format pagination postback, group suppression, and fallback of an unknown location-like value to the SKU flow.
+- This follow-up is committed only to the feature branch pending production approval. It has not been deployed; production remains Worker version `e0a87ea9-dcdd-415a-a56b-047ec39cf475`.
+
 ## Current production state
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>

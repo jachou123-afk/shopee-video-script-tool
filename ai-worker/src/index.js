@@ -924,6 +924,14 @@ function parseWarehouseStorageLocationCommand(text) {
   return /^\d{2}-[LR]\d{2}-\d{2}(?:\/T\d{1,3})?$/u.test(candidate) ? candidate : null;
 }
 
+function parseWarehouseStorageLocationCandidate(text) {
+  const normalized = normalizeScheduleDigits(text).normalize("NFKC").trim();
+  const prefixed = normalized.match(/^(?:儲位|查儲位|查詢儲位)\s*(?:[+＋:：]\s*)?(.+)$/u);
+  const candidate = normalizeWarehouseStorageLocation(prefixed?.[1] || normalized);
+  if (!candidate || /(?:HTTPS?:\/\/|WWW\.)/iu.test(candidate)) return null;
+  return candidate;
+}
+
 function parseWarehouseLocationDetailCommand(text) {
   const normalized = normalizeScheduleDigits(text).replace(/\s+/g, " ").trim();
   const match = normalized.match(/^(?:完整儲位|儲位明細)\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/u);
@@ -3525,9 +3533,9 @@ async function replyWarehouseLocation(event, sku, env, showDetails = false) {
   }
 }
 
-async function replyWarehouseStorageLocation(event, location, page, env) {
+async function replyWarehouseStorageLocation(event, location, page, env, preparedResult = null) {
   try {
-    const result = await warehouseStorageLocationRequest(env, location, page);
+    const result = preparedResult || await warehouseStorageLocationRequest(env, location, page);
     if (!result?.metadata) {
       await replyLine(event.replyToken, "ERP 主倉儲位資料尚未完成第一次同步，請稍後再試。", env);
       return;
@@ -3727,7 +3735,7 @@ async function processLineEvent(event, env) {
     }
     if (action === warehouseStorageLocationAction) {
       if (event.source?.type !== "user") return;
-      const location = parseWarehouseStorageLocationCommand(params.get("location") || "");
+      const location = normalizeWarehouseStorageLocation(params.get("location") || "");
       if (!location) return;
       await replyWarehouseStorageLocation(event, location, Number.parseInt(params.get("page"), 10) || 1, env);
       return;
@@ -3790,12 +3798,28 @@ async function processLineEvent(event, env) {
     return;
   }
 
-  const warehouseStorageLocation = parseWarehouseStorageLocationCommand(text);
-  if (warehouseStorageLocation) {
-    if (event.source?.type === "user") {
-      await replyWarehouseStorageLocation(event, warehouseStorageLocation, 1, env);
+  const parsedWarehouseStorageLocation = parseWarehouseStorageLocationCommand(text);
+  const warehouseStorageLocationCandidate = parsedWarehouseStorageLocation
+    || parseWarehouseStorageLocationCandidate(text);
+  if (warehouseStorageLocationCandidate) {
+    try {
+      const result = await warehouseStorageLocationRequest(env, warehouseStorageLocationCandidate, 1);
+      const exactErpLocation = Boolean(result?.metadata && Number(result?.totalCount) > 0);
+      if (exactErpLocation || parsedWarehouseStorageLocation) {
+        if (event.source?.type === "user") {
+          await replyWarehouseStorageLocation(event, warehouseStorageLocationCandidate, 1, env, result);
+        }
+        return;
+      }
+    } catch (error) {
+      console.error("LINE warehouse storage location probe error", error?.message || error);
+      if (parsedWarehouseStorageLocation) {
+        if (event.source?.type === "user") {
+          await replyLine(event.replyToken, `目前無法反查 ERP 儲位：${error?.message || "請稍後再試"}`, env);
+        }
+        return;
+      }
     }
-    return;
   }
 
   if (isScheduleAddCommand(text)) {
@@ -4243,6 +4267,7 @@ export {
   parseLineFollowup,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
+  parseWarehouseStorageLocationCandidate,
   parseWarehouseStorageLocationCommand,
   parseWarehousePositionDryRunCommand,
   parseWarehousePositionDryRunStartCommand,
