@@ -41,12 +41,20 @@ git pull --ff-only origin agent/line-schedule-handoff
 - Source commit `02aacf28d9cab2b9b2914e909d7dd61b31130714` was fast-forwarded to the formal `agent/line-schedule-handoff` branch and deployed as Cloudflare Worker version `5db64fd9-51fa-4a07-b21b-f6372c62fbac` at 2026-08-26 12:39:06 +08:00 with 100% traffic. The public endpoint returned the expected HTTP 405 JSON response for a root GET after deployment.
 - The last confirmed NAS cycle before deployment completed at 12:34:44 with 3,694 LINE main-warehouse locations. This routing-only release reuses that existing reverse index and does not require a new schema or index rebuild. The NAS share became unavailable during the 12:40 post-deployment readback, so a later successful cycle has not yet been confirmed. A fresh private-chat `AR01-03` query is still required for final user-facing verification.
 
+### Complete-location blank-row fix deployed (2026-08-26)
+
+- A live read-only ERP main-warehouse export confirmed that A856 has four variants totaling 3,870 available units. The 55*80 / F variant has 990 units but a blank `倉庫儲位`; the other three variants have W2-1 and total 2,880 units. No ERP data was changed.
+- `formatWarehouseLocation` previously removed every blank-location variant whenever at least one located variant existed. `完整儲位 A856` therefore showed only three rows even though its product total included all four.
+- Source commit `fb049627d3d04f40d16874be36d7f96fa010ecab` now lists every ERP variant and renders a blank location as `未設定儲位` with the original available quantity. The 40-row safety cap now counts all variants consistently.
+- Validation: all 62 Worker tests and `node --check ai-worker/src/index.js` pass. Regression coverage reproduces A856 with all four variants and verifies `55*80／F：未設定儲位（可用 990）` while preserving the 3,870 product total.
+- Cloudflare Worker version `e371c6ea-cfd6-448d-a63c-9c261a1033e5` was deployed at 2026-08-26 13:03:46 +08:00 with 100% traffic. The public endpoint returned the expected HTTP 405 JSON response for a root GET after deployment. A fresh private-chat `完整儲位 A856` query is still required for final user-facing verification.
+
 ## Current production state
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source commit before this documentation update: `02aacf28d9cab2b9b2914e909d7dd61b31130714` (`Recognize ERP-defined LINE storage locations`).
-- Latest production deployment: `5db64fd9-51fa-4a07-b21b-f6372c62fbac` at 2026-08-26 12:39:06 +08:00, deployed from source commit `02aacf28d9cab2b9b2914e909d7dd61b31130714`.
+- Latest feature source commit before this documentation update: `fb049627d3d04f40d16874be36d7f96fa010ecab` (`fix(line): show variants without warehouse locations`).
+- Latest production deployment: `e371c6ea-cfd6-448d-a63c-9c261a1033e5` at 2026-08-26 13:03:46 +08:00, deployed from source commit `fb049627d3d04f40d16874be36d7f96fa010ecab`.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
 - Validation status: all 62 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
