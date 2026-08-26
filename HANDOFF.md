@@ -33,19 +33,20 @@ git pull --ff-only origin agent/line-schedule-handoff
 - Validation: all 62 Worker tests pass and `node --check ai-worker/src/index.js` passes. Cloudflare Worker version `e0a87ea9-dcdd-415a-a56b-047ec39cf475` was deployed at 2026-08-26 12:15:54 +08:00 with 100% traffic; the public endpoint returned the expected HTTP 405 JSON response for a root GET after deployment.
 - A fresh private-chat LINE query still needs to be sent by the user to confirm the final user-facing reply with live warehouse data. The pre-index compatibility scan means the exact-location query can work immediately; the next normal NAS snapshot sync will replace that fallback with the reverse index.
 
-### Pending ERP-driven location recognition follow-up (2026-08-26)
+### ERP-driven location recognition deployed (2026-08-26)
 
 - The user confirmed that any normalized input exactly present in the current ERP main-warehouse `倉庫儲位` values must be treated as a storage location, rather than relying only on the original numeric pattern. This covers `AR01-03`, `A區-01`, and future ERP-defined shapes without adding one regular expression per format.
-- The pending Worker change probes the exact reverse index before SKU and keyword routing. A matching ERP location wins; a miss falls back to the existing SKU or keyword behavior, preserving commands such as `儲位 A725` and ordinary product searches. Pagination postbacks now accept the normalized ERP location value instead of reapplying the old numeric-only parser. Physical-location lists remain private-chat only.
+- The Worker probes the exact reverse index before SKU and keyword routing. A matching ERP location wins; a miss falls back to the existing SKU or keyword behavior, preserving commands such as `儲位 A725` and ordinary product searches. Pagination postbacks now accept the normalized ERP location value instead of reapplying the old numeric-only parser. Physical-location lists remain private-chat only.
 - Validation: all 62 Worker tests and `node --check ai-worker/src/index.js` pass. Regression coverage includes bare and prefixed `AR01-03`, two-page results, the AR-format pagination postback, group suppression, and fallback of an unknown location-like value to the SKU flow.
-- This follow-up is committed only to the feature branch pending production approval. It has not been deployed; production remains Worker version `e0a87ea9-dcdd-415a-a56b-047ec39cf475`.
+- Source commit `02aacf28d9cab2b9b2914e909d7dd61b31130714` was fast-forwarded to the formal `agent/line-schedule-handoff` branch and deployed as Cloudflare Worker version `5db64fd9-51fa-4a07-b21b-f6372c62fbac` at 2026-08-26 12:39:06 +08:00 with 100% traffic. The public endpoint returned the expected HTTP 405 JSON response for a root GET after deployment.
+- The last confirmed NAS cycle before deployment completed at 12:34:44 with 3,694 LINE main-warehouse locations. This routing-only release reuses that existing reverse index and does not require a new schema or index rebuild. The NAS share became unavailable during the 12:40 post-deployment readback, so a later successful cycle has not yet been confirmed. A fresh private-chat `AR01-03` query is still required for final user-facing verification.
 
 ## Current production state
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source commit before this documentation update: `2643a9f1cd2d5597d118fde7a9390defb9b4cd35` (`Add LINE storage location reverse lookup`).
-- Latest production deployment: `e0a87ea9-dcdd-415a-a56b-047ec39cf475` at 2026-08-26 12:15:54 +08:00, deployed from source commit `2643a9f1cd2d5597d118fde7a9390defb9b4cd35`.
+- Latest feature source commit before this documentation update: `02aacf28d9cab2b9b2914e909d7dd61b31130714` (`Recognize ERP-defined LINE storage locations`).
+- Latest production deployment: `5db64fd9-51fa-4a07-b21b-f6372c62fbac` at 2026-08-26 12:39:06 +08:00, deployed from source commit `02aacf28d9cab2b9b2914e909d7dd61b31130714`.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
 - Validation status: all 62 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
