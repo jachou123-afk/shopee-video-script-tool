@@ -1457,17 +1457,17 @@ function formatWarehouseLocation(item, metadata = {}, options = {}) {
   if (costText) lines.push(costText);
   lines.push("儲位：");
   const variants = Array.isArray(item.variants) ? item.variants : [];
-  const located = variants.filter((variant) => String(variant.location || "").trim());
-  if (!located.length) {
+  if (!variants.length) {
     lines.push("尚未設定儲位");
   } else {
-    const shown = located.slice(0, 40);
+    const shown = variants.slice(0, 40);
     for (const variant of shown) {
       const specification = [variant.style, variant.size].filter(Boolean).join("／");
       const prefix = specification ? `${specification}：` : "";
-      lines.push(`- ${prefix}${variant.location}（可用 ${Number(variant.available) || 0}）`);
+      const location = String(variant.location || "").trim() || "未設定儲位";
+      lines.push(`- ${prefix}${location}（可用 ${Number(variant.available) || 0}）`);
     }
-    if (located.length > shown.length) lines.push(`另有 ${located.length - shown.length} 筆規格未列出。`);
+    if (variants.length > shown.length) lines.push(`另有 ${variants.length - shown.length} 筆規格未列出。`);
   }
   if (metadata.updatedAt) lines.push(`更新：${formatTaipeiDate(Date.parse(metadata.updatedAt))}`);
   return lines.join("\n");

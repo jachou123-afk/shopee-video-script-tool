@@ -326,6 +326,19 @@ test("warehouse location formatter shows variants and missing locations", () => 
   assert.match(text, /主倉可用庫存：8/);
   assert.match(text, /紅色／大：A區-01/);
   assert.match(text, /更新：2026\/08\/12/);
+  const mixedLocations = formatWarehouseLocation({
+    sku: "A856",
+    name: "搬家打包袋",
+    available: 3870,
+    variants: [
+      { location: "W2-1", style: "65*100", size: "F", available: 978 },
+      { location: "W2-1", style: "75*110", size: "F", available: 978 },
+      { location: "W2-1", style: "85*120", size: "F", available: 924 },
+      { location: "", style: "55*80", size: "F", available: 990 },
+    ],
+  });
+  assert.match(mixedLocations, /主倉可用庫存：3870/);
+  assert.match(mixedLocations, /55\*80／F：未設定儲位（可用 990）/);
   assert.match(formatWarehouseLocation({ sku: "B1", name: "無儲位", available: 0, variants: [] }), /尚未設定儲位/);
   const privateCost = formatWarehouseLocation({
     sku: "K501",
