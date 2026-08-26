@@ -8,6 +8,7 @@ import worker, {
   createWarehousePositionDryRunPreview,
   createWarehousePositionWizardMessage,
   createWarehouseSearchMessage,
+  createWarehouseStorageLocationMessage,
   enrichScheduleItemsWithProfitSkus,
   extractShopeePageContent,
   fetchShopeePageContent,
@@ -33,6 +34,7 @@ import worker, {
   parseLineFollowup,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
+  parseWarehouseStorageLocationCommand,
   parseWarehousePositionDryRunCommand,
   parseWarehousePositionDryRunStartCommand,
   parseWarehouseSearchCommand,
@@ -50,6 +52,7 @@ import worker, {
   takeLineGroupActivation,
   verifyLineSignature,
   warehouseLocationBucket,
+  normalizeWarehouseStorageLocation,
   warehousePositionWizardLocation,
   warehouseSearchScore,
   withAbortTimeout,
@@ -135,6 +138,65 @@ test("warehouse location command accepts common LINE input forms", () => {
   assert.equal(parseWarehouseLocationDetailCommand("完整儲位 A725"), "A725");
   assert.equal(parseWarehouseLocationDetailCommand("儲位明細：p063"), "P063");
   assert.equal(parseWarehouseLocationDetailCommand("A725"), null);
+});
+
+test("warehouse storage-location command accepts exact tray and no-tray locations", () => {
+  assert.equal(parseWarehouseStorageLocationCommand("04-R05-02/T5"), "04-R05-02/T5");
+  assert.equal(parseWarehouseStorageLocationCommand("05-R04-03"), "05-R04-03");
+  assert.equal(parseWarehouseStorageLocationCommand("儲位 04-r05-02/t5"), "04-R05-02/T5");
+  assert.equal(parseWarehouseStorageLocationCommand("查儲位：０５－Ｒ０４－０３"), "05-R04-03");
+  assert.equal(parseWarehouseStorageLocationCommand("04 - R05 - 02 ／ T12"), "04-R05-02/T12");
+  assert.equal(parseWarehouseStorageLocationCommand("A725"), null);
+  assert.equal(parseWarehouseStorageLocationCommand("A區-01"), null);
+  assert.equal(parseWarehouseStorageLocationCommand("04-R05-02/T"), null);
+  assert.equal(normalizeWarehouseStorageLocation(" ０４－ｒ０５－０２／ｔ５ "), "04-R05-02/T5");
+});
+
+test("warehouse storage-location reply paginates and flags unavailable and stale stock", () => {
+  const message = createWarehouseStorageLocationMessage({
+    location: "04-R05-02/T5",
+    items: [
+      { sku: "A1", name: "商品一", style: "紅色", size: "大", available: 2 },
+      { sku: "A2", name: "商品二", style: "", size: "", available: 0 },
+      { sku: "A3", name: "商品三", style: "藍色", size: "小", available: -1 },
+    ],
+    skuCount: 12,
+    totalCount: 13,
+    page: 1,
+    totalPages: 2,
+    metadata: {
+      warehouseName: "主倉",
+      updatedAt: "2026-08-13T09:00:00+08:00",
+    },
+  }, Date.parse("2026-08-13T10:00:01+08:00"));
+  assert.match(message.text, /主倉｜04-R05-02\/T5/);
+  assert.match(message.text, /共 12 個貨號、13 個品項｜第 1\/2 頁/);
+  assert.match(message.text, /紅色／大｜可用 2/);
+  assert.match(message.text, /一般規格｜⚠️ 可用 0/);
+  assert.match(message.text, /藍色／小｜⚠️ 可用 -1/);
+  assert.match(message.text, /已超過 30 分鐘/);
+  assert.deepEqual(message.quickReply.items.map((item) => item.action.label), ["➡️ 下一頁"]);
+  assert.match(message.quickReply.items[0].action.data, /action=warehouse_storage_location/);
+  assert.ok(message.quickReply.items[0].action.data.length <= 300);
+
+  const bounded = createWarehouseStorageLocationMessage({
+    location: "04-R05-02/T5",
+    items: Array.from({ length: 10 }, (_, index) => ({
+      sku: `LONG-SKU-${index}-${"X".repeat(80)}`,
+      name: `商品 ${index} ${"長".repeat(200)}`,
+      style: "款".repeat(100),
+      size: "尺寸".repeat(50),
+      available: index,
+    })),
+    skuCount: 10,
+    totalCount: 10,
+    page: 1,
+    totalPages: 1,
+    metadata: { warehouseName: "主倉", updatedAt: "2026-08-13T09:55:00+08:00" },
+  }, Date.parse("2026-08-13T10:00:00+08:00"));
+  assert.ok(bounded.text.length < 5000);
+  assert.match(bounded.text, /10\. LONG-SKU-9/);
+  assert.match(bounded.text, /ERP 更新/);
 });
 
 test("warehouse position dry-run command requires a SKU and safe new location", () => {
@@ -1098,6 +1160,143 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   }));
   data = await response.json();
   assert.equal(data.item.name, "測試商品");
+});
+
+test("LineActivation builds an exact reverse index and paginates every item at a storage location", async () => {
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const targetLocation = "04-R05-02/T5";
+  const targetBucket = warehouseLocationBucket(targetLocation, 64);
+  let collidingLocation = "";
+  for (let zone = 0; zone < 100 && !collidingLocation; zone += 1) {
+    for (let shelf = 0; shelf < 100; shelf += 1) {
+      const candidate = `${String(zone).padStart(2, "0")}-L${String(shelf).padStart(2, "0")}-01/T1`;
+      if (candidate !== targetLocation && warehouseLocationBucket(candidate, 64) === targetBucket) {
+        collidingLocation = candidate;
+        break;
+      }
+    }
+  }
+  assert.ok(collidingLocation, "the test needs another location in the same reverse bucket");
+  const items = Array.from({ length: 12 }, (_, index) => ({
+    sku: `A${index + 1}`,
+    name: `測試商品 ${index + 1}`,
+    available: index - 1,
+    variants: [{
+      location: index % 2 ? "04-r05-02/t5" : "０４－Ｒ０５－０２／Ｔ５",
+      style: `款式 ${index + 1}`,
+      size: "",
+      barcode: `A${index + 1}-01`,
+      available: index - 1,
+    }],
+  }));
+  items[0].variants.push({ ...items[0].variants[0] }, {
+    ...items[0].variants[0],
+    style: "另一款",
+    barcode: "A1-02",
+  });
+  items.unshift(...Array.from({ length: 45 }, (_, index) => ({
+    sku: `Z${index + 1}`,
+    name: `同桶前置商品 ${index + 1}`,
+    available: 1,
+    variants: [{
+      location: collidingLocation,
+      style: "",
+      size: "",
+      barcode: `Z${index + 1}-01`,
+      available: 1,
+    }],
+  })));
+
+  let response = await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: "2026-08-26T10:00:00+08:00",
+      warehouseName: "主倉",
+      items,
+    }),
+  }));
+  let data = await response.json();
+  assert.equal(data.locationCount, 2);
+  assert.equal(data.locatedItemCount, 58, "an exact duplicate is removed but a distinct variant remains");
+  assert.ok(values.has("warehouse-location-active"));
+  const reverseChunks = [...values.entries()]
+    .filter(([key]) => key.startsWith("warehouse-location-reverse-items:"))
+    .map(([, value]) => value);
+  assert.ok(reverseChunks.length > 0);
+  assert.ok(reverseChunks.every((chunk) => Array.isArray(chunk) && chunk.length <= 50));
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
+    method: "POST",
+    body: JSON.stringify({ location: "04-R05-02/T5", page: 1 }),
+  }));
+  data = await response.json();
+  assert.equal(data.indexed, true);
+  assert.equal(data.location, "０４－Ｒ０５－０２／Ｔ５");
+  assert.equal(data.skuCount, 12);
+  assert.equal(data.totalCount, 13);
+  assert.equal(data.items.length, 10);
+  assert.ok(data.items.every((item) => item.sku.startsWith("A")), "a page spanning two chunks must not leak the colliding location");
+  assert.equal(data.page, 1);
+  assert.equal(data.totalPages, 2);
+  assert.ok(data.items.some((item) => item.available === 0));
+  assert.ok(data.items.some((item) => item.available < 0));
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
+    method: "POST",
+    body: JSON.stringify({ location: "０４－ｒ０５－０２／ｔ５", page: 2 }),
+  }));
+  data = await response.json();
+  assert.equal(data.items.length, 3);
+  assert.equal(data.page, 2);
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
+    method: "POST",
+    body: JSON.stringify({ location: "04-R05-02/T6", page: 1 }),
+  }));
+  data = await response.json();
+  assert.equal(data.totalCount, 0);
+  assert.deepEqual(data.items, []);
+});
+
+test("storage-location query remains compatible with a snapshot created before the reverse index", async () => {
+  const values = new Map();
+  const version = "legacy-version";
+  const item = {
+    sku: "A900",
+    name: "舊快照商品",
+    available: 0,
+    variants: [{ location: "05-R04-03", style: "", size: "", barcode: "A900-01", available: 0 }],
+  };
+  values.set("warehouse-location-active", {
+    version,
+    bucketCount: 64,
+    warehouseName: "主倉",
+    updatedAt: "2026-08-26T10:00:00+08:00",
+  });
+  values.set(`warehouse-location:${version}:${warehouseLocationBucket(item.sku, 64)}`, { [item.sku]: item });
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
+    method: "POST",
+    body: JSON.stringify({ location: "05-R04-03" }),
+  }));
+  const data = await response.json();
+  assert.equal(data.indexed, false);
+  assert.equal(data.totalCount, 1);
+  assert.equal(data.items[0].sku, "A900");
+  assert.equal(data.items[0].available, 0);
 });
 
 test("warehouse image cache downloads only one product per alarm and persists the LINE image", async () => {
@@ -2101,6 +2300,90 @@ test("group users can search warehouse products by a bare keyword without mentio
     "https://down-tw.img.susercontent.com/file/tw-11134207-laundry-bag-image",
   );
   assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 A100");
+});
+
+test("private LINE users can page through a storage location while groups receive no inventory list", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      warehouseName: "主倉",
+      items: Array.from({ length: 12 }, (_, index) => ({
+        sku: `P${index + 1}`,
+        name: `儲位商品 ${index + 1}`,
+        available: index - 1,
+        variants: [{
+          location: "04-R05-02/T5",
+          style: `款 ${index + 1}`,
+          size: "",
+          barcode: `P${index + 1}-01`,
+          available: index - 1,
+        }],
+      })),
+    }),
+  }));
+  const replies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(init.body));
+      return new Response("OK");
+    }
+    throw new Error(`Unexpected fetch: ${input}`);
+  };
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() { return { fetch(input, init) { return object.fetch(new Request(input, init)); } }; },
+    },
+  };
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "storage-location-private",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      message: { type: "text", text: "儲位 04-R05-02/T5" },
+    }, env);
+    assert.equal(replies.length, 1);
+    assert.match(replies[0].messages[0].text, /共 12 個貨號、12 個品項｜第 1\/2 頁/);
+    assert.match(replies[0].messages[0].text, /1\. P1｜儲位商品 1/);
+    assert.match(replies[0].messages[0].text, /⚠️ 可用 -1/);
+    assert.doesNotMatch(replies[0].messages[0].text, /成本|售價/);
+    const nextPageData = replies[0].messages[0].quickReply.items[0].action.data;
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "storage-location-group",
+      timestamp: Date.now(),
+      source: { type: "group", groupId: "g1", userId: "owner-user" },
+      message: { type: "text", text: "04-R05-02/T5" },
+    }, env);
+    assert.equal(replies.length, 1, "physical storage-location inventory must stay private by default");
+
+    await processLineEvent({
+      type: "postback",
+      replyToken: "storage-location-page-2",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      postback: { data: nextPageData },
+    }, env);
+    assert.equal(replies.length, 2);
+    assert.match(replies[1].messages[0].text, /第 2\/2 頁/);
+    assert.match(replies[1].messages[0].text, /11\. P11｜儲位商品 11/);
+    assert.deepEqual(replies[1].messages[0].quickReply.items.map((item) => item.action.label), ["⬅️ 上一頁"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("formatLineScript creates a readable LINE reply", () => {

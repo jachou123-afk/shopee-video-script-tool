@@ -24,6 +24,14 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
+## Pending release: location-to-items lookup (2026-08-26)
+
+- Branch `codex/line-location-reverse-lookup-20260826` adds a read-only private-chat lookup from an exact main-warehouse location to every item stored there. It is tested but must not be deployed until the user explicitly approves production release.
+- Accepted forms include `04-R05-02/T5`, `05-R04-03`, and `儲位 04-R05-02/T5`. Parsing happens before SKU parsing so a no-tray location is not mistaken for a SKU.
+- The NAS snapshot sync now builds a chunked 64-bucket reverse index before switching the active version; row chunks are capped at 50 records to stay below either Durable Object storage backend's per-value limit. Each LINE reply shows 10 rows per page, preserves zero/negative availability with a warning, omits cost and price, and warns after 30 minutes. Group and room messages are ignored for this reverse inventory list.
+- The Worker remains compatible with the currently active pre-index snapshot by scanning the bounded 64 SKU buckets only until the next normal NAS sync creates the reverse index.
+- Validation on this branch: all 62 Worker tests pass. Production Worker and LINE user-facing behavior have not changed yet.
+
 ## Current production state
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
