@@ -24,23 +24,24 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
-## Pending release: location-to-items lookup (2026-08-26)
+## Location-to-items lookup deployed (2026-08-26)
 
-- Branch `codex/line-location-reverse-lookup-20260826` adds a read-only private-chat lookup from an exact main-warehouse location to every item stored there. It is tested but must not be deployed until the user explicitly approves production release.
+- Source commit `2643a9f1cd2d5597d118fde7a9390defb9b4cd35` adds a read-only private-chat lookup from an exact main-warehouse location to every item stored there. The user approved production release on 2026-08-26, and the commit was fast-forwarded to the formal `agent/line-schedule-handoff` branch before deployment.
 - Accepted forms include `04-R05-02/T5`, `05-R04-03`, and `儲位 04-R05-02/T5`. Parsing happens before SKU parsing so a no-tray location is not mistaken for a SKU.
 - The NAS snapshot sync now builds a chunked 64-bucket reverse index before switching the active version; row chunks are capped at 50 records to stay below either Durable Object storage backend's per-value limit. Each LINE reply shows 10 rows per page, preserves zero/negative availability with a warning, omits cost and price, and warns after 30 minutes. Group and room messages are ignored for this reverse inventory list.
 - The Worker remains compatible with the currently active pre-index snapshot by scanning the bounded 64 SKU buckets only until the next normal NAS sync creates the reverse index.
-- Validation on this branch: all 62 Worker tests pass. Production Worker and LINE user-facing behavior have not changed yet.
+- Validation: all 62 Worker tests pass and `node --check ai-worker/src/index.js` passes. Cloudflare Worker version `e0a87ea9-dcdd-415a-a56b-047ec39cf475` was deployed at 2026-08-26 12:15:54 +08:00 with 100% traffic; the public endpoint returned the expected HTTP 405 JSON response for a root GET after deployment.
+- A fresh private-chat LINE query still needs to be sent by the user to confirm the final user-facing reply with live warehouse data. The pre-index compatibility scan means the exact-location query can work immediately; the next normal NAS snapshot sync will replace that fallback with the reverse index.
 
 ## Current production state
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source commit before this documentation update: `97b81c214ac4a472d12d6c474acde197c4cd2b97` (`Allow warehouse positions without tray suffix`).
-- Latest production deployment: `04e4dea9-29be-4cce-ba56-09cbf0cb2871` at 2026-08-14 14:06:58 +08:00. It was deployed immediately before the matching source commit was created at 14:07:19.
+- Latest feature source commit before this documentation update: `2643a9f1cd2d5597d118fde7a9390defb9b4cd35` (`Add LINE storage location reverse lookup`).
+- Latest production deployment: `e0a87ea9-dcdd-415a-a56b-047ec39cf475` at 2026-08-26 12:15:54 +08:00, deployed from source commit `2643a9f1cd2d5597d118fde7a9390defb9b4cd35`.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: all 57 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
+- Validation status: all 62 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
 
 ## Persistent product-image cache (2026-08-13)
 
