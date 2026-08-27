@@ -24,13 +24,17 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
-## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，尚未部署）
+## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，已正式部署，待 LINE 私訊驗收）
 
 - NAS ERP 主倉快照現在會為每個貨號帶入所有正數 `售價` 的最低值與最高值；同貨號各款式價格相同時顯示單一價格，不同時顯示區間，未設定或 0 顯示「未設定」，不修改 ERP 資料。
 - `@059hdfyo` 一對一私訊查貨號、品名關鍵字卡片與 `完整儲位 {貨號}` 會顯示「ERP 售價：NT$…／個」。群組／聊天室回覆、依實體儲位反查的品項清單仍不顯示售價或成本。
 - 原 G／K 私訊存貨成本顯示與其他查詢規則均保留；沒有 D1／KV schema、環境變數或密鑰變更，也沒有修改 `@037vajci`。
 - 驗證：Worker `node --check` 通過且 `63/63` 項測試通過；NAS ERP 同步端 `57/57` 項測試通過。回歸測試涵蓋單一價格、價格區間、未設定價格、所有貨號系列、群組隱藏與舊快照相容。
-- 待完成：推送兩個 GitHub 正式來源、部署 Cloudflare Worker、更新 NAS 正式 `erp_sync.py` 並確認新快照同步成功；完成前不可視為正式上線。
+- GitHub 正式來源已推送：本儲存庫 `agent/line-schedule-handoff` commit `b8efc5b4b330c61b1040660c01d63ee959592dd1`；NAS 同步來源已快轉至 `profit-analysis-cloud/main` commit `cac70041a60ac8f2cec2ebecec9e7108ccbe7291`。
+- Cloudflare Worker version `b2c7cf17-3c48-4027-8e25-c669237da3e8` 已於 2026-08-27 21:59:36 +08:00 部署並確認承接 100% 流量；公開根端點回讀為預期 HTTP 405。
+- NAS 正式檔已先備份為 `/volume1/docker/erp-sync/backups/erp_sync.py.before-line-sale-price-20260827-221057`，再更新 `/volume1/docker/erp-sync/erp_sync.py`。正式檔為 79,324 Bytes，DSM MD5 `B080AE1CD2AD1F17375D90A5F525683D` 與本機交付檔完全一致；容器維持運作、未停止或重建。
+- NAS 更新後的新一輪主倉快照已於 2026-08-27 22:32:07 +08:00 由 `Synology-ERP-Sync/1.0` 推送；正式 `/erp/locations/push` 與 Durable Object `/warehouse-locations/sync` 均回 HTTP 200，承接版本為 `b2c7cf17-3c48-4027-8e25-c669237da3e8`，請求內容長度為 1,320,854 Bytes。
+- 待完成：請使用者於 `@059hdfyo` 一對一私訊實查貨號及 `完整儲位 {貨號}`；真實 LINE 畫面完成前不標為最終驗收完成。
 
 ## 儲位反查「先詢問／明確指令直查」（2026-08-27，已正式部署，待 LINE 私訊驗收）
 
@@ -72,8 +76,8 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source commit before this documentation update: `279cc5724de8f10d2c533fc2d28c5ddfacf79cb0` (`feat(line): 詢問儲位無庫存顯示方式`).
-- Latest production deployment: `5a68527f-e6e0-4ded-8ee7-3502e2f4b324` at 2026-08-27 21:45:38 +08:00, deployed from source commit `279cc5724de8f10d2c533fc2d28c5ddfacf79cb0`.
+- Latest feature source commit before this documentation update: `b8efc5b4b330c61b1040660c01d63ee959592dd1` (`feat(line): 私訊查貨號顯示 ERP 售價`).
+- Latest production deployment: `b2c7cf17-3c48-4027-8e25-c669237da3e8` at 2026-08-27 21:59:36 +08:00, deployed from source commit `b8efc5b4b330c61b1040660c01d63ee959592dd1`.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
 - Validation status: all 63 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
