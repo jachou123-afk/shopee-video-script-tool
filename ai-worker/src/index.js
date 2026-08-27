@@ -932,6 +932,23 @@ function parseWarehouseStorageLocationCandidate(text) {
   return candidate;
 }
 
+function parseWarehouseStorageLocationAvailabilityCommand(text) {
+  const normalized = normalizeScheduleDigits(text).normalize("NFKC").trim();
+  const directives = [
+    { pattern: /^(.*?)\s*(?:不顯示|隱藏|排除)\s*無庫存(?:商品|品項)?$/u, includeUnavailable: false },
+    { pattern: /^(.*?)\s*只\s*(?:看|顯示)?\s*有庫存(?:商品|品項)?$/u, includeUnavailable: false },
+    { pattern: /^(.*?)\s+有庫存(?:商品|品項)?$/u, includeUnavailable: false },
+    { pattern: /^(.*?)\s*(?:顯示|包含|含)\s*無庫存(?:商品|品項)?$/u, includeUnavailable: true },
+  ];
+  for (const directive of directives) {
+    const match = normalized.match(directive.pattern);
+    if (!match) continue;
+    const location = parseWarehouseStorageLocationCandidate(match[1]);
+    if (location) return { location, includeUnavailable: directive.includeUnavailable };
+  }
+  return null;
+}
+
 function parseWarehouseLocationDetailCommand(text) {
   const normalized = normalizeScheduleDigits(text).replace(/\s+/g, " ").trim();
   const match = normalized.match(/^(?:完整儲位|儲位明細)\s*(?:[+＋:：]\s*)?([^\s]+)\s*$/u);
@@ -1387,9 +1404,23 @@ function createWarehouseStorageLocationMessage(result, now = Date.now()) {
   const stale = !Number.isFinite(updatedAt) || Math.max(0, Number(now) - updatedAt) > warehousePositionDryRunMaxSnapshotAgeMs;
   const staleLine = stale ? "⚠️ 儲位資料已超過 30 分鐘，請先確認 NAS 同步狀態。" : "";
   const totalCount = Math.max(0, Number(result?.totalCount) || 0);
+  const allTotalCount = Math.max(totalCount, Number(result?.allTotalCount) || 0);
   const skuCount = Math.max(0, Number(result?.skuCount) || 0);
+  const includeUnavailable = result?.includeUnavailable !== false;
   const items = Array.isArray(result?.items) ? result.items : [];
   if (!totalCount) {
+    if (!includeUnavailable && allTotalCount) {
+      return {
+        type: "text",
+        text: [
+          `📍 ${metadata.warehouseName || "主倉"}｜${location}`,
+          "目前沒有可用庫存大於 0 的品項。",
+          `如需查看無庫存，請輸入「${location} 顯示無庫存」。`,
+          updatedLine,
+          staleLine,
+        ].filter(Boolean).join("\n").slice(0, 4900),
+      };
+    }
     return {
       type: "text",
       text: [
@@ -1406,7 +1437,8 @@ function createWarehouseStorageLocationMessage(result, now = Date.now()) {
   const start = (page - 1) * warehouseStorageLocationPageSize;
   const lines = [
     `📍 ${metadata.warehouseName || "主倉"}｜${location}`,
-    `共 ${skuCount} 個貨號、${totalCount} 個品項｜第 ${page}/${totalPages} 頁`,
+    `共 ${skuCount} 個貨號、${totalCount} 個${includeUnavailable ? "" : "有庫存"}品項｜第 ${page}/${totalPages} 頁`,
+    `篩選：${includeUnavailable ? "顯示無庫存" : "只看有庫存"}`,
     "",
   ];
   items.forEach((item, index) => {
@@ -1428,6 +1460,7 @@ function createWarehouseStorageLocationMessage(result, now = Date.now()) {
       action: warehouseStorageLocationAction,
       location,
       page: String(targetPage),
+      includeUnavailable: includeUnavailable ? "1" : "0",
     }).toString();
     quickReplyItems.push({
       type: "action",
@@ -1442,6 +1475,39 @@ function createWarehouseStorageLocationMessage(result, now = Date.now()) {
   const message = { type: "text", text: lines.join("\n").slice(0, 4900) };
   if (quickReplyItems.length) message.quickReply = { items: quickReplyItems };
   return message;
+}
+
+function createWarehouseStorageLocationFilterPrompt(result) {
+  const metadata = result?.metadata || {};
+  const location = normalizeWarehouseStorageLocation(result?.location);
+  const totalCount = Math.max(0, Number(result?.totalCount) || 0);
+  const skuCount = Math.max(0, Number(result?.skuCount) || 0);
+  const choices = [
+    { label: "只看有庫存", includeUnavailable: false },
+    { label: "顯示無庫存", includeUnavailable: true },
+  ].map((choice) => ({
+    type: "action",
+    action: {
+      type: "postback",
+      label: choice.label,
+      data: new URLSearchParams({
+        action: warehouseStorageLocationAction,
+        location,
+        page: "1",
+        includeUnavailable: choice.includeUnavailable ? "1" : "0",
+      }).toString(),
+      displayText: `${location} ${choice.label}`,
+    },
+  }));
+  return {
+    type: "text",
+    text: [
+      `📍 ${metadata.warehouseName || "主倉"}｜${location}`,
+      `此儲位共有 ${skuCount} 個貨號、${totalCount} 個品項。`,
+      "是否顯示無庫存品項？",
+    ].join("\n"),
+    quickReply: { items: choices },
+  };
 }
 
 function formatWarehouseLocation(item, metadata = {}, options = {}) {
@@ -2581,8 +2647,13 @@ export class LineActivation {
   }
 
   async queryWarehouseStorageLocation(request) {
-    const { location: rawLocation, page: rawPage } = await request.json();
+    const {
+      location: rawLocation,
+      page: rawPage,
+      includeUnavailable: rawIncludeUnavailable = true,
+    } = await request.json();
     const location = normalizeWarehouseStorageLocation(rawLocation);
+    const includeUnavailable = rawIncludeUnavailable !== false;
     const metadata = await this.storage.get("warehouse-location-active");
     if (!metadata?.version || !location) {
       return Response.json({
@@ -2591,8 +2662,10 @@ export class LineActivation {
         items: [],
         skuCount: 0,
         totalCount: 0,
+        allTotalCount: 0,
         page: 1,
         totalPages: 0,
+        includeUnavailable,
         metadata: metadata || null,
       });
     }
@@ -2623,14 +2696,41 @@ export class LineActivation {
       if (rows.length) record = finalizeWarehouseStorageLocationRecord(displayLocation, rows);
     }
 
-    const totalCount = Math.max(0, Number(record?.itemCount) || 0);
+    const allTotalCount = Math.max(0, Number(record?.itemCount) || 0);
+    let filteredItems = null;
+    if (!includeUnavailable && record) {
+      let allItems = Array.isArray(record.items) ? record.items : [];
+      if (reverseBucketCount && !Array.isArray(record.items) && allTotalCount) {
+        const bucketIndex = warehouseLocationBucket(location, reverseBucketCount);
+        const chunkSize = Math.min(
+          200,
+          Math.max(1, Number(metadata.reverseItemChunkSize) || warehouseStorageLocationIndexChunkSize),
+        );
+        const absoluteStart = Math.max(0, Number(record.offset) || 0);
+        const absoluteEnd = absoluteStart + allTotalCount;
+        const firstChunk = Math.floor(absoluteStart / chunkSize);
+        const lastChunk = Math.floor(Math.max(absoluteStart, absoluteEnd - 1) / chunkSize);
+        const chunks = await Promise.all(Array.from({ length: lastChunk - firstChunk + 1 }, (_, offset) =>
+          this.storage.get(`warehouse-location-reverse-items:${metadata.version}:${bucketIndex}:${firstChunk + offset}`)
+        ));
+        allItems = chunks.flatMap((chunk) => Array.isArray(chunk) ? chunk : []).slice(
+          absoluteStart - firstChunk * chunkSize,
+          absoluteStart - firstChunk * chunkSize + allTotalCount,
+        );
+      }
+      filteredItems = allItems.filter((item) => Math.trunc(Number(item?.available) || 0) > 0);
+    }
+
+    const totalCount = filteredItems ? filteredItems.length : allTotalCount;
     const totalPages = totalCount ? Math.ceil(totalCount / warehouseStorageLocationPageSize) : 0;
     const page = totalPages
       ? Math.min(totalPages, Math.max(1, Math.trunc(Number(rawPage) || 1)))
       : 1;
     const start = (page - 1) * warehouseStorageLocationPageSize;
-    let pageItems = record?.items?.slice(start, start + warehouseStorageLocationPageSize) || [];
-    if (record && reverseBucketCount && !Array.isArray(record.items)) {
+    let pageItems = filteredItems
+      ? filteredItems.slice(start, start + warehouseStorageLocationPageSize)
+      : record?.items?.slice(start, start + warehouseStorageLocationPageSize) || [];
+    if (!filteredItems && record && reverseBucketCount && !Array.isArray(record.items)) {
       const bucketIndex = warehouseLocationBucket(location, reverseBucketCount);
       const chunkSize = Math.min(200, Math.max(1, Number(metadata.reverseItemChunkSize) || warehouseStorageLocationIndexChunkSize));
       const absoluteStart = Math.max(0, Number(record.offset) || 0) + start;
@@ -2649,10 +2749,14 @@ export class LineActivation {
       ok: true,
       location: record?.location || location,
       items: pageItems,
-      skuCount: Math.max(0, Number(record?.skuCount) || 0),
+      skuCount: filteredItems
+        ? new Set(filteredItems.map((item) => String(item?.sku || ""))).size
+        : Math.max(0, Number(record?.skuCount) || 0),
       totalCount,
+      allTotalCount,
       page,
       totalPages,
+      includeUnavailable,
       metadata,
       indexed: Boolean(reverseBucketCount),
     });
@@ -3058,13 +3162,13 @@ async function warehouseLocationRequest(env, sku, includeImage = true) {
   return response.json();
 }
 
-async function warehouseStorageLocationRequest(env, location, page = 1) {
+async function warehouseStorageLocationRequest(env, location, page = 1, includeUnavailable = true) {
   if (!env.LINE_ACTIVATION) throw httpError("ERP 儲位查詢服務尚未設定", 503);
   const stub = lineScheduleStub(env, globalLineScheduleName);
   const response = await stub.fetch("https://line-schedule/warehouse-locations/query-storage-location", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ location, page }),
+    body: JSON.stringify({ location, page, includeUnavailable }),
   });
   if (!response.ok) throw httpError("ERP 儲位反查暫時無法使用", 503);
   return response.json();
@@ -3533,9 +3637,11 @@ async function replyWarehouseLocation(event, sku, env, showDetails = false) {
   }
 }
 
-async function replyWarehouseStorageLocation(event, location, page, env, preparedResult = null) {
+async function replyWarehouseStorageLocation(event, location, page, env, options = {}) {
   try {
-    const result = preparedResult || await warehouseStorageLocationRequest(env, location, page);
+    const includeUnavailable = options.includeUnavailable !== false;
+    const result = options.preparedResult
+      || await warehouseStorageLocationRequest(env, location, page, includeUnavailable);
     if (!result?.metadata) {
       await replyLine(event.replyToken, "ERP 主倉儲位資料尚未完成第一次同步，請稍後再試。", env);
       return;
@@ -3737,7 +3843,16 @@ async function processLineEvent(event, env) {
       if (event.source?.type !== "user") return;
       const location = normalizeWarehouseStorageLocation(params.get("location") || "");
       if (!location) return;
-      await replyWarehouseStorageLocation(event, location, Number.parseInt(params.get("page"), 10) || 1, env);
+      const includeUnavailable = params.has("includeUnavailable")
+        ? params.get("includeUnavailable") !== "0"
+        : true;
+      await replyWarehouseStorageLocation(
+        event,
+        location,
+        Number.parseInt(params.get("page"), 10) || 1,
+        env,
+        { includeUnavailable },
+      );
       return;
     }
     if (action !== "generate" && action !== "choose_focus") return;
@@ -3798,22 +3913,39 @@ async function processLineEvent(event, env) {
     return;
   }
 
-  const parsedWarehouseStorageLocation = parseWarehouseStorageLocationCommand(text);
-  const warehouseStorageLocationCandidate = parsedWarehouseStorageLocation
+  const availabilityCommand = parseWarehouseStorageLocationAvailabilityCommand(text);
+  const parsedWarehouseStorageLocation = availabilityCommand
+    ? parseWarehouseStorageLocationCommand(availabilityCommand.location)
+    : parseWarehouseStorageLocationCommand(text);
+  const warehouseStorageLocationCandidate = availabilityCommand?.location
+    || parsedWarehouseStorageLocation
     || parseWarehouseStorageLocationCandidate(text);
   if (warehouseStorageLocationCandidate) {
     try {
       const result = await warehouseStorageLocationRequest(env, warehouseStorageLocationCandidate, 1);
       const exactErpLocation = Boolean(result?.metadata && Number(result?.totalCount) > 0);
-      if (exactErpLocation || parsedWarehouseStorageLocation) {
+      if (exactErpLocation || parsedWarehouseStorageLocation || availabilityCommand) {
         if (event.source?.type === "user") {
-          await replyWarehouseStorageLocation(event, warehouseStorageLocationCandidate, 1, env, result);
+          if (!exactErpLocation || availabilityCommand) {
+            await replyWarehouseStorageLocation(
+              event,
+              warehouseStorageLocationCandidate,
+              1,
+              env,
+              {
+                includeUnavailable: availabilityCommand?.includeUnavailable !== false,
+                preparedResult: availabilityCommand?.includeUnavailable === false ? null : result,
+              },
+            );
+          } else {
+            await replyLine(event.replyToken, [createWarehouseStorageLocationFilterPrompt(result)], env);
+          }
         }
         return;
       }
     } catch (error) {
       console.error("LINE warehouse storage location probe error", error?.message || error);
-      if (parsedWarehouseStorageLocation) {
+      if (parsedWarehouseStorageLocation || availabilityCommand) {
         if (event.source?.type === "user") {
           await replyLine(event.replyToken, `目前無法反查 ERP 儲位：${error?.message || "請稍後再試"}`, env);
         }
@@ -4243,6 +4375,7 @@ export {
   createLineFocusPanel,
   createLinePanel,
   createWarehouseSearchMessage,
+  createWarehouseStorageLocationFilterPrompt,
   createWarehouseStorageLocationMessage,
   extractShopeePageContent,
   enrichScheduleItemsWithProfitSkus,
@@ -4267,6 +4400,7 @@ export {
   parseLineFollowup,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
+  parseWarehouseStorageLocationAvailabilityCommand,
   parseWarehouseStorageLocationCandidate,
   parseWarehouseStorageLocationCommand,
   parseWarehousePositionDryRunCommand,

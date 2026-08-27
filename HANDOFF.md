@@ -24,6 +24,15 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
+## 儲位反查「先詢問／明確指令直查」（2026-08-27，尚未部署）
+
+- `@059hdfyo` 私訊只輸入 ERP 已知儲位（例如 `AR03-03` 或 `儲位 AR03-03`）時，現在先詢問「是否顯示無庫存品項？」並提供 `只看有庫存`／`顯示無庫存` 兩個 LINE 快速按鈕。
+- 明確指令不再詢問，直接回覆：支援 `AR03-03 顯示無庫存`、`AR03-03 只看有庫存`、`儲位 AR03-03 不顯示無庫存`，並保留全形字元與大小寫正規化。
+- `只看有庫存` 排除可用量 `0` 與負數；回覆的貨號數、品項數及總頁數均依篩選後資料重新計算。上一頁／下一頁 postback 會攜帶同一篩選條件，不會翻頁後恢復顯示無庫存。
+- 詢問按鈕直接攜帶正規化儲位與篩選選項，不保存待處理使用者狀態。實體儲位清單仍只限一對一私訊、仍不顯示成本或售價、仍只讀 Cloudflare 的 ERP 主倉快照，沒有寫入 ERP、沒有 D1／KV schema 或密鑰變更，也沒有修改 `@037vajci`。
+- 驗證：`node --check ai-worker/src/index.js` 通過；Worker `63/63` 項測試通過，涵蓋明確指令、先詢問按鈕、正／零／負庫存篩選、正確總數與分頁、舊快照相容及群組不回傳實體儲位清單。
+- 目前僅完成程式與測試，尚未提交、推送或部署 Cloudflare Worker；正式發布後必須補記 GitHub commit、Worker version 與實際 LINE 私訊驗收狀態。
+
 ## Location-to-items lookup deployed (2026-08-26)
 
 - Source commit `2643a9f1cd2d5597d118fde7a9390defb9b4cd35` adds a read-only private-chat lookup from an exact main-warehouse location to every item stored there. The user approved production release on 2026-08-26, and the commit was fast-forwarded to the formal `agent/line-schedule-handoff` branch before deployment.

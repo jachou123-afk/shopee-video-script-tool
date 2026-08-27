@@ -8,6 +8,7 @@ import worker, {
   createWarehousePositionDryRunPreview,
   createWarehousePositionWizardMessage,
   createWarehouseSearchMessage,
+  createWarehouseStorageLocationFilterPrompt,
   createWarehouseStorageLocationMessage,
   enrichScheduleItemsWithProfitSkus,
   extractShopeePageContent,
@@ -34,6 +35,7 @@ import worker, {
   parseLineFollowup,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
+  parseWarehouseStorageLocationAvailabilityCommand,
   parseWarehouseStorageLocationCandidate,
   parseWarehouseStorageLocationCommand,
   parseWarehousePositionDryRunCommand,
@@ -158,6 +160,26 @@ test("warehouse storage-location command accepts exact tray and no-tray location
   assert.equal(parseWarehouseStorageLocationCandidate("https://example.com/AR01-03"), null);
 });
 
+test("warehouse storage-location availability commands are explicit and normalized", () => {
+  assert.deepEqual(parseWarehouseStorageLocationAvailabilityCommand("AR03-03 顯示無庫存"), {
+    location: "AR03-03",
+    includeUnavailable: true,
+  });
+  assert.deepEqual(parseWarehouseStorageLocationAvailabilityCommand("儲位 ar03-03 不顯示無庫存"), {
+    location: "AR03-03",
+    includeUnavailable: false,
+  });
+  assert.deepEqual(parseWarehouseStorageLocationAvailabilityCommand("AR03-03 只看有庫存"), {
+    location: "AR03-03",
+    includeUnavailable: false,
+  });
+  assert.deepEqual(parseWarehouseStorageLocationAvailabilityCommand("０４－Ｒ０５－０２／Ｔ５ 有庫存"), {
+    location: "04-R05-02/T5",
+    includeUnavailable: false,
+  });
+  assert.equal(parseWarehouseStorageLocationAvailabilityCommand("AR03-03"), null);
+});
+
 test("warehouse storage-location reply paginates and flags unavailable and stale stock", () => {
   const message = createWarehouseStorageLocationMessage({
     location: "04-R05-02/T5",
@@ -177,13 +199,38 @@ test("warehouse storage-location reply paginates and flags unavailable and stale
   }, Date.parse("2026-08-13T10:00:01+08:00"));
   assert.match(message.text, /主倉｜04-R05-02\/T5/);
   assert.match(message.text, /共 12 個貨號、13 個品項｜第 1\/2 頁/);
+  assert.match(message.text, /篩選：顯示無庫存/);
   assert.match(message.text, /紅色／大｜可用 2/);
   assert.match(message.text, /一般規格｜⚠️ 可用 0/);
   assert.match(message.text, /藍色／小｜⚠️ 可用 -1/);
   assert.match(message.text, /已超過 30 分鐘/);
   assert.deepEqual(message.quickReply.items.map((item) => item.action.label), ["➡️ 下一頁"]);
   assert.match(message.quickReply.items[0].action.data, /action=warehouse_storage_location/);
+  assert.match(message.quickReply.items[0].action.data, /includeUnavailable=1/);
   assert.ok(message.quickReply.items[0].action.data.length <= 300);
+
+  const prompt = createWarehouseStorageLocationFilterPrompt({
+    location: "AR03-03",
+    skuCount: 19,
+    totalCount: 19,
+    metadata: { warehouseName: "主倉" },
+  });
+  assert.match(prompt.text, /是否顯示無庫存品項/);
+  assert.deepEqual(prompt.quickReply.items.map((item) => item.action.label), ["只看有庫存", "顯示無庫存"]);
+  assert.match(prompt.quickReply.items[0].action.data, /includeUnavailable=0/);
+  assert.match(prompt.quickReply.items[1].action.data, /includeUnavailable=1/);
+
+  const availableOnlyEmpty = createWarehouseStorageLocationMessage({
+    location: "AR03-03",
+    items: [],
+    skuCount: 0,
+    totalCount: 0,
+    allTotalCount: 3,
+    includeUnavailable: false,
+    metadata: { warehouseName: "主倉", updatedAt: "2026-08-13T09:55:00+08:00" },
+  }, Date.parse("2026-08-13T10:00:00+08:00"));
+  assert.match(availableOnlyEmpty.text, /目前沒有可用庫存大於 0 的品項/);
+  assert.match(availableOnlyEmpty.text, /AR03-03 顯示無庫存/);
 
   const bounded = createWarehouseStorageLocationMessage({
     location: "04-R05-02/T5",
@@ -1269,6 +1316,18 @@ test("LineActivation builds an exact reverse index and paginates every item at a
 
   response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
     method: "POST",
+    body: JSON.stringify({ location: "04-R05-02/T5", page: 1, includeUnavailable: false }),
+  }));
+  data = await response.json();
+  assert.equal(data.includeUnavailable, false);
+  assert.equal(data.allTotalCount, 13);
+  assert.equal(data.totalCount, 10);
+  assert.equal(data.skuCount, 10);
+  assert.equal(data.totalPages, 1);
+  assert.ok(data.items.every((item) => item.available > 0));
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
+    method: "POST",
     body: JSON.stringify({ location: "０４－ｒ０５－０２／ｔ５", page: 2 }),
   }));
   data = await response.json();
@@ -1307,15 +1366,26 @@ test("storage-location query remains compatible with a snapshot created before t
       async delete(key) { values.delete(key); },
     },
   });
-  const response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
+  let response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
     method: "POST",
     body: JSON.stringify({ location: "05-R04-03" }),
   }));
-  const data = await response.json();
+  let data = await response.json();
   assert.equal(data.indexed, false);
   assert.equal(data.totalCount, 1);
   assert.equal(data.items[0].sku, "A900");
   assert.equal(data.items[0].available, 0);
+
+  response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query-storage-location", {
+    method: "POST",
+    body: JSON.stringify({ location: "05-R04-03", includeUnavailable: false }),
+  }));
+  data = await response.json();
+  assert.equal(data.indexed, false);
+  assert.equal(data.includeUnavailable, false);
+  assert.equal(data.allTotalCount, 1);
+  assert.equal(data.totalCount, 0);
+  assert.deepEqual(data.items, []);
 });
 
 test("warehouse image cache downloads only one product per alarm and persists the LINE image", async () => {
@@ -2388,11 +2458,27 @@ test("private LINE users can page through ERP-known storage locations while grou
       message: { type: "text", text: "儲位 04-R05-02/T5" },
     }, env);
     assert.equal(replies.length, 1);
-    assert.match(replies[0].messages[0].text, /共 12 個貨號、12 個品項｜第 1\/2 頁/);
-    assert.match(replies[0].messages[0].text, /1\. P1｜儲位商品 1/);
-    assert.match(replies[0].messages[0].text, /⚠️ 可用 -1/);
-    assert.doesNotMatch(replies[0].messages[0].text, /成本|售價/);
-    const nextPageData = replies[0].messages[0].quickReply.items[0].action.data;
+    assert.match(replies[0].messages[0].text, /是否顯示無庫存品項/);
+    assert.deepEqual(
+      replies[0].messages[0].quickReply.items.map((item) => item.action.label),
+      ["只看有庫存", "顯示無庫存"],
+    );
+    const showUnavailableData = replies[0].messages[0].quickReply.items[1].action.data;
+
+    await processLineEvent({
+      type: "postback",
+      replyToken: "storage-location-show-unavailable",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      postback: { data: showUnavailableData },
+    }, env);
+    assert.equal(replies.length, 2);
+    assert.match(replies[1].messages[0].text, /共 12 個貨號、12 個品項｜第 1\/2 頁/);
+    assert.match(replies[1].messages[0].text, /篩選：顯示無庫存/);
+    assert.match(replies[1].messages[0].text, /1\. P1｜儲位商品 1/);
+    assert.match(replies[1].messages[0].text, /⚠️ 可用 -1/);
+    assert.doesNotMatch(replies[1].messages[0].text, /成本|售價/);
+    const nextPageData = replies[1].messages[0].quickReply.items[0].action.data;
 
     await processLineEvent({
       type: "message",
@@ -2401,7 +2487,7 @@ test("private LINE users can page through ERP-known storage locations while grou
       source: { type: "group", groupId: "g1", userId: "owner-user" },
       message: { type: "text", text: "04-R05-02/T5" },
     }, env);
-    assert.equal(replies.length, 1, "physical storage-location inventory must stay private by default");
+    assert.equal(replies.length, 2, "physical storage-location inventory must stay private by default");
 
     await processLineEvent({
       type: "postback",
@@ -2410,10 +2496,23 @@ test("private LINE users can page through ERP-known storage locations while grou
       source: { type: "user", userId: "owner-user" },
       postback: { data: nextPageData },
     }, env);
-    assert.equal(replies.length, 2);
-    assert.match(replies[1].messages[0].text, /第 2\/2 頁/);
-    assert.match(replies[1].messages[0].text, /11\. P11｜儲位商品 11/);
-    assert.deepEqual(replies[1].messages[0].quickReply.items.map((item) => item.action.label), ["⬅️ 上一頁"]);
+    assert.equal(replies.length, 3);
+    assert.match(replies[2].messages[0].text, /第 2\/2 頁/);
+    assert.match(replies[2].messages[0].text, /11\. P11｜儲位商品 11/);
+    assert.match(replies[2].messages[0].text, /篩選：顯示無庫存/);
+    assert.deepEqual(replies[2].messages[0].quickReply.items.map((item) => item.action.label), ["⬅️ 上一頁"]);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "storage-location-available-only-command",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "owner-user" },
+      message: { type: "text", text: "04-R05-02/T5 只看有庫存" },
+    }, env);
+    assert.equal(replies.length, 4);
+    assert.match(replies[3].messages[0].text, /共 10 個貨號、10 個有庫存品項｜第 1\/1 頁/);
+    assert.match(replies[3].messages[0].text, /篩選：只看有庫存/);
+    assert.doesNotMatch(replies[3].messages[0].text, /⚠️ 可用/);
 
     await processLineEvent({
       type: "message",
@@ -2422,20 +2521,21 @@ test("private LINE users can page through ERP-known storage locations while grou
       source: { type: "user", userId: "owner-user" },
       message: { type: "text", text: "AR01-03" },
     }, env);
-    assert.equal(replies.length, 3);
-    assert.match(replies[2].messages[0].text, /📍 主倉｜AR01-03/);
-    assert.match(replies[2].messages[0].text, /共 12 個貨號、12 個品項｜第 1\/2 頁/);
-    const arNextPageData = replies[2].messages[0].quickReply.items[0].action.data;
+    assert.equal(replies.length, 5);
+    assert.match(replies[4].messages[0].text, /📍 主倉｜AR01-03/);
+    assert.match(replies[4].messages[0].text, /是否顯示無庫存品項/);
 
     await processLineEvent({
       type: "message",
       replyToken: "erp-known-location-prefixed",
       timestamp: Date.now(),
       source: { type: "user", userId: "owner-user" },
-      message: { type: "text", text: "儲位 ar01-03" },
+      message: { type: "text", text: "儲位 ar01-03 顯示無庫存" },
     }, env);
-    assert.equal(replies.length, 4);
-    assert.match(replies[3].messages[0].text, /📍 主倉｜AR01-03/);
+    assert.equal(replies.length, 6);
+    assert.match(replies[5].messages[0].text, /📍 主倉｜AR01-03/);
+    assert.match(replies[5].messages[0].text, /共 12 個貨號、12 個品項｜第 1\/2 頁/);
+    const arNextPageData = replies[5].messages[0].quickReply.items[0].action.data;
 
     await processLineEvent({
       type: "postback",
@@ -2444,9 +2544,9 @@ test("private LINE users can page through ERP-known storage locations while grou
       source: { type: "user", userId: "owner-user" },
       postback: { data: arNextPageData },
     }, env);
-    assert.equal(replies.length, 5);
-    assert.match(replies[4].messages[0].text, /第 2\/2 頁/);
-    assert.match(replies[4].messages[0].text, /11\. ARITEM11｜AR 儲位商品 11/);
+    assert.equal(replies.length, 7);
+    assert.match(replies[6].messages[0].text, /第 2\/2 頁/);
+    assert.match(replies[6].messages[0].text, /11\. ARITEM11｜AR 儲位商品 11/);
 
     await processLineEvent({
       type: "message",
@@ -2455,7 +2555,7 @@ test("private LINE users can page through ERP-known storage locations while grou
       source: { type: "group", groupId: "g1", userId: "owner-user" },
       message: { type: "text", text: "AR01-03" },
     }, env);
-    assert.equal(replies.length, 5, "ERP-known storage locations must stay private even with an unrecognized shape");
+    assert.equal(replies.length, 7, "ERP-known storage locations must stay private even with an unrecognized shape");
 
     await processLineEvent({
       type: "message",
@@ -2464,8 +2564,8 @@ test("private LINE users can page through ERP-known storage locations while grou
       source: { type: "user", userId: "owner-user" },
       message: { type: "text", text: "AR99-99" },
     }, env);
-    assert.equal(replies.length, 6);
-    assert.match(replies[5].messages[0].text, /ERP 主倉查無此貨號/);
+    assert.equal(replies.length, 8);
+    assert.match(replies[7].messages[0].text, /ERP 主倉查無此貨號/);
   } finally {
     globalThis.fetch = originalFetch;
   }
