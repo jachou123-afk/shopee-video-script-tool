@@ -1323,6 +1323,8 @@ function normalizeWarehouseLocationItem(rawItem) {
     sku,
     name: String(rawItem?.name || "ERP 商品").replace(/\s+/g, " ").trim().slice(0, 200) || "ERP 商品",
     available: Math.trunc(Number(rawItem?.available) || 0),
+    priceMin: normalizeWarehouseMoney(rawItem?.priceMin),
+    priceMax: normalizeWarehouseMoney(rawItem?.priceMax),
     variants,
   };
   if (isNasLocalImageSku(sku)) {
@@ -1332,14 +1334,22 @@ function normalizeWarehouseLocationItem(rawItem) {
   return item;
 }
 
+function normalizeWarehouseMoney(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount > 0 ? Math.round(amount * 10000) / 10000 : 0;
+}
+
 function normalizeWarehouseUnitCost(value) {
-  const cost = Number(value);
-  return Number.isFinite(cost) && cost > 0 ? Math.round(cost * 10000) / 10000 : 0;
+  return normalizeWarehouseMoney(value);
+}
+
+function formatWarehouseMoney(value) {
+  const rounded = Math.round(normalizeWarehouseMoney(value) * 100) / 100;
+  return Number.isInteger(rounded) ? `NT$${rounded}` : `NT$${rounded.toFixed(2)}`;
 }
 
 function formatWarehouseUnitCost(value) {
-  const rounded = Math.round(normalizeWarehouseUnitCost(value) * 100) / 100;
-  return Number.isInteger(rounded) ? `NT$${rounded}` : `NT$${rounded.toFixed(2)}`;
+  return formatWarehouseMoney(value);
 }
 
 function warehouseUnitCostText(item) {
@@ -1351,6 +1361,16 @@ function warehouseUnitCostText(item) {
   const high = maximum || minimum;
   if (low === high) return `🔒 單個存貨成本：${formatWarehouseUnitCost(low)}／個`;
   return `🔒 單個存貨成本：${formatWarehouseUnitCost(low)}～${formatWarehouseUnitCost(high)}／個`;
+}
+
+function warehouseSalePriceText(item) {
+  const minimum = normalizeWarehouseMoney(item?.priceMin);
+  const maximum = normalizeWarehouseMoney(item?.priceMax);
+  if (!minimum && !maximum) return "💰 ERP 售價：未設定";
+  const low = minimum || maximum;
+  const high = maximum || minimum;
+  if (low === high) return `💰 ERP 售價：${formatWarehouseMoney(low)}／個`;
+  return `💰 ERP 售價：${formatWarehouseMoney(low)}～${formatWarehouseMoney(high)}／個`;
 }
 
 function warehouseLocationBucket(sku, bucketCount = 64) {
@@ -1521,6 +1541,8 @@ function formatWarehouseLocation(item, metadata = {}, options = {}) {
   ];
   const costText = options.showCost === true ? warehouseUnitCostText(item) : "";
   if (costText) lines.push(costText);
+  const priceText = options.showPrice === true ? warehouseSalePriceText(item) : "";
+  if (priceText) lines.push(priceText);
   lines.push("儲位：");
   const variants = Array.isArray(item.variants) ? item.variants : [];
   if (!variants.length) {
@@ -1555,6 +1577,7 @@ function createWarehouseSearchMessage(items, keyword, totalCount = items.length,
     const imageUrl = normalizeShopeeImageUrl(item?.imageUrl);
     const locations = warehouseSearchLocations(item);
     const costText = options.showCost === true ? warehouseUnitCostText(item) : "";
+    const priceText = options.showPrice === true ? warehouseSalePriceText(item) : "";
     const bodyContents = [
       { type: "text", text: `【${item.sku}】`, weight: "bold", color: "#174B3A", size: "lg" },
       { type: "text", text: String(item.name || "ERP 商品"), wrap: true, maxLines: 3, weight: "bold", size: "md" },
@@ -1569,8 +1592,9 @@ function createWarehouseSearchMessage(items, keyword, totalCount = items.length,
         color: "#555555",
       },
     ];
+    const privatePricingContents = [];
     if (costText) {
-      bodyContents.splice(4, 0, {
+      privatePricingContents.push({
         type: "text",
         text: costText,
         wrap: true,
@@ -1578,6 +1602,16 @@ function createWarehouseSearchMessage(items, keyword, totalCount = items.length,
         color: "#9A6700",
       });
     }
+    if (priceText) {
+      privatePricingContents.push({
+        type: "text",
+        text: priceText,
+        wrap: true,
+        size: "sm",
+        color: "#9A6700",
+      });
+    }
+    if (privatePricingContents.length) bodyContents.splice(4, 0, ...privatePricingContents);
     const bubble = {
       type: "bubble",
       size: "kilo",
@@ -3620,7 +3654,7 @@ async function replyWarehouseLocation(event, sku, env, showDetails = false) {
     if (showDetails || !result.item) {
       await replyLine(
         event.replyToken,
-        formatWarehouseLocation(result.item, result.metadata, { showCost }),
+        formatWarehouseLocation(result.item, result.metadata, { showCost, showPrice: showCost }),
         env,
       );
       return;
@@ -3628,7 +3662,7 @@ async function replyWarehouseLocation(event, sku, env, showDetails = false) {
     const [item] = await enrichWarehouseSearchItems([result.item], env);
     await replyLine(
       event.replyToken,
-      [createWarehouseSearchMessage([item], sku, 1, { showCost })],
+      [createWarehouseSearchMessage([item], sku, 1, { showCost, showPrice: showCost })],
       env,
     );
   } catch (error) {
@@ -3675,7 +3709,7 @@ async function replyWarehouseSearch(event, keyword, env) {
         items,
         keyword,
         Number(result.totalCount) || items.length,
-        { showCost },
+        { showCost, showPrice: showCost },
       ),
     ], env);
   } catch (error) {

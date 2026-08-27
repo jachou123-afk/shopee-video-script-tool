@@ -393,25 +393,32 @@ test("warehouse location formatter shows variants and missing locations", () => 
     available: 30,
     costMin: 23,
     costMax: 24.5,
+    priceMin: 35,
+    priceMax: 38.5,
     variants: [],
-  }, {}, { showCost: true });
+  }, {}, { showCost: true, showPrice: true });
   assert.match(privateCost, /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
+  assert.match(privateCost, /💰 ERP 售價：NT\$35～NT\$38\.50／個/);
   assert.doesNotMatch(formatWarehouseLocation({
     sku: "K501",
     name: "頭盔小鴨吊飾",
     available: 30,
     costMin: 23,
     costMax: 24.5,
+    priceMin: 35,
+    priceMax: 38.5,
     variants: [],
-  }), /存貨成本|NT\$/);
+  }), /存貨成本|ERP 售價|NT\$/);
   assert.match(formatWarehouseLocation({
     sku: "G888",
     name: "未設定成本商品",
     available: 1,
     costMin: 0,
     costMax: 0,
+    priceMin: 0,
+    priceMax: 0,
     variants: [],
-  }, {}, { showCost: true }), /🔒 單個存貨成本：未設定/);
+  }, {}, { showCost: true, showPrice: true }), /🔒 單個存貨成本：未設定[\s\S]*💰 ERP 售價：未設定/);
   assert.equal(warehouseLocationBucket("A12345"), warehouseLocationBucket("A12345"));
 });
 
@@ -439,28 +446,36 @@ test("warehouse keyword search ranks matches and builds image cards", () => {
     available: 30,
     costMin: 23,
     costMax: 23,
+    priceMin: 35,
+    priceMax: 35,
     variants: [],
-  }], "K501", 1, { showCost: true });
+  }], "K501", 1, { showCost: true, showPrice: true });
   const privateCostBody = JSON.stringify(privateCostMessage.contents.contents[0].body.contents);
   assert.match(privateCostBody, /🔒 單個存貨成本：NT\$23／個/);
+  assert.match(privateCostBody, /💰 ERP 售價：NT\$35／個/);
   const groupCostBody = JSON.stringify(createWarehouseSearchMessage([{
     sku: "K501",
     name: "頭盔小鴨吊飾",
     available: 30,
     costMin: 23,
     costMax: 23,
+    priceMin: 35,
+    priceMax: 35,
     variants: [],
   }], "K501", 1).contents.contents[0].body.contents);
-  assert.doesNotMatch(groupCostBody, /存貨成本|NT\$/);
+  assert.doesNotMatch(groupCostBody, /存貨成本|ERP 售價|NT\$/);
   const nonGkBody = JSON.stringify(createWarehouseSearchMessage([{
     sku: "A725",
     name: "細網洗衣袋",
     available: 12,
     costMin: 99,
     costMax: 99,
+    priceMin: 120,
+    priceMax: 125.5,
     variants: [],
-  }], "A725", 1, { showCost: true }).contents.contents[0].body.contents);
-  assert.doesNotMatch(nonGkBody, /存貨成本|NT\$/);
+  }], "A725", 1, { showCost: true, showPrice: true }).contents.contents[0].body.contents);
+  assert.doesNotMatch(nonGkBody, /存貨成本/);
+  assert.match(nonGkBody, /💰 ERP 售價：NT\$120～NT\$125\.50／個/);
 });
 
 test("pure-profit products provide Shopee URLs and image URLs for warehouse cards", () => {
@@ -1164,6 +1179,8 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
         available: 8,
         costMin: 999,
         costMax: 999,
+        priceMin: 120,
+        priceMax: 125.5,
         variants: [{ location: "A區-01", style: "紅色", size: "大", barcode: "4711", available: 8 }],
       }, {
         sku: "k501",
@@ -1171,6 +1188,8 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
         available: 30,
         costMin: 23,
         costMax: 24.5,
+        priceMin: 35,
+        priceMax: 38.5,
         variants: [],
       }],
     }),
@@ -1188,6 +1207,8 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   assert.equal(data.item.variants[0].location, "A區-01");
   assert.equal(data.item.costMin, undefined);
   assert.equal(data.item.costMax, undefined);
+  assert.equal(data.item.priceMin, 120);
+  assert.equal(data.item.priceMax, 125.5);
   assert.equal(data.metadata.warehouseName, "主倉");
 
   response = await object.fetch(new Request("https://line-schedule/warehouse-locations/query", {
@@ -1197,6 +1218,8 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   data = await response.json();
   assert.equal(data.item.costMin, 23);
   assert.equal(data.item.costMax, 24.5);
+  assert.equal(data.item.priceMin, 35);
+  assert.equal(data.item.priceMax, 38.5);
 
   response = await object.fetch(new Request("https://line-schedule/warehouse-locations/search", {
     method: "POST",
@@ -1840,6 +1863,8 @@ test("group users can query a warehouse location without mentioning the bot", as
         available: 30,
         costMin: 23,
         costMax: 24.5,
+        priceMin: 35,
+        priceMax: 38.5,
         variants: [{ location: "K區-01", style: "", size: "", available: 30 }],
       }],
     }),
@@ -1897,12 +1922,14 @@ test("group users can query a warehouse location without mentioning the bot", as
   assert.equal(replies[0].messages[0].type, "flex");
   assert.match(replies[0].messages[0].altText, /K501.*找到 1 項/);
   assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 K501");
-  assert.doesNotMatch(JSON.stringify(replies[0]), /存貨成本|NT\$/);
+  assert.doesNotMatch(JSON.stringify(replies[0]), /存貨成本|ERP 售價|NT\$/);
   assert.match(replies[1].messages[0].text, /K501｜頭盔小鴨吊飾/);
   assert.match(replies[1].messages[0].text, /K區-01/);
-  assert.doesNotMatch(replies[1].messages[0].text, /存貨成本|NT\$/);
+  assert.doesNotMatch(replies[1].messages[0].text, /存貨成本|ERP 售價|NT\$/);
   assert.match(JSON.stringify(replies[2]), /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
+  assert.match(JSON.stringify(replies[2]), /💰 ERP 售價：NT\$35～NT\$38\.50／個/);
   assert.match(replies[3].messages[0].text, /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
+  assert.match(replies[3].messages[0].text, /💰 ERP 售價：NT\$35～NT\$38\.50／個/);
 });
 
 test("warehouse position dry run is private, account-bound, and read-only", async () => {
