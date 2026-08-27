@@ -24,14 +24,16 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
-## 儲位反查「先詢問／明確指令直查」（2026-08-27，尚未部署）
+## 儲位反查「先詢問／明確指令直查」（2026-08-27，已正式部署，待 LINE 私訊驗收）
 
 - `@059hdfyo` 私訊只輸入 ERP 已知儲位（例如 `AR03-03` 或 `儲位 AR03-03`）時，現在先詢問「是否顯示無庫存品項？」並提供 `只看有庫存`／`顯示無庫存` 兩個 LINE 快速按鈕。
 - 明確指令不再詢問，直接回覆：支援 `AR03-03 顯示無庫存`、`AR03-03 只看有庫存`、`儲位 AR03-03 不顯示無庫存`，並保留全形字元與大小寫正規化。
 - `只看有庫存` 排除可用量 `0` 與負數；回覆的貨號數、品項數及總頁數均依篩選後資料重新計算。上一頁／下一頁 postback 會攜帶同一篩選條件，不會翻頁後恢復顯示無庫存。
 - 詢問按鈕直接攜帶正規化儲位與篩選選項，不保存待處理使用者狀態。實體儲位清單仍只限一對一私訊、仍不顯示成本或售價、仍只讀 Cloudflare 的 ERP 主倉快照，沒有寫入 ERP、沒有 D1／KV schema 或密鑰變更，也沒有修改 `@037vajci`。
 - 驗證：`node --check ai-worker/src/index.js` 通過；Worker `63/63` 項測試通過，涵蓋明確指令、先詢問按鈕、正／零／負庫存篩選、正確總數與分頁、舊快照相容及群組不回傳實體儲位清單。
-- 目前僅完成程式與測試，尚未提交、推送或部署 Cloudflare Worker；正式發布後必須補記 GitHub commit、Worker version 與實際 LINE 私訊驗收狀態。
+- 功能與交接文件已提交並推送到正式 `agent/line-schedule-handoff` 分支，來源 commit 為 `279cc5724de8f10d2c533fc2d28c5ddfacf79cb0`。
+- Cloudflare Worker version `5a68527f-e6e0-4ded-8ee7-3502e2f4b324` 已於 2026-08-27 21:45:38 +08:00 部署並確認承接 100% 流量；21:46 正式公開端點回讀為預期的 HTTP 405 JSON `Method not allowed`，證明新 Worker 可連線且路由正常。
+- 尚待使用者在 `@059hdfyo` 一對一私訊分別測試 `AR03-03`、`AR03-03 只看有庫存`、`AR03-03 顯示無庫存`，確認實際 LINE 問句、兩個快速按鈕與結果內容；完成這項使用者端驗收前，不把 LINE 畫面流程標成最終驗收完成。
 
 ## Location-to-items lookup deployed (2026-08-26)
 
@@ -62,11 +64,11 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source commit before this documentation update: `fb049627d3d04f40d16874be36d7f96fa010ecab` (`fix(line): show variants without warehouse locations`).
-- Latest production deployment: `e371c6ea-cfd6-448d-a63c-9c261a1033e5` at 2026-08-26 13:03:46 +08:00, deployed from source commit `fb049627d3d04f40d16874be36d7f96fa010ecab`.
+- Latest feature source commit before this documentation update: `279cc5724de8f10d2c533fc2d28c5ddfacf79cb0` (`feat(line): 詢問儲位無庫存顯示方式`).
+- Latest production deployment: `5a68527f-e6e0-4ded-8ee7-3502e2f4b324` at 2026-08-27 21:45:38 +08:00, deployed from source commit `279cc5724de8f10d2c533fc2d28c5ddfacf79cb0`.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: all 62 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
+- Validation status: all 63 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
 
 ## Persistent product-image cache (2026-08-13)
 
