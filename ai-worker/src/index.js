@@ -31,6 +31,9 @@ const warehouseStorageLocationAction = "warehouse_storage_location";
 const warehouseStorageLocationPageSize = 10;
 const warehouseStorageLocationBucketCount = 64;
 const warehouseStorageLocationIndexChunkSize = 50;
+const erpOrderAliasBucketCount = 128;
+const erpOrderChunkTargetBytes = 96 * 1024;
+const erpOrderMaxSnapshotAgeMs = 30 * 60_000;
 const warehousePositionWizardOptions = Object.freeze({
   zones: ["01", "02", "03", "04", "05", "06"],
   sides: ["L", "R"],
@@ -1249,6 +1252,11 @@ function lineHelpText() {
     "取消完成1、取消完成2…",
     "依照『已拍完』清單編號，將誤標完成的商品退回待拍清單。",
     "",
+    "【查詢 ERP 訂單】",
+    "僅限授權私訊：直接輸入出貨單右上角編號，例如：0350000-10747554。",
+    "也可以輸入「訂單 0350000-10747554」。",
+    "回覆狀態、平台單號、品項、數量、單價與交易總計；不顯示姓名、電話、地址。",
+    "",
     "【查詢 ERP 主倉儲位】",
     "直接輸入貨號，例如：A12345",
     "原本的「儲位 A12345」也可以使用。",
@@ -1350,6 +1358,157 @@ function formatWarehouseMoney(value) {
 
 function formatWarehouseUnitCost(value) {
   return formatWarehouseMoney(value);
+}
+
+function normalizeErpOrderAlias(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toUpperCase()
+    .replace(/\s+/g, "")
+    .replace(/[‐‑‒–—―]/g, "-")
+    .slice(0, 160);
+}
+
+function erpOrderLookupCandidates(value) {
+  const normalized = normalizeErpOrderAlias(value);
+  if (!normalized) return [];
+  const candidates = new Set([normalized]);
+  const printable = normalized.match(/^\d{4,10}-(\d{6,12})$/);
+  if (printable) candidates.add(printable[1]);
+  if (/^\d{12,24}$/.test(normalized)) {
+    candidates.add(normalized.slice(-8));
+  }
+  return [...candidates];
+}
+
+function parseLineOrderLookupCommand(text) {
+  const normalized = normalizeScheduleDigits(text).normalize("NFKC").trim();
+  const explicit = normalized.match(/^訂單(?:編號)?\s*[+＋:：]?\s*([A-Za-z0-9-]{6,160})$/iu);
+  if (explicit) return normalizeErpOrderAlias(explicit[1]);
+  if (/^\d{4,10}-\d{6,12}$/.test(normalized)) return normalizeErpOrderAlias(normalized);
+  if (/^\d{7,12}$/.test(normalized)) return normalized;
+  return "";
+}
+
+function isLineOrderPromptCommand(text) {
+  return /^訂單(?:編號)?\s*[+＋:：]?\s*$/u.test(
+    normalizeScheduleDigits(text).normalize("NFKC").trim(),
+  );
+}
+
+function normalizeErpOrder(rawOrder) {
+  const transactionNo = normalizeErpOrderAlias(rawOrder?.transactionNo).slice(0, 80);
+  if (!transactionNo) return null;
+  const uniqueStrings = (values, limit = 100) => [...new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 160))
+      .filter(Boolean),
+  )].slice(0, limit);
+  const money = (value) => {
+    const amount = Number(value);
+    return Number.isFinite(amount) ? Math.round(amount * 10000) / 10000 : 0;
+  };
+  const order = {
+    transactionNo,
+    orderNumbers: uniqueStrings(rawOrder?.orderNumbers),
+    printableOrderNumbers: uniqueStrings(rawOrder?.printableOrderNumbers),
+    platformOrderNumbers: uniqueStrings(rawOrder?.platformOrderNumbers),
+    platform: String(rawOrder?.platform || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    status: String(rawOrder?.status || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    cancelReason: String(rawOrder?.cancelReason || "").replace(/\s+/g, " ").trim().slice(0, 160),
+    shipmentType: String(rawOrder?.shipmentType || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    shipmentNo: String(rawOrder?.shipmentNo || "").replace(/\s+/g, " ").trim().slice(0, 120),
+    shippingStatus: String(rawOrder?.shippingStatus || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    createdAt: String(rawOrder?.createdAt || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    shippedAt: String(rawOrder?.shippedAt || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    dispatchAt: String(rawOrder?.dispatchAt || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    pickedAt: String(rawOrder?.pickedAt || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    totalAmount: money(rawOrder?.totalAmount),
+    totalQuantity: money(rawOrder?.totalQuantity),
+    lastSeenAt: String(rawOrder?.lastSeenAt || "").slice(0, 80),
+    items: [],
+  };
+  for (const rawItem of Array.isArray(rawOrder?.items) ? rawOrder.items.slice(0, 100) : []) {
+    order.items.push({
+      orderNo: String(rawItem?.orderNo || "").replace(/\s+/g, "").slice(0, 120),
+      subOrderNo: String(rawItem?.subOrderNo || "").replace(/\s+/g, "").slice(0, 120),
+      name: String(rawItem?.name || "商品").replace(/\s+/g, " ").trim().slice(0, 240) || "商品",
+      style: String(rawItem?.style || "").replace(/\s+/g, " ").trim().slice(0, 120),
+      quantity: money(rawItem?.quantity),
+      unitPrice: money(rawItem?.unitPrice),
+      warehouseArea: String(rawItem?.warehouseArea || "").replace(/\s+/g, " ").trim().slice(0, 160),
+    });
+  }
+  order.aliases = [...new Set([
+    transactionNo,
+    ...order.orderNumbers,
+    ...order.printableOrderNumbers,
+    ...order.platformOrderNumbers,
+    ...order.items.flatMap((item) => [item.orderNo, item.subOrderNo]),
+  ].flatMap(erpOrderLookupCandidates))].slice(0, 500);
+  return order;
+}
+
+function buildErpOrderChunks(orders) {
+  const chunks = [];
+  let chunk = {};
+  let chunkBytes = 2;
+  for (const order of orders) {
+    const entryBytes = encoder.encode(JSON.stringify({ [order.transactionNo]: order })).byteLength;
+    if (Object.keys(chunk).length && chunkBytes + entryBytes > erpOrderChunkTargetBytes) {
+      chunks.push(chunk);
+      chunk = {};
+      chunkBytes = 2;
+    }
+    chunk[order.transactionNo] = order;
+    chunkBytes += entryBytes;
+  }
+  if (Object.keys(chunk).length) chunks.push(chunk);
+  return chunks;
+}
+
+function formatErpOrderMoney(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "NT$0";
+  const rounded = Math.round(amount * 100) / 100;
+  return `NT$${Number.isInteger(rounded) ? rounded : rounded.toFixed(2)}`;
+}
+
+function createErpOrderMessage(result, query, now = Date.now()) {
+  const metadata = result?.metadata || null;
+  const updatedAt = Date.parse(String(metadata?.updatedAt || ""));
+  const updatedLine = Number.isFinite(updatedAt)
+    ? `ERP 更新：${formatTaipeiDate(updatedAt)}`
+    : "ERP 更新：時間不明";
+  const stale = !Number.isFinite(updatedAt)
+    || Number(now) - updatedAt > erpOrderMaxSnapshotAgeMs
+    || updatedAt > Number(now) + 5 * 60_000;
+  if (stale) {
+    return `⚠️ 訂單查詢暫停\n\nERP 訂單資料已超過 30 分鐘或時間無效，為避免回覆舊資料，請先確認 NAS 同步。\n${updatedLine}`;
+  }
+  const order = result?.order;
+  if (!order) return `🔎 查無訂單「${String(query || "").slice(0, 160)}」\n${updatedLine}`;
+  const displayNo = order.printableOrderNumbers?.[0] || String(query || order.transactionNo);
+  const lines = [`📦 訂單 ${displayNo}`];
+  if (order.platformOrderNumbers?.length) lines.push(`平台單號：${order.platformOrderNumbers.join("、")}`);
+  if (order.platform) lines.push(`平台：${order.platform}`);
+  if (order.status) lines.push(`狀態：${order.status}`);
+  if (order.shippingStatus) lines.push(`配送：${order.shippingStatus}`);
+  if (order.shipmentType) lines.push(`出貨方式：${order.shipmentType}`);
+  if (order.shipmentNo) lines.push(`出貨單號：${order.shipmentNo}`);
+  if (order.createdAt) lines.push(`建立：${order.createdAt}`);
+  if (order.shippedAt) lines.push(`出貨：${order.shippedAt}`);
+  const items = Array.isArray(order.items) ? order.items : [];
+  lines.push(`共 ${items.length} 品／${order.totalQuantity || 0} 件｜交易總計 ${formatErpOrderMoney(order.totalAmount)}`);
+  for (const [index, item] of items.slice(0, 12).entries()) {
+    const style = item.style && item.style !== item.name ? `｜${item.style}` : "";
+    lines.push(`${index + 1}. ${item.name}${style} ×${item.quantity || 0}`);
+    lines.push(`   單價 ${formatErpOrderMoney(item.unitPrice)}${item.warehouseArea ? `｜儲位 ${item.warehouseArea}` : ""}`);
+  }
+  if (items.length > 12) lines.push(`…另有 ${items.length - 12} 品未顯示`);
+  if (order.cancelReason) lines.push(`取消原因：${order.cancelReason}`);
+  lines.push(updatedLine);
+  return lines.join("\n").slice(0, 4900);
 }
 
 function warehouseUnitCostText(item) {
@@ -2657,6 +2816,92 @@ export class LineActivation {
     return Response.json({ ok: true, itemCount, locationCount, locatedItemCount, updatedAt: metadata.updatedAt });
   }
 
+  async syncErpOrders(request) {
+    const body = await request.json();
+    if (!Array.isArray(body?.orders)) {
+      return Response.json({ ok: false, error: "INVALID_ORDER_DATA" }, { status: 400 });
+    }
+    const byTransaction = new Map();
+    for (const rawOrder of body.orders.slice(0, 20000)) {
+      const order = normalizeErpOrder(rawOrder);
+      if (order) byTransaction.set(order.transactionNo, order);
+    }
+    const orders = [...byTransaction.values()].sort((a, b) =>
+      a.transactionNo.localeCompare(b.transactionNo, "en", { numeric: true })
+    );
+    const chunks = buildErpOrderChunks(orders);
+    const chunkByTransaction = new Map();
+    chunks.forEach((chunk, index) => {
+      for (const transactionNo of Object.keys(chunk)) chunkByTransaction.set(transactionNo, index);
+    });
+    const aliases = Array.from({ length: erpOrderAliasBucketCount }, () => ({}));
+    let aliasCount = 0;
+    for (const order of orders) {
+      const chunkIndex = chunkByTransaction.get(order.transactionNo);
+      for (const alias of order.aliases) {
+        const bucket = aliases[warehouseLocationBucket(alias, erpOrderAliasBucketCount)];
+        if (!bucket[alias]) aliasCount += 1;
+        bucket[alias] = { transactionNo: order.transactionNo, chunkIndex };
+      }
+    }
+    const previous = await this.storage.get("erp-order-active");
+    const version = crypto.randomUUID();
+    for (let index = 0; index < chunks.length; index += 1) {
+      await this.storage.put(`erp-order:${version}:${index}`, chunks[index]);
+    }
+    for (let index = 0; index < aliases.length; index += 1) {
+      await this.storage.put(`erp-order-alias:${version}:${index}`, aliases[index]);
+    }
+    const metadata = {
+      version,
+      orderCount: orders.length,
+      aliasCount,
+      chunkCount: chunks.length,
+      aliasBucketCount: erpOrderAliasBucketCount,
+      retentionDays: Math.min(365, Math.max(1, Number(body?.retentionDays) || 90)),
+      updatedAt: String(body?.updatedAt || new Date().toISOString()).slice(0, 80),
+    };
+    await this.storage.put("erp-order-active", metadata);
+    if (previous?.version && previous.version !== version) {
+      const previousChunkCount = Math.min(5000, Math.max(0, Number(previous.chunkCount) || 0));
+      for (let index = 0; index < previousChunkCount; index += 1) {
+        await this.storage.delete(`erp-order:${previous.version}:${index}`);
+      }
+      const previousAliasCount = Math.min(512, Math.max(0, Number(previous.aliasBucketCount) || 0));
+      for (let index = 0; index < previousAliasCount; index += 1) {
+        await this.storage.delete(`erp-order-alias:${previous.version}:${index}`);
+      }
+    }
+    return Response.json({
+      ok: true,
+      orderCount: metadata.orderCount,
+      aliasCount: metadata.aliasCount,
+      updatedAt: metadata.updatedAt,
+    });
+  }
+
+  async queryErpOrder(request) {
+    const { query } = await request.json();
+    const metadata = await this.storage.get("erp-order-active");
+    if (!metadata?.version) {
+      return Response.json({ ok: true, order: null, metadata: metadata || null });
+    }
+    const aliasBucketCount = Math.min(512, Math.max(1, Number(metadata.aliasBucketCount) || 128));
+    for (const alias of erpOrderLookupCandidates(query)) {
+      const bucket = await this.storage.get(
+        `erp-order-alias:${metadata.version}:${warehouseLocationBucket(alias, aliasBucketCount)}`,
+      );
+      const location = bucket && typeof bucket === "object" ? bucket[alias] : null;
+      if (!location) continue;
+      const chunk = await this.storage.get(
+        `erp-order:${metadata.version}:${Math.max(0, Number(location.chunkIndex) || 0)}`,
+      );
+      const order = chunk && typeof chunk === "object" ? chunk[location.transactionNo] || null : null;
+      if (order) return Response.json({ ok: true, order, metadata });
+    }
+    return Response.json({ ok: true, order: null, metadata });
+  }
+
   async queryWarehouseLocation(request) {
     const { sku: rawSku, includeImage = true } = await request.json();
     const sku = String(rawSku || "").replace(/\s+/g, "").trim().toUpperCase().slice(0, 80);
@@ -2909,6 +3154,12 @@ export class LineActivation {
     }
     if (url.pathname === "/warehouse-locations/sync" && request.method === "POST") {
       return this.syncWarehouseLocations(request);
+    }
+    if (url.pathname === "/erp-orders/sync" && request.method === "POST") {
+      return this.syncErpOrders(request);
+    }
+    if (url.pathname === "/erp-orders/query" && request.method === "POST") {
+      return this.queryErpOrder(request);
     }
     if (url.pathname === "/warehouse-locations/query" && request.method === "POST") {
       return this.queryWarehouseLocation(request);
@@ -3210,6 +3461,31 @@ async function warehouseStorageLocationRequest(env, location, page = 1, includeU
     body: JSON.stringify({ location, page, includeUnavailable }),
   });
   if (!response.ok) throw httpError("ERP 儲位反查暫時無法使用", 503);
+  return response.json();
+}
+
+function lineOrderLookupAllowed(event, env) {
+  if (event?.source?.type !== "user" || !event.source.userId) return false;
+  const allowed = new Set(
+    String(env.LINE_ORDER_ALLOWED_USER_IDS || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  return allowed.has(String(event.source.userId));
+}
+
+async function erpOrderRequest(env, query) {
+  if (!env.LINE_ACTIVATION) throw httpError("ERP 訂單查詢服務尚未設定", 503);
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/erp-orders/query",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+    },
+  );
+  if (!response.ok) throw httpError("ERP 訂單查詢暫時無法使用", 503);
   return response.json();
 }
 
@@ -3952,6 +4228,29 @@ async function processLineEvent(event, env) {
     return;
   }
 
+  const orderLookupQuery = parseLineOrderLookupCommand(text);
+  if (orderLookupQuery || isLineOrderPromptCommand(text)) {
+    if (event.source?.type !== "user") return;
+    if (!lineOrderLookupAllowed(event, env)) {
+      console.log("LINE_ORDER_LOOKUP", JSON.stringify({ authorized: false, sourceType: event.source?.type || "unknown" }));
+      await replyLine(event.replyToken, "🔒 訂單查詢只限已授權的 LINE 私訊帳號使用。", env);
+      return;
+    }
+    if (!orderLookupQuery) {
+      await replyLine(event.replyToken, "請輸入出貨單右上角的訂單編號，例如：0350000-10747554", env);
+      return;
+    }
+    try {
+      const result = await erpOrderRequest(env, orderLookupQuery);
+      console.log("LINE_ORDER_LOOKUP", JSON.stringify({ authorized: true, hit: Boolean(result?.order) }));
+      await replyLine(event.replyToken, createErpOrderMessage(result, orderLookupQuery), env);
+    } catch (error) {
+      console.error("LINE order lookup error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法查詢 ERP 訂單：${error?.message || "請稍後再試"}`, env);
+    }
+    return;
+  }
+
   const availabilityCommand = parseWarehouseStorageLocationAvailabilityCommand(text);
   const parsedWarehouseStorageLocation = availabilityCommand
     ? parseWarehouseStorageLocationCommand(availabilityCommand.location)
@@ -4258,6 +4557,25 @@ async function handleWarehouseLocationPush(request, env, context) {
   return response;
 }
 
+async function handleErpOrderPush(request, env) {
+  const expected = String(env.ERP_SYNC_TOKEN || "");
+  const supplied = String(request.headers.get("X-Erp-Sync-Token") || "");
+  if (!expected || supplied !== expected) return new Response("Unauthorized", { status: 401 });
+  if (!env.LINE_ACTIVATION) return Response.json({ ok: false, error: "STORAGE_NOT_CONFIGURED" }, { status: 503 });
+  const rawBody = await request.text();
+  try {
+    const body = JSON.parse(rawBody);
+    if (!Array.isArray(body?.orders)) throw new Error("INVALID_ORDER_DATA");
+  } catch {
+    return Response.json({ ok: false, error: "INVALID_JSON" }, { status: 400 });
+  }
+  return lineScheduleStub(env, globalLineScheduleName).fetch("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: rawBody,
+  });
+}
+
 async function handleWarehouseImageStatus(request, env) {
   const expected = String(env.ERP_SYNC_TOKEN || "");
   const supplied = String(request.headers.get("X-Erp-Sync-Token") || "");
@@ -4416,6 +4734,7 @@ export {
   createWarehouseSearchMessage,
   createWarehouseStorageLocationFilterPrompt,
   createWarehouseStorageLocationMessage,
+  createErpOrderMessage,
   extractShopeePageContent,
   enrichScheduleItemsWithProfitSkus,
   fetchShopeePageContent,
@@ -4437,6 +4756,7 @@ export {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseLineOrderLookupCommand,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
   parseWarehouseStorageLocationAvailabilityCommand,
@@ -4463,6 +4783,7 @@ export {
   warehousePositionWizardPostback,
   warehouseLocationBucket,
   normalizeWarehouseStorageLocation,
+  normalizeErpOrderAlias,
   warehouseSearchScore,
   withAbortTimeout,
   armLineGroup,
@@ -4513,6 +4834,11 @@ export default {
     if (url.pathname === "/erp/locations/push") {
       if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
       return handleWarehouseLocationPush(request, env, context);
+    }
+
+    if (url.pathname === "/erp/orders/push") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      return handleErpOrderPush(request, env);
     }
 
     if (url.pathname === "/erp/images/status") {

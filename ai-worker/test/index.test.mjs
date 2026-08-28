@@ -7,6 +7,7 @@ import worker, {
   createLinePanel,
   createWarehousePositionDryRunPreview,
   createWarehousePositionWizardMessage,
+  createErpOrderMessage,
   createWarehouseSearchMessage,
   createWarehouseStorageLocationFilterPrompt,
   createWarehouseStorageLocationMessage,
@@ -33,6 +34,7 @@ import worker, {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseLineOrderLookupCommand,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
   parseWarehouseStorageLocationAvailabilityCommand,
@@ -55,6 +57,7 @@ import worker, {
   takeLineGroupActivation,
   verifyLineSignature,
   warehouseLocationBucket,
+  normalizeErpOrderAlias,
   normalizeWarehouseStorageLocation,
   warehousePositionWizardLocation,
   warehouseSearchScore,
@@ -119,6 +122,47 @@ test("schedule commands and numeric selections are recognized", () => {
   assert.equal(parseScheduleCompletion("完成第 ２ 號"), 2);
   assert.equal(parseScheduleUndoCompletion("取消完成1"), 1);
   assert.equal(parseScheduleUndoCompletion("取消完成第２號"), 2);
+});
+
+test("ERP order commands recognize the printed transaction number without capturing ordinary SKUs", () => {
+  assert.equal(parseLineOrderLookupCommand("0350000-10747554"), "0350000-10747554");
+  assert.equal(parseLineOrderLookupCommand("訂單：0350000-10747554"), "0350000-10747554");
+  assert.equal(parseLineOrderLookupCommand("訂單 260827EYQGCNGU"), "260827EYQGCNGU");
+  assert.equal(parseLineOrderLookupCommand("10747554"), "10747554");
+  assert.equal(parseLineOrderLookupCommand("A725"), "");
+  assert.equal(normalizeErpOrderAlias("０３５００００－１０７４７５５４"), "0350000-10747554");
+});
+
+test("ERP order reply is operational only and fails closed for stale data", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const message = createErpOrderMessage({
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10747554",
+      printableOrderNumbers: ["0350000-10747554"],
+      platformOrderNumbers: ["260827EYQGCNGU"],
+      platform: "蝦皮購物",
+      status: "已出貨",
+      totalAmount: 360,
+      totalQuantity: 180,
+      items: [
+        { name: "糖果化妝包", style: "粉", quantity: 100, unitPrice: 2, warehouseArea: "02-L09-03/T2" },
+        { name: "糖果化妝包", style: "玫瑰紅", quantity: 80, unitPrice: 2, warehouseArea: "02-L09-03/T2" },
+      ],
+    },
+  }, "0350000-10747554", now);
+  assert.match(message, /訂單 0350000-10747554/);
+  assert.match(message, /260827EYQGCNGU/);
+  assert.match(message, /共 2 品／180 件/);
+  assert.match(message, /粉 ×100/);
+  assert.doesNotMatch(message, /姓名|電話|地址/);
+
+  const stale = createErpOrderMessage({
+    metadata: { updatedAt: "2026-08-28T09:00:00+08:00" },
+    order: { transactionNo: "10747554", items: [{ name: "不得洩漏" }] },
+  }, "0350000-10747554", now);
+  assert.match(stale, /訂單查詢暫停/);
+  assert.doesNotMatch(stale, /不得洩漏/);
 });
 
 test("warehouse location command accepts common LINE input forms", () => {
@@ -1249,6 +1293,53 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
   }));
   data = await response.json();
   assert.equal(data.item.name, "測試商品");
+});
+
+test("LineActivation publishes a sanitized ERP order index with printed and platform aliases", async () => {
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  let response = await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: "2026-08-28T09:55:00+08:00",
+      retentionDays: 90,
+      orders: [{
+        transactionNo: "10747554",
+        printableOrderNumbers: ["0350000-10747554"],
+        platformOrderNumbers: ["260827EYQGCNGU"],
+        recipientName: "不應儲存的姓名",
+        recipientPhone: "0912345678",
+        recipientAddress: "不應儲存的地址",
+        status: "已出貨",
+        totalAmount: 360,
+        totalQuantity: 180,
+        items: [
+          { orderNo: "SP1", subOrderNo: "035000010747554", name: "糖果化妝包", style: "粉", quantity: 100, unitPrice: 2 },
+          { orderNo: "SP2", subOrderNo: "035000010747554", name: "糖果化妝包", style: "玫瑰紅", quantity: 80, unitPrice: 2 },
+        ],
+      }],
+    }),
+  }));
+  let data = await response.json();
+  assert.equal(data.ok, true);
+  assert.equal(data.orderCount, 1);
+
+  for (const query of ["0350000-10747554", "10747554", "260827EYQGCNGU"] ) {
+    response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+      method: "POST",
+      body: JSON.stringify({ query }),
+    }));
+    data = await response.json();
+    assert.equal(data.order.transactionNo, "10747554");
+    assert.equal(data.order.items.length, 2);
+    assert.doesNotMatch(JSON.stringify(data.order), /不應儲存|0912345678/);
+  }
 });
 
 test("LineActivation builds an exact reverse index and paginates every item at a storage location", async () => {
