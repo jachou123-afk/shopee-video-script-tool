@@ -163,7 +163,7 @@ test("ERP order reply is operational only and fails closed for stale data", () =
   assert.match(message, /訂單 0350000-10747554/);
   assert.match(message, /260827EYQGCNGU/);
   assert.match(message, /共 1 款／2 規格／180 件/);
-  assert.match(message, /糖果化妝包\n   粉 ×100、玫瑰紅 ×80/);
+  assert.match(message, /糖果化妝包\n   粉x100 玫瑰紅x80/);
   assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
   assert.equal((message.match(/單價 NT\$2/gu) || []).length, 1);
   assert.doesNotMatch(message, /姓名|電話|地址/);
@@ -190,8 +190,8 @@ test("ERP order reply keeps per-style prices and locations when a grouped produc
       ],
     },
   }, "10747554", now);
-  assert.match(message, /1\) 粉 ×1｜單價 NT\$2｜儲位 A-01/);
-  assert.match(message, /2\) 玫瑰紅 ×1｜單價 NT\$3｜儲位 B-02/);
+  assert.match(message, /1\) 粉x1｜單價 NT\$2｜儲位 A-01/);
+  assert.match(message, /2\) 玫瑰紅x1｜單價 NT\$3｜儲位 B-02/);
   assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
 });
 
