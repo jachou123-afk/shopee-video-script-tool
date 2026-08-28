@@ -24,7 +24,7 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
-## LINE 私訊查 ERP 訂單（2026-08-28 起；2026-08-29 子貨號／儲位版已正式部署，待 LINE 畫面驗收）
+## LINE 私訊查 ERP 訂單（2026-08-28 起；2026-08-29 子貨號／儲位版已正式部署並完成 LINE 畫面驗收）
 
 - 目標帳號仍是 `@059hdfyo`。一對一私訊可直接輸入出貨單右上角列印號碼（例如 `0350000-10747554`），也支援 `訂單 {編號}`、ERP 交易序號與平台訂單編號；群組及聊天室不回傳訂單資料。
 - NAS 以 ERP「訂單管理／匯出訂單」內既有的 `codex抓資料` 設定，唯讀抓最近 7 個台北日。每次先把 Big5/CP950 原始 CSV 與 SHA-256 manifest 保存到 NAS 私有設定區，再解析；去識別化訂單索引累積保留 90 天，原始匯出保留 30 天。
@@ -48,8 +48,8 @@ git pull --ff-only origin agent/line-schedule-handoff
 - Worker 來源 commit `49cda26a2e647bdfff51abdd0d4cee27ff499509` 已推送 `agent/line-schedule-handoff`，Cloudflare Worker version `6be578f0-6639-4da4-8e74-8fccbbc508a0` 已正式部署。NAS 來源 commit `3d4b468a215205c84833ab687afbb066917912f0` 已推送 `profit-analysis-cloud/main`。
 - NAS 正式 `/volume1/docker/erp-sync/erp_sync.py` 為 97,627 Bytes，DSM MD5 `51047B36FC139883BCE7B3D39DBC8AF2` 與本機相同；本機 SHA-256 為 `F87A4A2C825DEF77EA28CAB651815FD91D88570A2BEB3A870C382E3CC243DE0A`。上傳前備份為 `/volume1/docker/erp-sync/backups/erp_sync.py.before-line-order-sku-location-20260829-012834`；容器未停止或重建。
 - 02:00 自然排程已由新版接手：02:00:25 去識別化訂單索引由約 10 MB 壓縮為約 3.5 MB；目標單 `0350000-10747554` 已成為 2 筆規格、共 180 件，內容為 `A032-09／玫瑰紅-1／80／NT$7` 與 `A032-03／粉-1／100／NT$7`。此輪沒有 `LINE order sync failed/skipped`，且流程已進入後續相簿步驟，證明前段訂單索引與 Worker 推送已完成。
-- 同一輪後段於 02:04:49 記錄 `failed: The read operation timed out`；這是訂單推送完成後的既有後段讀取逾時，未回滾訂單索引。仍需後續觀察一般完整同步是否恢復成功。
-- 待完成：請在 `@059hdfyo` 一對一私訊 `0350000-10747554`，目視確認 `A032-03 粉x100`、`A032-09 玫瑰紅x80`、共用儲位及 NT$7；真實 LINE 畫面完成前不標為最終驗收完成。
+- 同一輪後段於 02:04:49 記錄 `failed: The read operation timed out`；這是訂單推送完成後的既有後段讀取逾時，未回滾訂單索引。下一輪 02:10 排程已於 02:12:15 完整 `success`，同步 3,708 個 LINE 主倉儲位及 2,538 筆 LINE 訂單，確認一般完整同步已恢復。
+- 02:08 使用者以真實 LINE 私訊訂單 `0354000-10747956` 完成畫面驗收：回覆正確顯示每個規格的子貨號、`款式x數量`、共用儲位與單價；同品名多子貨號正確合併。畫面摘要為 4 款／5 規格／9 件，逐項數量加總也是 9 件。配合 `0350000-10747554` 新版索引已確認為 2 筆規格／180 件，本功能驗收完成。
 
 ## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，已正式部署，待 LINE 私訊驗收）
 
