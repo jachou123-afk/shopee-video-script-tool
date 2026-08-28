@@ -24,7 +24,7 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
-## LINE 私訊查 ERP 訂單（2026-08-28，已正式部署，待真實 LINE 私訊驗收）
+## LINE 私訊查 ERP 訂單（2026-08-28 起，已正式部署，查詢已通過，待合併格式驗收）
 
 - 目標帳號仍是 `@059hdfyo`。一對一私訊可直接輸入出貨單右上角列印號碼（例如 `0350000-10747554`），也支援 `訂單 {編號}`、ERP 交易序號與平台訂單編號；群組及聊天室不回傳訂單資料。
 - NAS 以 ERP「訂單管理／匯出訂單」內既有的 `codex抓資料` 設定，唯讀抓最近 7 個台北日。每次先把 Big5/CP950 原始 CSV 與 SHA-256 manifest 保存到 NAS 私有設定區，再解析；去識別化訂單索引累積保留 90 天，原始匯出保留 30 天。
@@ -38,7 +38,8 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 23:20 自動排程也已自然通過：23:20:18 在 NAS 產生 15.9 MB 原始 CSV 與 SHA-256 manifest，23:20:25 寫入 10 MB 去識別化索引；23:22:19 完整日誌為 `success`，正式 Worker 收到 2,513 筆 LINE 訂單。
 - 23:26、23:37 兩次真實 LINE 測試均成功辨識訂單指令但回覆未授權。複核後發現 Chrome LINE Chat 當時實際停在另一個官方帳號 `@037vajci`，前兩次候選 ID 都不屬於目標帳號。已切換到正確的 `@059hdfyo`，選取含上述兩次測試訊息的同一位私訊者對話，再把該對話的私訊者 ID 覆寫到 Cloudflare Secret；值仍未進 Git。Secret Change version `f277ec13-1521-4565-9d4f-e778dd3e1228` 於 23:40:18（Asia/Taipei）承接 100% 流量。
 - 23:40 修正後真實測試仍未授權，確認 LINE Official Account Manager 的聊天網址 ID 不能可靠取代 Messaging API webhook 實際送入的 user ID。已改為私訊一次性 `綁定訂單 {授權碼}`：只有正確 Cloudflare Secret 授權碼可把該次 webhook 的真實 user ID 綁定，授權碼只能使用一次；Durable Object 僅保存 user ID 與授權碼的 SHA-256 雜湊，不保存原值。語法與 70/70 項測試通過，程式 commit `85b3adb`；Worker upload version `87416285-2f61-4536-bd0e-a31b9c4405bb`、Secret Change version `70f6bf79-fcd6-4774-b227-c9d085ae6504` 於 23:57:43（Asia/Taipei）承接 100% 流量。一次性授權碼只存在 Cloudflare Secret 與本次使用者指示，不進 Git 或交接文件。
-- 待完成：用真實 LINE 一對一私訊輸入 `0350000-10747554`，確認畫面回覆後才算使用者端驗收完成。
+- 2026-08-29 使用者針對真實訂單回覆中的「糖果化妝包」顏色明細提出版面改善，確認一次性綁定後已能取得實際訂單資料。依使用者要求，同品名改為只顯示一次，再把 `顏色 × 數量` 合併在同一行；只有單價與儲位一致時才共用資料，不一致時仍逐規格保留。摘要改為「款／規格／件」。語法與 71/71 項測試通過，程式 commit `98ff8aa`；Worker version `0f625584-5a32-4976-8557-82b31fc19f75` 於 00:03:58（Asia/Taipei）承接 100% 流量。
+- 待完成：用真實 LINE 再查同一訂單，確認同品名合併格式後完成版面驗收。
 
 ## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，已正式部署，待 LINE 私訊驗收）
 
