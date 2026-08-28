@@ -24,15 +24,19 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
-## LINE 私訊查 ERP 訂單（2026-08-28，尚未部署）
+## LINE 私訊查 ERP 訂單（2026-08-28，已正式部署，待真實 LINE 私訊驗收）
 
 - 目標帳號仍是 `@059hdfyo`。一對一私訊可直接輸入出貨單右上角列印號碼（例如 `0350000-10747554`），也支援 `訂單 {編號}`、ERP 交易序號與平台訂單編號；群組及聊天室不回傳訂單資料。
 - NAS 以 ERP「訂單管理／匯出訂單」內既有的 `codex抓資料` 設定，唯讀抓最近 7 個台北日。每次先把 Big5/CP950 原始 CSV 與 SHA-256 manifest 保存到 NAS 私有設定區，再解析；去識別化訂單索引累積保留 90 天，原始匯出保留 30 天。
 - 傳到 Worker 的欄位只含交易／平台單號、狀態、出貨資訊、品項、樣式、數量、單價、總計與儲位區；收件人姓名、買家姓名、電話及地址不會進入 payload。Worker 會再次白名單化欄位，陌生欄位即使被送入也不會保存。
-- 訂單查詢由 `LINE_ORDER_ALLOWED_USER_IDS` Cloudflare Secret 控制，只允許指定 LINE user ID 的私訊。Secret 不得寫入 Git；目前仍待使用者於本次工作確認傳送後設定。資料更新超過 30 分鐘時停止回覆明細，避免回傳舊訂單。
+- 訂單查詢由 `LINE_ORDER_ALLOWED_USER_IDS` Cloudflare Secret 控制，只允許指定 LINE user ID 的私訊。使用者已明確允許設定，Secret 已上傳正式 Worker 且值未寫入 Git 或交接文件。資料更新超過 30 分鐘時停止回覆明細，避免回傳舊訂單。
 - NAS 新增 `/erp/orders/push` 推送，沿用既有 `ERP_SYNC_TOKEN`；Worker Durable Object 以版本化 chunk 與 128 個 alias bucket 原子發布，空資料可代表查詢期間沒有訂單，但失敗同步不覆蓋前一版。
-- 驗證：Worker `node --check` 與 67/67 項測試通過；NAS `py_compile` 與 60/60 項測試通過。測試包含列印號碼正規化、平台單號別名、PII 丟棄、30 分鐘失效保護、Big5 CSV、原始雜湊 manifest 與 90 天索引。
-- 尚未部署：等待 Cloudflare 白名單 Secret 的使用者明確確認；之後仍需部署 Worker、備份並更新 NAS 正式檔、確認第一次訂單快照成功，以及用真實 `0350000-10747554` 完成 LINE 私訊驗收。
+- 驗證：Worker `node --check` 與 67/67 項測試通過；NAS `py_compile` 與 61/61 項測試通過。測試包含列印號碼正規化、平台單號別名、PII 丟棄、30 分鐘失效保護、Big5 CSV、原始雜湊 manifest、90 天索引及 ERP 官方匯出參數。
+- Worker 來源 commit `abf0936cd322e1e260be35fdbb76c6dc2f6b89dd` 已推送 `agent/line-schedule-handoff`；Cloudflare Worker version `488a766f-3e1d-456f-8ac0-e1676433abe5` 已承接 100% 流量。正式根網址與 `/erp/orders/push` 的 GET 均為預期 HTTP 405，未授權 POST 為 HTTP 401。
+- NAS 來源已推送 `profit-analysis-cloud/main`，最新程式 commit `c7f4515`。正式 `/volume1/docker/erp-sync/erp_sync.py` 為 93,819 Bytes，DSM MD5 `17763FE78A471994AE90AFEDCEADCEC8` 與交付檔相同；更新前備份為 `/volume1/docker/erp-sync/backups/erp_sync.py.before-line-order-20260828-225432`，容器未停止或重建。
+- 第一次隔離正式同步於 23:15:55（Asia/Taipei）完成，ERP 原始匯出先進暫存封存、隱私清洗後推送 Worker，共建立 2,511 筆訂單索引。另已把訂單同步移到每輪最前面，舊庫存／相簿報表逾時不再阻擋訂單更新。
+- 23:20 自動排程也已自然通過：23:20:18 在 NAS 產生 15.9 MB 原始 CSV 與 SHA-256 manifest，23:20:25 寫入 10 MB 去識別化索引；23:22:19 完整日誌為 `success`，正式 Worker 收到 2,513 筆 LINE 訂單。
+- 待完成：用真實 LINE 一對一私訊輸入 `0350000-10747554`，確認畫面回覆後才算使用者端驗收完成。
 
 ## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，已正式部署，待 LINE 私訊驗收）
 
