@@ -34,6 +34,8 @@ const warehouseStorageLocationIndexChunkSize = 50;
 const erpOrderAliasBucketCount = 128;
 const erpOrderChunkTargetBytes = 96 * 1024;
 const erpOrderMaxSnapshotAgeMs = 30 * 60_000;
+const erpOrderMaxInputItems = 20_000;
+const erpOrderMaxStoredItems = 100;
 const warehousePositionWizardOptions = Object.freeze({
   zones: ["01", "02", "03", "04", "05", "06"],
   sides: ["L", "R"],
@@ -1428,23 +1430,33 @@ function normalizeErpOrder(rawOrder) {
     lastSeenAt: String(rawOrder?.lastSeenAt || "").slice(0, 80),
     items: [],
   };
-  for (const rawItem of Array.isArray(rawOrder?.items) ? rawOrder.items.slice(0, 100) : []) {
-    order.items.push({
+  const rawItems = Array.isArray(rawOrder?.items) ? rawOrder.items : [];
+  const normalizedItems = [];
+  const itemAliases = [];
+  for (const rawItem of rawItems.slice(0, erpOrderMaxInputItems)) {
+    const item = {
       orderNo: String(rawItem?.orderNo || "").replace(/\s+/g, "").slice(0, 120),
       subOrderNo: String(rawItem?.subOrderNo || "").replace(/\s+/g, "").slice(0, 120),
+      sku: normalizeWarehouseSku(rawItem?.sku),
       name: String(rawItem?.name || "商品").replace(/\s+/g, " ").trim().slice(0, 240) || "商品",
       style: String(rawItem?.style || "").replace(/\s+/g, " ").trim().slice(0, 120),
       quantity: money(rawItem?.quantity),
       unitPrice: money(rawItem?.unitPrice),
       warehouseArea: String(rawItem?.warehouseArea || "").replace(/\s+/g, " ").trim().slice(0, 160),
-    });
+    };
+    normalizedItems.push(item);
+    itemAliases.push(item.orderNo, item.subOrderNo);
   }
+  const collapsedItems = collapseErpOrderItems(normalizedItems);
+  order.items = collapsedItems.slice(0, erpOrderMaxStoredItems);
+  order.itemsTruncated = rawItems.length > erpOrderMaxInputItems
+    || collapsedItems.length > erpOrderMaxStoredItems;
   order.aliases = [...new Set([
     transactionNo,
     ...order.orderNumbers,
     ...order.printableOrderNumbers,
     ...order.platformOrderNumbers,
-    ...order.items.flatMap((item) => [item.orderNo, item.subOrderNo]),
+    ...itemAliases,
   ].flatMap(erpOrderLookupCandidates))].slice(0, 500);
   return order;
 }
@@ -1491,12 +1503,109 @@ function groupErpOrderItemsByName(items) {
 }
 
 function erpOrderItemStyle(item) {
-  const style = String(item?.style || "").trim();
+  const style = String(item?.displayStyle || item?.style || "").trim();
   return style && style !== item?.name ? style : "未標示規格";
 }
 
+function normalizeErpOrderItemSpecification(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toUpperCase()
+    .replace(/[‐‑‒–—―−﹘﹣－]/gu, "-")
+    .replace(/／/gu, "/")
+    .replace(/\s+/gu, "")
+    .slice(0, 240);
+}
+
+function resolveErpOrderItemWarehouseDetails(item, warehouseItems) {
+  const suppliedSku = normalizeWarehouseSku(item?.sku);
+  const itemStyle = normalizeErpOrderItemSpecification(item?.style);
+  const itemLocation = normalizeWarehouseStorageLocation(item?.warehouseArea);
+  const matches = [];
+  for (const warehouseItem of Array.isArray(warehouseItems) ? warehouseItems : []) {
+    const parentSku = normalizeWarehouseSku(warehouseItem?.sku);
+    if (!parentSku) continue;
+    for (const variant of Array.isArray(warehouseItem?.variants) ? warehouseItem.variants : []) {
+      const barcode = normalizeWarehouseSku(variant?.barcode);
+      const skuMatches = !suppliedSku
+        || suppliedSku === parentSku
+        || suppliedSku === barcode;
+      if (!skuMatches) continue;
+      const variantStyle = normalizeErpOrderItemSpecification(variant?.style);
+      const variantStyleAndSize = normalizeErpOrderItemSpecification(
+        [variant?.style, variant?.size].filter(Boolean).join("-"),
+      );
+      const styleMatches = !itemStyle || itemStyle === variantStyle || itemStyle === variantStyleAndSize;
+      const locationMatches = !itemLocation
+        || itemLocation === normalizeWarehouseStorageLocation(variant?.location);
+      if (styleMatches && locationMatches) matches.push({ parentSku, variant, barcode });
+    }
+  }
+  if (matches.length !== 1) return { ...item, sku: suppliedSku };
+  const [{ parentSku, variant, barcode }] = matches;
+  const resolvedSku = suppliedSku || (
+    barcode && (barcode === parentSku || barcode.startsWith(`${parentSku}-`)) ? barcode : parentSku
+  );
+  const variantSize = String(variant?.size || "").replace(/\s+/g, " ").trim();
+  const displayStyle = variantSize === "1"
+    ? String(variant?.style || item?.style || "")
+    : String(item?.style || [variant?.style, variantSize].filter(Boolean).join("-") || "");
+  return {
+    ...item,
+    sku: resolvedSku,
+    displayStyle: displayStyle.replace(/\s+/g, " ").trim().slice(0, 120),
+    warehouseArea: String(item?.warehouseArea || variant?.location || "").replace(/\s+/g, " ").trim().slice(0, 160),
+  };
+}
+
+function erpOrderItemDisplay(item) {
+  const sku = normalizeWarehouseSku(item?.sku);
+  const style = erpOrderItemStyle(item);
+  const specification = style === "未標示規格" ? "" : style;
+  const quantity = Number(item?.quantity) || 0;
+  return [sku, `${specification ? `${specification}x` : "x"}${quantity}`].filter(Boolean).join(" ");
+}
+
+function collapseErpOrderItems(items) {
+  const collapsed = [];
+  const indexes = new Map();
+  for (const rawItem of Array.isArray(items) ? items : []) {
+    const item = rawItem || {};
+    const key = JSON.stringify([
+      normalizeWarehouseSku(item.sku),
+      String(item.name || "商品").trim(),
+      String(item.style || "").trim(),
+      Number(item.unitPrice) || 0,
+      String(item.warehouseArea || "").trim(),
+    ]);
+    const existingIndex = indexes.get(key);
+    if (existingIndex === undefined) {
+      indexes.set(key, collapsed.length);
+      collapsed.push({ ...item, quantity: Number(item.quantity) || 0 });
+    } else {
+      collapsed[existingIndex].quantity += Number(item.quantity) || 0;
+    }
+  }
+  return collapsed;
+}
+
 function erpOrderItemMetadata(item) {
-  return `單價 ${formatErpOrderMoney(item?.unitPrice)}${item?.warehouseArea ? `｜儲位 ${item.warehouseArea}` : ""}`;
+  return `${item?.warehouseArea ? `儲位 ${item.warehouseArea}｜` : ""}單價 ${formatErpOrderMoney(item?.unitPrice)}`;
+}
+
+function joinErpOrderMessageLines(lines, limit = 4900) {
+  const message = lines.join("\n");
+  if (message.length <= limit) return message;
+  const notice = "…內容過長，後續品項已省略";
+  const kept = [];
+  let length = notice.length + 1;
+  for (const line of lines) {
+    const nextLength = length + String(line).length + (kept.length ? 1 : 0);
+    if (nextLength > limit) break;
+    kept.push(line);
+    length = nextLength;
+  }
+  return [...kept, notice].join("\n");
 }
 
 function createErpOrderMessage(result, query, now = Date.now()) {
@@ -1523,33 +1632,27 @@ function createErpOrderMessage(result, query, now = Date.now()) {
   if (order.shipmentNo) lines.push(`出貨單號：${order.shipmentNo}`);
   if (order.createdAt) lines.push(`建立：${order.createdAt}`);
   if (order.shippedAt) lines.push(`出貨：${order.shippedAt}`);
-  const items = Array.isArray(order.items) ? order.items : [];
+  const items = collapseErpOrderItems(order.items);
   const itemGroups = groupErpOrderItemsByName(items);
   lines.push(`共 ${itemGroups.length} 款／${items.length} 規格／${order.totalQuantity || 0} 件｜交易總計 ${formatErpOrderMoney(order.totalAmount)}`);
+  if (order.itemsTruncated) lines.push(`⚠️ 品項過多，僅保留前 ${erpOrderMaxStoredItems} 個合併規格`);
   for (const [index, group] of itemGroups.slice(0, 12).entries()) {
-    if (group.items.length === 1) {
-      const [item] = group.items;
-      const style = erpOrderItemStyle(item);
-      lines.push(`${index + 1}. ${group.name}${style === "未標示規格" ? "" : `｜${style}`}x${item.quantity || 0}`);
-      lines.push(`   ${erpOrderItemMetadata(item)}`);
-      continue;
-    }
     lines.push(`${index + 1}. ${group.name}`);
     const metadata = group.items.map(erpOrderItemMetadata);
     const sharedMetadata = metadata.every((value) => value === metadata[0]);
     if (sharedMetadata) {
-      lines.push(`   ${group.items.map((item) => `${erpOrderItemStyle(item)}x${item.quantity || 0}`).join(" ")}`);
+      for (const item of group.items) lines.push(`   ${erpOrderItemDisplay(item)}`);
       lines.push(`   ${metadata[0]}`);
       continue;
     }
     for (const [itemIndex, item] of group.items.entries()) {
-      lines.push(`   ${itemIndex + 1}) ${erpOrderItemStyle(item)}x${item.quantity || 0}｜${metadata[itemIndex]}`);
+      lines.push(`   ${erpOrderItemDisplay(item)}｜${metadata[itemIndex]}`);
     }
   }
   if (itemGroups.length > 12) lines.push(`…另有 ${itemGroups.length - 12} 款未顯示`);
   if (order.cancelReason) lines.push(`取消原因：${order.cancelReason}`);
   lines.push(updatedLine);
-  return lines.join("\n").slice(0, 4900);
+  return joinErpOrderMessageLines(lines);
 }
 
 function warehouseUnitCostText(item) {
@@ -2921,6 +3024,78 @@ export class LineActivation {
     });
   }
 
+  async resolveErpOrderWarehouseSkus(order) {
+    const items = Array.isArray(order?.items) ? order.items : [];
+    const metadata = await this.storage.get("warehouse-location-active");
+    if (!items.length || !metadata?.version) return order;
+    const warehouseUpdatedAt = Date.parse(String(metadata.updatedAt || ""));
+    const warehouseName = String(metadata.warehouseName || "").replace(/\s+/g, "").trim();
+    const warehouseIsCurrentMain = Number(metadata.warehouseId) === 1
+      && warehouseName === "主倉"
+      && Number.isFinite(warehouseUpdatedAt)
+      && Date.now() - warehouseUpdatedAt <= erpOrderMaxSnapshotAgeMs
+      && warehouseUpdatedAt <= Date.now() + 5 * 60_000;
+    if (!warehouseIsCurrentMain) return order;
+    const directSkus = new Set(items.map((item) => normalizeWarehouseSku(item?.sku)).filter(Boolean));
+    const unresolvedNames = new Set(items
+      .map((item) => normalizeWarehouseSearchText(item?.name))
+      .filter(Boolean));
+    const skusByName = new Map([...unresolvedNames].map((name) => [name, new Set()]));
+    if (unresolvedNames.size) {
+      const searchChunkCount = Math.min(1000, Math.max(0, Number(metadata.searchChunkCount) || 0));
+      let searchItems = [];
+      if (searchChunkCount) {
+        const chunks = await Promise.all(Array.from({ length: searchChunkCount }, (_, index) =>
+          this.storage.get(`warehouse-location-search:${metadata.version}:${index}`)
+        ));
+        searchItems = chunks.flatMap((chunk) => Array.isArray(chunk) ? chunk : []);
+      } else {
+        const legacyBucketCount = Math.min(256, Math.max(1, Number(metadata.bucketCount) || 64));
+        const legacyBuckets = await Promise.all(Array.from({ length: legacyBucketCount }, (_, index) =>
+          this.storage.get(`warehouse-location:${metadata.version}:${index}`)
+        ));
+        searchItems = legacyBuckets.flatMap((bucket) =>
+          Object.values(bucket && typeof bucket === "object" ? bucket : {})
+            .map((item) => ({ sku: item?.sku, name: item?.name }))
+        );
+      }
+      for (const searchItem of searchItems) {
+        const name = normalizeWarehouseSearchText(searchItem?.name);
+        const sku = normalizeWarehouseSku(searchItem?.sku);
+        if (sku && skusByName.has(name)) skusByName.get(name).add(sku);
+      }
+    }
+    const candidateSkus = new Set(directSkus);
+    for (const skuSet of skusByName.values()) {
+      for (const sku of skuSet) candidateSkus.add(sku);
+    }
+    if (!candidateSkus.size) return order;
+    const bucketCount = Math.min(256, Math.max(1, Number(metadata.bucketCount) || 64));
+    const bucketIndexes = [...new Set([...candidateSkus].map((sku) => warehouseLocationBucket(sku, bucketCount)))];
+    const bucketEntries = await Promise.all(bucketIndexes.map(async (index) => [
+      index,
+      await this.storage.get(`warehouse-location:${metadata.version}:${index}`),
+    ]));
+    const buckets = new Map(bucketEntries);
+    const warehouseItems = new Map([...candidateSkus].map((sku) => {
+      const bucket = buckets.get(warehouseLocationBucket(sku, bucketCount));
+      return [sku, bucket && typeof bucket === "object" ? bucket[sku] || null : null];
+    }));
+    return {
+      ...order,
+      items: items.map((item) => {
+        const directSku = normalizeWarehouseSku(item?.sku);
+        const directItem = directSku ? warehouseItems.get(directSku) : null;
+        const candidateItems = directItem
+          ? [directItem]
+          : [...(skusByName.get(normalizeWarehouseSearchText(item?.name)) || [])]
+            .map((sku) => warehouseItems.get(sku))
+            .filter(Boolean);
+        return resolveErpOrderItemWarehouseDetails(item, candidateItems);
+      }),
+    };
+  }
+
   async queryErpOrder(request) {
     const { query } = await request.json();
     const metadata = await this.storage.get("erp-order-active");
@@ -2938,7 +3113,13 @@ export class LineActivation {
         `erp-order:${metadata.version}:${Math.max(0, Number(location.chunkIndex) || 0)}`,
       );
       const order = chunk && typeof chunk === "object" ? chunk[location.transactionNo] || null : null;
-      if (order) return Response.json({ ok: true, order, metadata });
+      if (order) {
+        return Response.json({
+          ok: true,
+          order: await this.resolveErpOrderWarehouseSkus(order),
+          metadata,
+        });
+      }
     }
     return Response.json({ ok: true, order: null, metadata });
   }

@@ -155,18 +155,31 @@ test("ERP order reply is operational only and fails closed for stale data", () =
       totalAmount: 360,
       totalQuantity: 180,
       items: [
-        { name: "糖果化妝包", style: "粉", quantity: 100, unitPrice: 2, warehouseArea: "02-L09-03/T2" },
-        { name: "糖果化妝包", style: "玫瑰紅", quantity: 80, unitPrice: 2, warehouseArea: "02-L09-03/T2" },
+        { sku: "A032-03", name: "糖果化妝包", style: "粉", quantity: 100, unitPrice: 2, warehouseArea: "02-L09-03/T2" },
+        { sku: "A032-09", name: "糖果化妝包", style: "玫瑰紅", quantity: 80, unitPrice: 2, warehouseArea: "02-L09-03/T2" },
       ],
     },
   }, "0350000-10747554", now);
   assert.match(message, /訂單 0350000-10747554/);
   assert.match(message, /260827EYQGCNGU/);
   assert.match(message, /共 1 款／2 規格／180 件/);
-  assert.match(message, /糖果化妝包\n   粉x100 玫瑰紅x80/);
+  assert.match(message, /糖果化妝包\n   A032-03 粉x100\n   A032-09 玫瑰紅x80/);
   assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
   assert.equal((message.match(/單價 NT\$2/gu) || []).length, 1);
+  assert.equal((message.match(/儲位 02-L09-03\/T2/gu) || []).length, 1);
   assert.doesNotMatch(message, /姓名|電話|地址/);
+
+  const legacy = createErpOrderMessage({
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10747554",
+      totalAmount: 2,
+      totalQuantity: 1,
+      items: [{ name: "糖果化妝包", style: "粉", quantity: 1, unitPrice: 2 }],
+    },
+  }, "10747554", now);
+  assert.match(legacy, /糖果化妝包\n   粉x1/);
+  assert.doesNotMatch(legacy, /undefined|null/);
 
   const stale = createErpOrderMessage({
     metadata: { updatedAt: "2026-08-28T09:00:00+08:00" },
@@ -185,14 +198,50 @@ test("ERP order reply keeps per-style prices and locations when a grouped produc
       totalAmount: 5,
       totalQuantity: 2,
       items: [
-        { name: "糖果化妝包", style: "粉", quantity: 1, unitPrice: 2, warehouseArea: "A-01" },
-        { name: "糖果化妝包", style: "玫瑰紅", quantity: 1, unitPrice: 3, warehouseArea: "B-02" },
+        { sku: "A032-03", name: "糖果化妝包", style: "粉", quantity: 1, unitPrice: 2, warehouseArea: "A-01" },
+        { sku: "A032-09", name: "糖果化妝包", style: "玫瑰紅", quantity: 1, unitPrice: 3, warehouseArea: "B-02" },
       ],
     },
   }, "10747554", now);
-  assert.match(message, /1\) 粉x1｜單價 NT\$2｜儲位 A-01/);
-  assert.match(message, /2\) 玫瑰紅x1｜單價 NT\$3｜儲位 B-02/);
+  assert.match(message, /A032-03 粉x1｜儲位 A-01｜單價 NT\$2/);
+  assert.match(message, /A032-09 玫瑰紅x1｜儲位 B-02｜單價 NT\$3/);
   assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
+});
+
+test("ERP order reply aggregates unit rows into color quantities", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const items = [
+    ...Array.from({ length: 100 }, () => ({
+      sku: "A032-03",
+      name: "糖果化妝包",
+      style: "粉",
+      quantity: 1,
+      unitPrice: 7,
+      warehouseArea: "02-L09-03/T2",
+    })),
+    ...Array.from({ length: 80 }, () => ({
+      sku: "A032-09",
+      name: "糖果化妝包",
+      style: "玫瑰紅",
+      quantity: 1,
+      unitPrice: 7,
+      warehouseArea: "02-L09-03/T2",
+    })),
+  ];
+  const message = createErpOrderMessage({
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10747554",
+      totalAmount: 1250,
+      totalQuantity: 180,
+      items,
+    },
+  }, "10747554", now);
+
+  assert.match(message, /共 1 款／2 規格／180 件/);
+  assert.match(message, /A032-03 粉x100/);
+  assert.match(message, /A032-09 玫瑰紅x80/);
+  assert.equal((message.match(/儲位 02-L09-03\/T2/gu) || []).length, 1);
 });
 
 test("warehouse location command accepts common LINE input forms", () => {
@@ -1327,6 +1376,7 @@ test("LineActivation atomically publishes and queries ERP warehouse locations", 
 
 test("LineActivation publishes a sanitized ERP order index with printed and platform aliases", async () => {
   const values = new Map();
+  const snapshotAt = new Date().toISOString();
   const object = new LineActivation({
     storage: {
       async put(key, value) { values.set(key, structuredClone(value)); },
@@ -1334,31 +1384,96 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
       async delete(key) { values.delete(key); },
     },
   });
-  let response = await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+  let response = await object.fetch(new Request("https://line-schedule/warehouse-locations/sync", {
     method: "POST",
     body: JSON.stringify({
-      updatedAt: "2026-08-28T09:55:00+08:00",
-      retentionDays: 90,
-      orders: [{
-        transactionNo: "10747554",
-        printableOrderNumbers: ["0350000-10747554"],
-        platformOrderNumbers: ["260827EYQGCNGU"],
-        recipientName: "不應儲存的姓名",
-        recipientPhone: "0912345678",
-        recipientAddress: "不應儲存的地址",
-        status: "已出貨",
-        totalAmount: 360,
-        totalQuantity: 180,
-        items: [
-          { orderNo: "SP1", subOrderNo: "035000010747554", name: "糖果化妝包", style: "粉", quantity: 100, unitPrice: 2 },
-          { orderNo: "SP2", subOrderNo: "035000010747554", name: "糖果化妝包", style: "玫瑰紅", quantity: 80, unitPrice: 2 },
-        ],
-      }],
+      updatedAt: snapshotAt,
+      warehouseId: 1,
+      warehouseName: "主倉",
+      items: [
+        {
+          sku: "A032",
+          name: "糖果化妝包",
+          available: 250,
+          variants: [
+            { location: "02-L09-03/T2", style: "粉", size: "1", barcode: "A032-03", available: 100 },
+            { location: "02-L09-03/T2", style: "玫瑰紅", size: "1", barcode: "A032-09", available: 150 },
+          ],
+        },
+        {
+          sku: "X999",
+          name: "糖果化妝包",
+          available: 1,
+          variants: [
+            { location: "錯誤儲位", style: "粉", size: "1", barcode: "X999-03", available: 1 },
+          ],
+        },
+      ],
     }),
   }));
   let data = await response.json();
   assert.equal(data.ok, true);
-  assert.equal(data.orderCount, 1);
+
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: snapshotAt,
+      retentionDays: 90,
+      orders: [
+        {
+          transactionNo: "10747554",
+          printableOrderNumbers: ["0350000-10747554"],
+          platformOrderNumbers: ["260827EYQGCNGU"],
+          recipientName: "不應儲存的姓名",
+          recipientPhone: "0912345678",
+          recipientAddress: "不應儲存的地址",
+          status: "已出貨",
+          totalAmount: 1260,
+          totalQuantity: 180,
+          items: [
+            ...Array.from({ length: 100 }, () => ({
+              orderNo: "SP1",
+              subOrderNo: "035000010747554",
+              sku: " a032－03 ",
+              name: "糖果化妝包",
+              style: "粉-1",
+              quantity: 1,
+              unitPrice: 7,
+            })),
+            ...Array.from({ length: 80 }, () => ({
+              orderNo: "SP2",
+              subOrderNo: "035000010747554",
+              sku: "A032-09",
+              name: "糖果化妝包",
+              style: "玫瑰紅-1",
+              quantity: 1,
+              unitPrice: 7,
+            })),
+          ],
+        },
+        {
+          transactionNo: "10747555",
+          totalQuantity: 1,
+          items: [{ sku: "UNKNOWN-03", name: "糖果化妝包", style: "粉-1", quantity: 1, unitPrice: 2 }],
+        },
+        {
+          transactionNo: "10747556",
+          totalQuantity: 1,
+          items: [{
+            sku: "A032-03",
+            name: "糖果化妝包",
+            style: "粉-1",
+            quantity: 1,
+            unitPrice: 2,
+            warehouseArea: "ORDER-LOCK",
+          }],
+        },
+      ],
+    }),
+  }));
+  data = await response.json();
+  assert.equal(data.ok, true);
+  assert.equal(data.orderCount, 3);
 
   for (const query of ["0350000-10747554", "10747554", "260827EYQGCNGU"] ) {
     response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
@@ -1368,8 +1483,61 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
     data = await response.json();
     assert.equal(data.order.transactionNo, "10747554");
     assert.equal(data.order.items.length, 2);
+    assert.deepEqual(data.order.items.map((item) => item.sku), ["A032-03", "A032-09"]);
+    assert.deepEqual(data.order.items.map((item) => item.quantity), [100, 80]);
+    assert.deepEqual(data.order.items.map((item) => item.style), ["粉-1", "玫瑰紅-1"]);
+    assert.deepEqual(data.order.items.map((item) => item.displayStyle), ["粉", "玫瑰紅"]);
+    assert.deepEqual(data.order.items.map((item) => item.warehouseArea), ["02-L09-03/T2", "02-L09-03/T2"]);
     assert.doesNotMatch(JSON.stringify(data.order), /不應儲存|0912345678/);
   }
+  const reply = createErpOrderMessage(data, "0350000-10747554", Date.now());
+  assert.match(reply, /A032-03 粉x100/);
+  assert.match(reply, /A032-09 玫瑰紅x80/);
+  assert.equal((reply.match(/儲位 02-L09-03\/T2/gu) || []).length, 1);
+  assert.equal((reply.match(/單價 NT\$7/gu) || []).length, 1);
+
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: "10747555" }),
+  }));
+  data = await response.json();
+  assert.equal(data.order.items[0].sku, "UNKNOWN-03");
+  assert.equal(data.order.items[0].style, "粉-1");
+  assert.equal(data.order.items[0].displayStyle, undefined);
+  assert.equal(data.order.items[0].warehouseArea, "");
+
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: "10747556" }),
+  }));
+  data = await response.json();
+  assert.equal(data.order.items[0].sku, "A032-03");
+  assert.equal(data.order.items[0].warehouseArea, "ORDER-LOCK");
+
+  const currentWarehouseMetadata = values.get("warehouse-location-active");
+  values.set("warehouse-location-active", {
+    ...currentWarehouseMetadata,
+    updatedAt: "2020-01-01T00:00:00Z",
+  });
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: "10747554" }),
+  }));
+  data = await response.json();
+  assert.deepEqual(data.order.items.map((item) => item.warehouseArea), ["", ""]);
+  assert.deepEqual(data.order.items.map((item) => item.displayStyle), [undefined, undefined]);
+
+  values.set("warehouse-location-active", {
+    ...currentWarehouseMetadata,
+    warehouseName: "副倉",
+    updatedAt: snapshotAt,
+  });
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: "10747554" }),
+  }));
+  data = await response.json();
+  assert.deepEqual(data.order.items.map((item) => item.warehouseArea), ["", ""]);
 });
 
 test("LineActivation binds the real LINE webhook user with a one-time token and stores only hashes", async () => {
