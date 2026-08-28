@@ -36,6 +36,7 @@ git pull --ff-only origin agent/line-schedule-handoff
 - NAS 來源已推送 `profit-analysis-cloud/main`，最新程式 commit `c7f4515`。正式 `/volume1/docker/erp-sync/erp_sync.py` 為 93,819 Bytes，DSM MD5 `17763FE78A471994AE90AFEDCEADCEC8` 與交付檔相同；更新前備份為 `/volume1/docker/erp-sync/backups/erp_sync.py.before-line-order-20260828-225432`，容器未停止或重建。
 - 第一次隔離正式同步於 23:15:55（Asia/Taipei）完成，ERP 原始匯出先進暫存封存、隱私清洗後推送 Worker，共建立 2,511 筆訂單索引。另已把訂單同步移到每輪最前面，舊庫存／相簿報表逾時不再阻擋訂單更新。
 - 23:20 自動排程也已自然通過：23:20:18 在 NAS 產生 15.9 MB 原始 CSV 與 SHA-256 manifest，23:20:25 寫入 10 MB 去識別化索引；23:22:19 完整日誌為 `success`，正式 Worker 收到 2,513 筆 LINE 訂單。
+- 23:26 第一次真實 LINE 測試成功辨識訂單指令，但回覆未授權；根因是白名單先前誤取 LINE Chat 網址中的官方帳號 ID，而非私訊者對話 ID。已從目前登入的正確對話重新取得私訊者 ID 並覆寫同一 Cloudflare Secret，值仍未進 Git；Secret Change version `3a2d49d5-4ee6-49bd-9d67-53255577efe1` 於 23:28:04（Asia/Taipei）承接 100% 流量。
 - 待完成：用真實 LINE 一對一私訊輸入 `0350000-10747554`，確認畫面回覆後才算使用者端驗收完成。
 
 ## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，已正式部署，待 LINE 私訊驗收）
