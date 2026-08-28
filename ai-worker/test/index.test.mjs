@@ -1648,6 +1648,22 @@ test("LineActivation asks the NAS reader for a local image and caches its record
   }
 });
 
+test("LineActivation ignores a stale reader close after a replacement connection", () => {
+  const object = new LineActivation({ storage: {} });
+  const staleSocket = { name: "stale" };
+  const currentSocket = { name: "current" };
+  object.readerSocket = currentSocket;
+  object.readerHello = { browser: { started: true } };
+
+  object.clearReaderIfCurrent(staleSocket);
+  assert.equal(object.readerSocket, currentSocket);
+  assert.deepEqual(object.readerHello, { browser: { started: true } });
+
+  object.clearReaderIfCurrent(currentSocket);
+  assert.equal(object.readerSocket, null);
+  assert.equal(object.readerHello, null);
+});
+
 test("an exact G045 query routes local-image work through the reader broker and indexes the result globally", async () => {
   const scheduleValues = new Map();
   const readerValues = new Map();

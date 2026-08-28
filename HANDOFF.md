@@ -76,11 +76,21 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source commit before this documentation update: `b8efc5b4b330c61b1040660c01d63ee959592dd1` (`feat(line): 私訊查貨號顯示 ERP 售價`).
-- Latest production deployment: `b2c7cf17-3c48-4027-8e25-c669237da3e8` at 2026-08-27 21:59:36 +08:00, deployed from source commit `b8efc5b4b330c61b1040660c01d63ee959592dd1`.
+- Latest feature source before the reader hotfix: `b8efc5b4b330c61b1040660c01d63ee959592dd1` (`feat(line): 私訊查貨號顯示 ERP 售價`).
+- Latest production deployment: `3ace1805-96de-4027-97dd-42cc1429b72e` at 2026-08-28 16:17 +08:00, containing the reader repair plus every newer formal-branch ERP price and storage-location filter change.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: all 63 Worker tests pass for the current LINE workflow; the previously recorded 9 NAS reader tests also pass.
+- Validation status: `node --check ai-worker/src/index.js`, all 64 Worker tests, and all 12 NAS reader tests pass on the integrated formal source.
+
+## Shopee reader restart repair deployed (2026-08-28)
+
+- The user-visible LINE failure said the NAS read service might be offline or the Shopee account might no longer be signed in. Production diagnosis found two restart defects rather than a newly configured password problem.
+- In the Worker Durable Object, replacing a reader WebSocket left the old socket's delayed `close` or `error` listener active. That stale event could clear the new live reader reference, so `/reader/status` incorrectly returned `connected: false` even though the NAS log showed a successful new connection. `clearReaderIfCurrent` now clears state only when the event belongs to the current socket. A regression test reproduces replacement followed by the stale close.
+- On the NAS, an unclean container restart could leave `/tmp/.X99-lock` or `/tmp/.X11-unix/X99`. Xvfb then exited with `Server is already active for display 99`, causing the container restart loop. `docker-entrypoint.sh` removes only those display-99 stale runtime files before starting Xvfb. `.gitattributes` forces LF for shell scripts because an intermediate CRLF copy was rejected by Linux as `bash\r`.
+- Cloudflare Worker version `79388504-63eb-4c2d-a1b8-2f2339c8be31` first restored reader connectivity, but it was built from a branch four commits behind the formal source. It was superseded by integrated production version `3ace1805-96de-4027-97dd-42cc1429b72e` at 2026-08-28 16:17 +08:00 after the combined source passed 64/64 Worker tests. The later version preserves the ERP price and storage-location filter features. The NAS source and deployed entrypoint were verified with matching SHA-256 `63758AAF0987107BFD28334E050260E78FCA2EE16DE69CE0515FF5BD9E1AF7F2`.
+- The successful NAS rebuild ran from 2026-08-28 16:08:50 to 16:09:38 +08:00 and produced image `sha256:c04db3f3eb48eef474d2de3efbeb97a62f0a6c21a29b5a93e89c7725a9f9cd34`. Existing `.env`, browser profile, and Shopee session data were preserved.
+- Post-deployment production verification returned public root HTTP 405 as expected, `connected: true`, and `browser.started: true`. The new reader hello captured a Shopee CAPTCHA URL, so reader transport is healthy but a fresh schedule-number reply from the user's personal LINE account remains the final content-read acceptance check. If that reply still fails, the user must complete Shopee's CAPTCHA in the NAS noVNC session; automation must not solve or bypass it.
+- The one-off DSM task `codex-shopee-reader-rebuild-20260828` was created only for this repair and must not be left scheduled for a later automatic rebuild. Delete it after receiving the user's action-time confirmation; do not delete either NAS source backup.
 
 ## Persistent product-image cache (2026-08-13)
 
@@ -162,14 +172,14 @@ Sending two schedule numbers almost simultaneously previously overloaded the sin
 - Production benchmarks after deployment all returned HTTP 200 with `pageContentRead: true`: 7.17 seconds for the first request, 5.43 seconds for the repeated cached request, and 5.50 seconds for a different uncached product. Before the NAS fast path, the same workflow took 27.76 seconds.
 - The pre-deployment reader source is retained on the NAS as `src/browser.mjs.bak-20260812-173917`. The temporary root SSH key and temporary build context were removed after verification.
 - The keyword-card image update was deployed to the NAS on 2026-08-13. The host source and running container both match SHA-256 `f5de4f3527471bb66909446371701e92208efbe0d5d230eb5b120c1ad9b9b138` for `browser.mjs` and `b3df5e3ff9625daa04bb32aa61de3e4d47a212cc0a0c71db7bf4125d75a20544` for `shopee.mjs`. Backups are `src/browser.mjs.bak-20260813-130701` and `src/shopee.mjs.bak-20260813-130701`; `.env` and `data/profile` were preserved. The temporary root SSH key and incremental build context were removed after verification.
-- Operational note at this handoff: the NAS health endpoint is up and connected to the Worker, but the persistent Shopee control page is currently on a Shopee CAPTCHA URL. A production script request therefore returned HTTP 503 until that CAPTCHA/login check is completed through the NAS noVNC page. This does not prevent ERP keyword text/location results; it only affects authenticated product-content reads and best-effort missing-image fallback.
+- The 2026-08-28 repair restored the NAS transport and the Worker now reports an active connection and started browser. The latest reconnect hello captured a Shopee CAPTCHA URL, so current authenticated content access still needs one fresh user-driven LINE request and, if necessary, manual CAPTCHA completion through the NAS noVNC page.
 
 ## Continue from another computer
 
 1. Clone this repository.
 2. Install Node.js 22 or newer and Wrangler.
 3. Run `node --test ai-worker/test/index.test.mjs`.
-4. Run `node --test nas-shopee-reader/test/shopee.test.mjs`.
+4. Run `node --test nas-shopee-reader/test/*.test.mjs`.
 5. Authenticate with `wrangler login`.
 6. Deploy from `ai-worker` with `wrangler deploy`.
 

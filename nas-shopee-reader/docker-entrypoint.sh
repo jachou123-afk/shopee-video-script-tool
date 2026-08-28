@@ -5,6 +5,7 @@ set -euo pipefail
 
 mkdir -p /data/profile /tmp/fluxbox
 rm -f /data/profile/SingletonCookie /data/profile/SingletonLock /data/profile/SingletonSocket
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 
 Xvfb :99 -screen 0 1365x768x24 -nolisten tcp &
 fluxbox -display :99 >/tmp/fluxbox.log 2>&1 &

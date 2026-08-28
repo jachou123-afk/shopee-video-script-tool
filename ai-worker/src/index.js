@@ -1714,6 +1714,11 @@ export class LineActivation {
     this.readerPending.clear();
   }
 
+  clearReaderIfCurrent(socket, error = "SHOPEE_READER_DISCONNECTED") {
+    if (this.readerSocket !== socket) return;
+    this.clearReader(error);
+  }
+
   acceptReader(request) {
     if (!this.readerAuthorized(request)) return new Response("Unauthorized", { status: 401 });
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
@@ -1727,8 +1732,8 @@ export class LineActivation {
     this.readerSocket = server;
     server.accept();
     server.addEventListener("message", (event) => this.handleReaderMessage(event));
-    server.addEventListener("close", () => this.clearReader());
-    server.addEventListener("error", () => this.clearReader());
+    server.addEventListener("close", () => this.clearReaderIfCurrent(server));
+    server.addEventListener("error", () => this.clearReaderIfCurrent(server));
     return new Response(null, { status: 101, webSocket: client });
   }
 
