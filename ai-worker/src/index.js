@@ -2902,6 +2902,34 @@ export class LineActivation {
     return Response.json({ ok: true, order: null, metadata });
   }
 
+  async bindErpOrderUser(request) {
+    const { userId, bindToken } = await request.json();
+    const normalizedUserId = String(userId || "").trim();
+    const normalizedToken = String(bindToken || "").trim();
+    if (!normalizedUserId || normalizedUserId.length > 120 || !/^[A-Za-z0-9_-]{8,64}$/u.test(normalizedToken)) {
+      return Response.json({ ok: false, error: "INVALID_ORDER_BINDING" }, { status: 400 });
+    }
+    const tokenKey = await lineOrderBindingTokenStorageKey(normalizedToken);
+    if (await this.storage.get(tokenKey)) {
+      return Response.json({ ok: false, error: "ORDER_BINDING_ALREADY_USED" }, { status: 409 });
+    }
+    const userKey = await lineOrderAuthorizationStorageKey(normalizedUserId);
+    const authorizedAt = new Date().toISOString();
+    await this.storage.put(userKey, { authorizedAt });
+    await this.storage.put(tokenKey, { usedAt: authorizedAt });
+    return Response.json({ ok: true, authorized: true });
+  }
+
+  async erpOrderUserAuthorized(request) {
+    const { userId } = await request.json();
+    const normalizedUserId = String(userId || "").trim();
+    if (!normalizedUserId || normalizedUserId.length > 120) {
+      return Response.json({ ok: true, authorized: false });
+    }
+    const record = await this.storage.get(await lineOrderAuthorizationStorageKey(normalizedUserId));
+    return Response.json({ ok: true, authorized: Boolean(record?.authorizedAt) });
+  }
+
   async queryWarehouseLocation(request) {
     const { sku: rawSku, includeImage = true } = await request.json();
     const sku = String(rawSku || "").replace(/\s+/g, "").trim().toUpperCase().slice(0, 80);
@@ -3160,6 +3188,12 @@ export class LineActivation {
     }
     if (url.pathname === "/erp-orders/query" && request.method === "POST") {
       return this.queryErpOrder(request);
+    }
+    if (url.pathname === "/erp-orders/bind-user" && request.method === "POST") {
+      return this.bindErpOrderUser(request);
+    }
+    if (url.pathname === "/erp-orders/user-authorized" && request.method === "POST") {
+      return this.erpOrderUserAuthorized(request);
     }
     if (url.pathname === "/warehouse-locations/query" && request.method === "POST") {
       return this.queryWarehouseLocation(request);
@@ -3464,7 +3498,28 @@ async function warehouseStorageLocationRequest(env, location, page = 1, includeU
   return response.json();
 }
 
-function lineOrderLookupAllowed(event, env) {
+async function sha256Hex(value) {
+  const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value || ""))));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function lineOrderAuthorizationStorageKey(userId) {
+  return `line-order-authorized-user:${await sha256Hex(userId)}`;
+}
+
+async function lineOrderBindingTokenStorageKey(token) {
+  return `line-order-binding-token:${await sha256Hex(token)}`;
+}
+
+function parseLineOrderBindingCommand(text) {
+  const normalized = normalizeScheduleDigits(String(text || "")).normalize("NFKC").trim();
+  const match = normalized.match(/^(?:綁定訂單|訂單綁定)(?:\s+(.+))?$/u);
+  if (!match) return null;
+  const token = String(match[1] || "").trim();
+  return /^[A-Za-z0-9_-]{8,64}$/u.test(token) ? token : "";
+}
+
+function lineOrderLookupAllowedBySecret(event, env) {
   if (event?.source?.type !== "user" || !event.source.userId) return false;
   const allowed = new Set(
     String(env.LINE_ORDER_ALLOWED_USER_IDS || "")
@@ -3473,6 +3528,45 @@ function lineOrderLookupAllowed(event, env) {
       .filter(Boolean),
   );
   return allowed.has(String(event.source.userId));
+}
+
+async function lineOrderLookupAllowed(event, env) {
+  if (lineOrderLookupAllowedBySecret(event, env)) return true;
+  if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) return false;
+  try {
+    const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+      "https://line-schedule/erp-orders/user-authorized",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: event.source.userId }),
+      },
+    );
+    if (!response.ok) return false;
+    return Boolean((await response.json())?.authorized);
+  } catch (error) {
+    console.error("LINE order authorization check error", error?.message || error);
+    return false;
+  }
+}
+
+async function bindLineOrderLookupUser(event, bindToken, env) {
+  if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) {
+    throw httpError("訂單授權服務尚未設定", 503);
+  }
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/erp-orders/bind-user",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: event.source.userId, bindToken }),
+    },
+  );
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok && result?.error !== "ORDER_BINDING_ALREADY_USED") {
+    throw httpError("訂單授權暫時無法使用", 503);
+  }
+  return result;
 }
 
 async function erpOrderRequest(env, query) {
@@ -4205,6 +4299,28 @@ async function processLineEvent(event, env) {
     textLength: text.length,
   }));
 
+  const orderBindingToken = parseLineOrderBindingCommand(text);
+  if (orderBindingToken !== null) {
+    if (event.source?.type !== "user") return;
+    const expectedToken = String(env.LINE_ORDER_BIND_TOKEN || "").trim();
+    if (!orderBindingToken || !expectedToken || orderBindingToken !== expectedToken) {
+      await replyLine(event.replyToken, "🔒 訂單查詢授權碼無效或已過期。", env);
+      return;
+    }
+    try {
+      const result = await bindLineOrderLookupUser(event, orderBindingToken, env);
+      if (result?.authorized) {
+        await replyLine(event.replyToken, "✅ 此 LINE 帳號已完成訂單查詢綁定。\n\n現在可直接輸入出貨單右上角的訂單編號。", env);
+      } else {
+        await replyLine(event.replyToken, "🔒 這組訂單查詢授權碼已使用，請通知管理者重新產生。", env);
+      }
+    } catch (error) {
+      console.error("LINE order binding error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法完成訂單查詢綁定：${error?.message || "請稍後再試"}`, env);
+    }
+    return;
+  }
+
   if (isWarehousePositionDryRunCommand(text)) {
     if (isWarehousePositionPromptCommand(text)) {
       await replyWarehousePositionPrompt(event, env);
@@ -4231,7 +4347,7 @@ async function processLineEvent(event, env) {
   const orderLookupQuery = parseLineOrderLookupCommand(text);
   if (orderLookupQuery || isLineOrderPromptCommand(text)) {
     if (event.source?.type !== "user") return;
-    if (!lineOrderLookupAllowed(event, env)) {
+    if (!await lineOrderLookupAllowed(event, env)) {
       console.log("LINE_ORDER_LOOKUP", JSON.stringify({ authorized: false, sourceType: event.source?.type || "unknown" }));
       await replyLine(event.replyToken, "🔒 訂單查詢只限已授權的 LINE 私訊帳號使用。", env);
       return;
@@ -4756,6 +4872,7 @@ export {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseLineOrderBindingCommand,
   parseLineOrderLookupCommand,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,

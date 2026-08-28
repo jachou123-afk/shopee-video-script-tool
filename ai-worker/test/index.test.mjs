@@ -34,6 +34,7 @@ import worker, {
   linePendingKey,
   panelPostback,
   parseLineFollowup,
+  parseLineOrderBindingCommand,
   parseLineOrderLookupCommand,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
@@ -131,6 +132,14 @@ test("ERP order commands recognize the printed transaction number without captur
   assert.equal(parseLineOrderLookupCommand("10747554"), "10747554");
   assert.equal(parseLineOrderLookupCommand("A725"), "");
   assert.equal(normalizeErpOrderAlias("０３５００００－１０７４７５５４"), "0350000-10747554");
+});
+
+test("ERP order binding command accepts only an explicit private binding token", () => {
+  assert.equal(parseLineOrderBindingCommand("綁定訂單 Abc_1234-X"), "Abc_1234-X");
+  assert.equal(parseLineOrderBindingCommand("訂單綁定 １２３４５６７８"), "12345678");
+  assert.equal(parseLineOrderBindingCommand("綁定訂單"), "");
+  assert.equal(parseLineOrderBindingCommand("綁定訂單 123"), "");
+  assert.equal(parseLineOrderBindingCommand("0350000-10747554"), null);
 });
 
 test("ERP order reply is operational only and fails closed for stale data", () => {
@@ -1339,6 +1348,93 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
     assert.equal(data.order.transactionNo, "10747554");
     assert.equal(data.order.items.length, 2);
     assert.doesNotMatch(JSON.stringify(data.order), /不應儲存|0912345678/);
+  }
+});
+
+test("LineActivation binds the real LINE webhook user with a one-time token and stores only hashes", async () => {
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const firstUser = "U-real-webhook-user-12345678";
+  const secondUser = "U-other-user-87654321";
+  const bindToken = "Once_9xK2p7";
+  let response = await object.fetch(new Request("https://line-schedule/erp-orders/bind-user", {
+    method: "POST",
+    body: JSON.stringify({ userId: firstUser, bindToken }),
+  }));
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).authorized, true);
+
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/user-authorized", {
+    method: "POST",
+    body: JSON.stringify({ userId: firstUser }),
+  }));
+  assert.equal((await response.json()).authorized, true);
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/user-authorized", {
+    method: "POST",
+    body: JSON.stringify({ userId: secondUser }),
+  }));
+  assert.equal((await response.json()).authorized, false);
+
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/bind-user", {
+    method: "POST",
+    body: JSON.stringify({ userId: secondUser, bindToken }),
+  }));
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).error, "ORDER_BINDING_ALREADY_USED");
+  assert.equal([...values.keys()].some((key) => key.includes(firstUser) || key.includes(bindToken)), false);
+});
+
+test("a one-time LINE binding command authorizes the exact webhook user for later order lookups", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const replies = [];
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    LINE_ORDER_BIND_TOKEN: "Bind_7kP3m9",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() { return { fetch: (input, init) => object.fetch(new Request(input, init)) }; },
+    },
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(options.body));
+      return Response.json({ ok: true });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  try {
+    const source = { type: "user", userId: "U-webhook-only-real-user" };
+    await processLineEvent({
+      type: "message",
+      replyToken: "bind-reply",
+      source,
+      message: { type: "text", text: "綁定訂單 Bind_7kP3m9" },
+    }, env);
+    assert.match(replies.at(-1).messages[0].text, /已完成訂單查詢綁定/);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "lookup-reply",
+      source,
+      message: { type: "text", text: "0350000-10747554" },
+    }, env);
+    assert.doesNotMatch(replies.at(-1).messages[0].text, /只限已授權/);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
