@@ -39,6 +39,7 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 23:26、23:37 兩次真實 LINE 測試均成功辨識訂單指令但回覆未授權。複核後發現 Chrome LINE Chat 當時實際停在另一個官方帳號 `@037vajci`，前兩次候選 ID 都不屬於目標帳號。已切換到正確的 `@059hdfyo`，選取含上述兩次測試訊息的同一位私訊者對話，再把該對話的私訊者 ID 覆寫到 Cloudflare Secret；值仍未進 Git。Secret Change version `f277ec13-1521-4565-9d4f-e778dd3e1228` 於 23:40:18（Asia/Taipei）承接 100% 流量。
 - 23:40 修正後真實測試仍未授權，確認 LINE Official Account Manager 的聊天網址 ID 不能可靠取代 Messaging API webhook 實際送入的 user ID。已改為私訊一次性 `綁定訂單 {授權碼}`：只有正確 Cloudflare Secret 授權碼可把該次 webhook 的真實 user ID 綁定，授權碼只能使用一次；Durable Object 僅保存 user ID 與授權碼的 SHA-256 雜湊，不保存原值。語法與 70/70 項測試通過，程式 commit `85b3adb`；Worker upload version `87416285-2f61-4536-bd0e-a31b9c4405bb`、Secret Change version `70f6bf79-fcd6-4774-b227-c9d085ae6504` 於 23:57:43（Asia/Taipei）承接 100% 流量。一次性授權碼只存在 Cloudflare Secret 與本次使用者指示，不進 Git 或交接文件。
 - 2026-08-29 使用者針對真實訂單回覆中的「糖果化妝包」顏色明細提出版面改善，確認一次性綁定後已能取得實際訂單資料。依使用者要求，同品名改為只顯示一次，再把 `顏色 × 數量` 合併在同一行；只有單價與儲位一致時才共用資料，不一致時仍逐規格保留。摘要改為「款／規格／件」。語法與 71/71 項測試通過，程式 commit `98ff8aa`；Worker version `0f625584-5a32-4976-8557-82b31fc19f75` 於 00:03:58（Asia/Taipei）承接 100% 流量。
+- 使用者進一步指定顏色數量採最精簡格式 `粉x100 玫瑰紅x80`，已統一改用半形 `x`、不留前後空格，規格之間只留一個空格。71/71 項測試通過，程式 commit `5e33f36`；Worker version `36b7167f-e198-43d0-bce3-30d8dbb07069` 於 00:08:35（Asia/Taipei）承接 100% 流量。
 - 待完成：用真實 LINE 再查同一訂單，確認同品名合併格式後完成版面驗收。
 
 ## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，已正式部署，待 LINE 私訊驗收）
