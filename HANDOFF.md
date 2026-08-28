@@ -24,7 +24,7 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 修改完成後應將交接文件與相關程式一起提交並推送到目前的雲端交接分支，除非使用者明確要求不要提交或不要推送。
 - 不得把密碼、Token、Cookie、登入狀態、私鑰或其他秘密值寫入交接文件或 Git。
 
-## LINE 私訊查 ERP 訂單（2026-08-28 起；2026-08-29 子貨號／儲位版尚未部署）
+## LINE 私訊查 ERP 訂單（2026-08-28 起；2026-08-29 子貨號／儲位版已正式部署，待 LINE 畫面驗收）
 
 - 目標帳號仍是 `@059hdfyo`。一對一私訊可直接輸入出貨單右上角列印號碼（例如 `0350000-10747554`），也支援 `訂單 {編號}`、ERP 交易序號與平台訂單編號；群組及聊天室不回傳訂單資料。
 - NAS 以 ERP「訂單管理／匯出訂單」內既有的 `codex抓資料` 設定，唯讀抓最近 7 個台北日。每次先把 Big5/CP950 原始 CSV 與 SHA-256 manifest 保存到 NAS 私有設定區，再解析；去識別化訂單索引累積保留 90 天，原始匯出保留 30 天。
@@ -41,10 +41,15 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 2026-08-29 使用者針對真實訂單回覆中的「糖果化妝包」顏色明細提出版面改善，確認一次性綁定後已能取得實際訂單資料。依使用者要求，同品名改為只顯示一次，再把 `顏色 × 數量` 合併在同一行；只有單價與儲位一致時才共用資料，不一致時仍逐規格保留。摘要改為「款／規格／件」。語法與 71/71 項測試通過，程式 commit `98ff8aa`；Worker version `0f625584-5a32-4976-8557-82b31fc19f75` 於 00:03:58（Asia/Taipei）承接 100% 流量。
 - 使用者進一步指定顏色數量採最精簡格式 `粉x100 玫瑰紅x80`，已統一改用半形 `x`、不留前後空格，規格之間只留一個空格。71/71 項測試通過，程式 commit `5e33f36`；Worker version `36b7167f-e198-43d0-bce3-30d8dbb07069` 於 00:08:35（Asia/Taipei）承接 100% 流量。
 - 2026-08-29 以使用者重新授權並重登的 ERP `codex` 帳號唯讀驗證 `codex抓資料`：最近 7 日正式匯出 47,753 列，必要欄位齊全；`0350000-10747554` 為 `A032-03／粉-1／100 件` 與 `A032-09／玫瑰紅-1／80 件`，商品單價均為 NT$7。訂單匯出的 `倉庫儲位區` 仍為空白，不能宣稱儲位直接來自訂單匯出。
-- 待發布版本會先在 NAS 依子貨號、品名、款式、單價及儲位合併逐件列，再由 Worker 白名單化；Worker 也改成先合併再套 100 規格上限，避免 180 列先被截斷成 100 列。舊 90 天索引在下一輪同步時同樣會安全壓縮，陌生欄位與 PII 不保留。
+- 正式版本已在 NAS 依子貨號、品名、款式、單價及儲位合併逐件列，再由 Worker 白名單化；Worker 也改成先合併再套 100 規格上限，避免 180 列先被截斷成 100 列。舊 90 天索引會安全壓縮，陌生欄位與 PII 不保留。
 - 儲位只允許從 30 分鐘內、`warehouseId=1` 且名稱為「主倉」的快照補值；有訂單子貨號時必須與主倉 variant barcode 完全一致，永遠保留訂單匯出的子貨號及既有儲位。同名但條碼不同、主倉過期或不唯一時不補，避免誤揀貨。
 - 預期 LINE 版面為品名一行、每個子貨號一行：`A032-03 粉x100`、`A032-09 玫瑰紅x80`，共用 `儲位 02-L09-03/T2｜單價 NT$7` 只顯示一次；有意義的尺寸不會被刪除，只有 ERP generic size `1` 會折疊成顏色。
-- 驗證：Worker `node --check` 與 72/72 項測試通過，包含 180 個逐件 rows 走正式 sync、同名錯誤條碼不可補值、既有訂單儲位不得覆蓋、主倉快照新鮮度及 PII 白名單。NAS `py_compile` 與 63/63 項測試通過。此版尚未部署，尚未取得新的 Worker version，也尚未完成真實 LINE 畫面驗收。
+- 驗證：Worker `node --check` 與 72/72 項測試通過，包含 180 個逐件 rows 走正式 sync、同名錯誤條碼不可補值、既有訂單儲位不得覆蓋、主倉快照新鮮度及 PII 白名單；NAS `py_compile` 與 63/63 項測試通過。
+- Worker 來源 commit `49cda26a2e647bdfff51abdd0d4cee27ff499509` 已推送 `agent/line-schedule-handoff`，Cloudflare Worker version `6be578f0-6639-4da4-8e74-8fccbbc508a0` 已正式部署。NAS 來源 commit `3d4b468a215205c84833ab687afbb066917912f0` 已推送 `profit-analysis-cloud/main`。
+- NAS 正式 `/volume1/docker/erp-sync/erp_sync.py` 為 97,627 Bytes，DSM MD5 `51047B36FC139883BCE7B3D39DBC8AF2` 與本機相同；本機 SHA-256 為 `F87A4A2C825DEF77EA28CAB651815FD91D88570A2BEB3A870C382E3CC243DE0A`。上傳前備份為 `/volume1/docker/erp-sync/backups/erp_sync.py.before-line-order-sku-location-20260829-012834`；容器未停止或重建。
+- 02:00 自然排程已由新版接手：02:00:25 去識別化訂單索引由約 10 MB 壓縮為約 3.5 MB；目標單 `0350000-10747554` 已成為 2 筆規格、共 180 件，內容為 `A032-09／玫瑰紅-1／80／NT$7` 與 `A032-03／粉-1／100／NT$7`。此輪沒有 `LINE order sync failed/skipped`，且流程已進入後續相簿步驟，證明前段訂單索引與 Worker 推送已完成。
+- 同一輪後段於 02:04:49 記錄 `failed: The read operation timed out`；這是訂單推送完成後的既有後段讀取逾時，未回滾訂單索引。仍需後續觀察一般完整同步是否恢復成功。
+- 待完成：請在 `@059hdfyo` 一對一私訊 `0350000-10747554`，目視確認 `A032-03 粉x100`、`A032-09 玫瑰紅x80`、共用儲位及 NT$7；真實 LINE 畫面完成前不標為最終驗收完成。
 
 ## LINE 私訊查貨號顯示 ERP 售價（2026-08-27，已正式部署，待 LINE 私訊驗收）
 
@@ -98,11 +103,11 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source before the reader hotfix: `b8efc5b4b330c61b1040660c01d63ee959592dd1` (`feat(line): 私訊查貨號顯示 ERP 售價`).
-- Latest production deployment: `3ace1805-96de-4027-97dd-42cc1429b72e` at 2026-08-28 16:17 +08:00, containing the reader repair plus every newer formal-branch ERP price and storage-location filter change.
+- Latest feature source: `49cda26a2e647bdfff51abdd0d4cee27ff499509` (`feat(line): 訂單顯示子貨號與儲位`).
+- Latest production deployment: `6be578f0-6639-4da4-8e74-8fccbbc508a0` on 2026-08-29, containing the order child-SKU/location release plus all earlier formal-branch changes.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: `node --check ai-worker/src/index.js`, all 64 Worker tests, and all 12 NAS reader tests pass on the integrated formal source.
+- Validation status: `node --check ai-worker/src/index.js`, all 72 Worker tests, and all 12 NAS reader tests pass on the integrated formal source.
 
 ## Shopee reader restart repair deployed (2026-08-28)
 
