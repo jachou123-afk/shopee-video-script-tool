@@ -162,8 +162,10 @@ test("ERP order reply is operational only and fails closed for stale data", () =
   }, "0350000-10747554", now);
   assert.match(message, /訂單 0350000-10747554/);
   assert.match(message, /260827EYQGCNGU/);
-  assert.match(message, /共 2 品／180 件/);
-  assert.match(message, /粉 ×100/);
+  assert.match(message, /共 1 款／2 規格／180 件/);
+  assert.match(message, /糖果化妝包\n   粉 ×100、玫瑰紅 ×80/);
+  assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
+  assert.equal((message.match(/單價 NT\$2/gu) || []).length, 1);
   assert.doesNotMatch(message, /姓名|電話|地址/);
 
   const stale = createErpOrderMessage({
@@ -172,6 +174,25 @@ test("ERP order reply is operational only and fails closed for stale data", () =
   }, "0350000-10747554", now);
   assert.match(stale, /訂單查詢暫停/);
   assert.doesNotMatch(stale, /不得洩漏/);
+});
+
+test("ERP order reply keeps per-style prices and locations when a grouped product differs", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const message = createErpOrderMessage({
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10747554",
+      totalAmount: 5,
+      totalQuantity: 2,
+      items: [
+        { name: "糖果化妝包", style: "粉", quantity: 1, unitPrice: 2, warehouseArea: "A-01" },
+        { name: "糖果化妝包", style: "玫瑰紅", quantity: 1, unitPrice: 3, warehouseArea: "B-02" },
+      ],
+    },
+  }, "10747554", now);
+  assert.match(message, /1\) 粉 ×1｜單價 NT\$2｜儲位 A-01/);
+  assert.match(message, /2\) 玫瑰紅 ×1｜單價 NT\$3｜儲位 B-02/);
+  assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
 });
 
 test("warehouse location command accepts common LINE input forms", () => {

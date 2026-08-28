@@ -1474,6 +1474,31 @@ function formatErpOrderMoney(value) {
   return `NT$${Number.isInteger(rounded) ? rounded : rounded.toFixed(2)}`;
 }
 
+function groupErpOrderItemsByName(items) {
+  const groups = [];
+  const byName = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    const name = String(item?.name || "未命名品項").trim() || "未命名品項";
+    let group = byName.get(name);
+    if (!group) {
+      group = { name, items: [] };
+      byName.set(name, group);
+      groups.push(group);
+    }
+    group.items.push(item || {});
+  }
+  return groups;
+}
+
+function erpOrderItemStyle(item) {
+  const style = String(item?.style || "").trim();
+  return style && style !== item?.name ? style : "未標示規格";
+}
+
+function erpOrderItemMetadata(item) {
+  return `單價 ${formatErpOrderMoney(item?.unitPrice)}${item?.warehouseArea ? `｜儲位 ${item.warehouseArea}` : ""}`;
+}
+
 function createErpOrderMessage(result, query, now = Date.now()) {
   const metadata = result?.metadata || null;
   const updatedAt = Date.parse(String(metadata?.updatedAt || ""));
@@ -1499,13 +1524,29 @@ function createErpOrderMessage(result, query, now = Date.now()) {
   if (order.createdAt) lines.push(`建立：${order.createdAt}`);
   if (order.shippedAt) lines.push(`出貨：${order.shippedAt}`);
   const items = Array.isArray(order.items) ? order.items : [];
-  lines.push(`共 ${items.length} 品／${order.totalQuantity || 0} 件｜交易總計 ${formatErpOrderMoney(order.totalAmount)}`);
-  for (const [index, item] of items.slice(0, 12).entries()) {
-    const style = item.style && item.style !== item.name ? `｜${item.style}` : "";
-    lines.push(`${index + 1}. ${item.name}${style} ×${item.quantity || 0}`);
-    lines.push(`   單價 ${formatErpOrderMoney(item.unitPrice)}${item.warehouseArea ? `｜儲位 ${item.warehouseArea}` : ""}`);
+  const itemGroups = groupErpOrderItemsByName(items);
+  lines.push(`共 ${itemGroups.length} 款／${items.length} 規格／${order.totalQuantity || 0} 件｜交易總計 ${formatErpOrderMoney(order.totalAmount)}`);
+  for (const [index, group] of itemGroups.slice(0, 12).entries()) {
+    if (group.items.length === 1) {
+      const [item] = group.items;
+      const style = erpOrderItemStyle(item);
+      lines.push(`${index + 1}. ${group.name}${style === "未標示規格" ? "" : `｜${style}`} ×${item.quantity || 0}`);
+      lines.push(`   ${erpOrderItemMetadata(item)}`);
+      continue;
+    }
+    lines.push(`${index + 1}. ${group.name}`);
+    const metadata = group.items.map(erpOrderItemMetadata);
+    const sharedMetadata = metadata.every((value) => value === metadata[0]);
+    if (sharedMetadata) {
+      lines.push(`   ${group.items.map((item) => `${erpOrderItemStyle(item)} ×${item.quantity || 0}`).join("、")}`);
+      lines.push(`   ${metadata[0]}`);
+      continue;
+    }
+    for (const [itemIndex, item] of group.items.entries()) {
+      lines.push(`   ${itemIndex + 1}) ${erpOrderItemStyle(item)} ×${item.quantity || 0}｜${metadata[itemIndex]}`);
+    }
   }
-  if (items.length > 12) lines.push(`…另有 ${items.length - 12} 品未顯示`);
+  if (itemGroups.length > 12) lines.push(`…另有 ${itemGroups.length - 12} 款未顯示`);
   if (order.cancelReason) lines.push(`取消原因：${order.cancelReason}`);
   lines.push(updatedLine);
   return lines.join("\n").slice(0, 4900);
