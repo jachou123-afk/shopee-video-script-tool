@@ -39,6 +39,7 @@ const erpOrderMaxStoredItems = 100;
 const erpOrderMaxPrintableOrders = 100;
 const erpOrderMaxAliases = 500;
 const erpOrderPrintablePageSize = 20;
+const erpOrderRecentSelectionTtlMs = 5 * 60_000;
 const warehousePositionWizardOptions = Object.freeze({
   zones: ["01", "02", "03", "04", "05", "06"],
   sides: ["L", "R"],
@@ -1860,7 +1861,7 @@ function selectErpOrderView(order, lookup) {
   return { kind: "list", printableNumbers };
 }
 
-function createErpOrderSelectionMessage(order, view, lookup, updatedLine) {
+function createErpOrderSelectionMessage(order, view, lookup, updatedLine, options = {}) {
   if (view.kind === "pending") {
     return joinErpOrderMessageLines([
       "⚠️ 訂單明細待更新",
@@ -1888,7 +1889,12 @@ function createErpOrderSelectionMessage(order, view, lookup, updatedLine) {
   if (statusAndShipment) lines.push(statusAndShipment);
   lines.push(`第 ${page}/${totalPages} 頁`);
   shown.forEach((number, index) => lines.push(`${start + index + 1}. ${number}`));
-  lines.push("", "請複製完整號碼查詢其中一張。");
+  lines.push(
+    "",
+    options.numericSelectionAvailable
+      ? "請直接輸入上方左側編號（例如：11），或複製完整號碼查詢其中一張。"
+      : "請複製完整號碼查詢其中一張。",
+  );
   if (page > 1) lines.push(`上一頁：訂單 ${order.transactionNo} 第${page - 1}頁`);
   if (page < totalPages) lines.push(`下一頁：訂單 ${order.transactionNo} 第${page + 1}頁`);
   lines.push(`查看整筆交易：全部 ${order.transactionNo}`, updatedLine);
@@ -1937,7 +1943,61 @@ function createErpOrderSummaryMessage(order, view, updatedLine) {
   return joinErpOrderMessageLines(lines, 4900, 2);
 }
 
-function createErpOrderMessage(result, query, now = Date.now()) {
+function erpOrderRecentSelectionContext(result, query, now = Date.now()) {
+  const metadata = result?.metadata || null;
+  const snapshotVersion = String(metadata?.version || "").trim();
+  const updatedAt = Date.parse(String(metadata?.updatedAt || ""));
+  const stale = !Number.isFinite(updatedAt)
+    || Number(now) - updatedAt > erpOrderMaxSnapshotAgeMs
+    || updatedAt > Number(now) + 5 * 60_000;
+  const order = result?.order;
+  if (!snapshotVersion || stale || !order) return null;
+  const lookup = normalizeErpOrderLookupRequest(query);
+  const view = selectErpOrderView(order, lookup);
+  if (view.kind !== "list") return null;
+  return {
+    snapshotVersion,
+    transactionNo: order.transactionNo,
+    printableNumbers: view.printableNumbers,
+    savedAt: Number(now),
+  };
+}
+
+function normalizeErpOrderRecentSelectionRecord(rawRecord) {
+  const snapshotVersion = String(rawRecord?.snapshotVersion || "").trim();
+  const transactionNo = normalizeErpOrderAlias(rawRecord?.transactionNo).slice(0, 80);
+  const rawNumbers = Array.isArray(rawRecord?.printableNumbers)
+    ? rawRecord.printableNumbers
+    : [];
+  const printableNumbers = rawNumbers.map(normalizeErpOrderAlias);
+  const savedAt = Number(rawRecord?.savedAt);
+  const expiresAt = Number(rawRecord?.expiresAt);
+  if (
+    !snapshotVersion
+    || snapshotVersion.length > 160
+    || !/^\d{7,12}$/u.test(transactionNo)
+    || rawNumbers.length < 2
+    || rawNumbers.length > erpOrderMaxPrintableOrders
+    || printableNumbers.some((number) => (
+      !/^\d{4,10}-\d{6,12}$/u.test(number)
+      || !number.endsWith(`-${transactionNo}`)
+    ))
+    || new Set(printableNumbers).size !== printableNumbers.length
+    || !Number.isFinite(savedAt)
+    || !Number.isFinite(expiresAt)
+    || expiresAt <= savedAt
+    || expiresAt - savedAt > erpOrderRecentSelectionTtlMs
+  ) return null;
+  return {
+    snapshotVersion,
+    transactionNo,
+    printableNumbers,
+    savedAt,
+    expiresAt,
+  };
+}
+
+function createErpOrderMessage(result, query, now = Date.now(), options = {}) {
   const metadata = result?.metadata || null;
   const updatedAt = Date.parse(String(metadata?.updatedAt || ""));
   const updatedLine = Number.isFinite(updatedAt)
@@ -1954,7 +2014,7 @@ function createErpOrderMessage(result, query, now = Date.now()) {
   if (!order) return `🔎 查無訂單「${lookup.query.slice(0, 160)}」\n${updatedLine}`;
   const view = selectErpOrderView(order, lookup);
   if (view.kind !== "summary") {
-    return createErpOrderSelectionMessage(order, view, lookup, updatedLine);
+    return createErpOrderSelectionMessage(order, view, lookup, updatedLine, options);
   }
   return createErpOrderSummaryMessage(order, view, updatedLine);
 }
@@ -3514,6 +3574,123 @@ export class LineActivation {
     return Response.json({ ok: true, order: null, metadata });
   }
 
+  async erpOrderUserIsAuthorized(userId) {
+    const normalizedUserId = String(userId || "").trim();
+    if (!normalizedUserId || normalizedUserId.length > 120) return false;
+    const allowed = new Set(
+      String(this.env.LINE_ORDER_ALLOWED_USER_IDS || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    );
+    if (allowed.has(normalizedUserId)) return true;
+    const record = await this.storage.get(await lineOrderAuthorizationStorageKey(normalizedUserId));
+    return Boolean(record?.authorizedAt);
+  }
+
+  async saveErpOrderRecentSelection(request) {
+    const body = await request.json();
+    const userId = String(body?.userId || "").trim();
+    if (!userId || userId.length > 120) {
+      return Response.json({ ok: false, error: "INVALID_ORDER_SELECTION_USER" }, { status: 400 });
+    }
+    if (!await this.erpOrderUserIsAuthorized(userId)) {
+      return Response.json({ ok: false, error: "ORDER_SELECTION_NOT_AUTHORIZED" }, { status: 403 });
+    }
+    const savedAt = Number.isFinite(Number(body?.savedAt)) ? Number(body.savedAt) : Date.now();
+    const record = normalizeErpOrderRecentSelectionRecord({
+      snapshotVersion: body?.snapshotVersion,
+      transactionNo: body?.transactionNo,
+      printableNumbers: body?.printableNumbers,
+      savedAt,
+      expiresAt: savedAt + erpOrderRecentSelectionTtlMs,
+    });
+    if (!record) {
+      return Response.json({ ok: false, error: "INVALID_ORDER_SELECTION" }, { status: 400 });
+    }
+    const metadata = await this.storage.get("erp-order-active");
+    if (!metadata?.version || String(metadata.version) !== record.snapshotVersion) {
+      return Response.json({ ok: false, error: "ORDER_SELECTION_SNAPSHOT_CHANGED" }, { status: 409 });
+    }
+    const receivedBytes = encoder.encode(JSON.stringify(record)).byteLength;
+    if (receivedBytes > erpOrderChunkTargetBytes) {
+      return Response.json({
+        ok: false,
+        error: "ORDER_SELECTION_TOO_LARGE",
+        receivedBytes,
+        limitBytes: erpOrderChunkTargetBytes,
+      }, { status: 413 });
+    }
+    await this.storage.put(await lineOrderRecentSelectionStorageKey(userId), record);
+    return Response.json({
+      ok: true,
+      saved: true,
+      count: record.printableNumbers.length,
+      expiresAt: record.expiresAt,
+    });
+  }
+
+  async resolveErpOrderRecentSelection(request) {
+    const body = await request.json();
+    const userId = String(body?.userId || "").trim();
+    const index = Number(body?.index);
+    if (!userId || userId.length > 120 || !Number.isInteger(index) || index < 1) {
+      return Response.json({ ok: false, error: "INVALID_ORDER_SELECTION" }, { status: 400 });
+    }
+    const key = await lineOrderRecentSelectionStorageKey(userId);
+    const rawRecord = await this.storage.get(key);
+    if (!rawRecord) return Response.json({ ok: true, found: false });
+    if (!await this.erpOrderUserIsAuthorized(userId)) {
+      await this.storage.delete(key);
+      return Response.json({ ok: false, error: "ORDER_SELECTION_NOT_AUTHORIZED" }, { status: 403 });
+    }
+    const record = normalizeErpOrderRecentSelectionRecord(rawRecord);
+    if (!record) {
+      await this.storage.delete(key);
+      return Response.json({ ok: false, error: "UNSAFE_ORDER_SELECTION" }, { status: 503 });
+    }
+    const now = Number.isFinite(Number(body?.now)) ? Number(body.now) : Date.now();
+    const metadata = await this.storage.get("erp-order-active");
+    const expired = now < record.savedAt - 5 * 60_000 || now > record.expiresAt;
+    const snapshotChanged = !metadata?.version || String(metadata.version) !== record.snapshotVersion;
+    if (expired || snapshotChanged) {
+      await this.storage.delete(key);
+      return Response.json({ ok: true, found: false, expired, snapshotChanged });
+    }
+    if (index > record.printableNumbers.length) {
+      return Response.json({
+        ok: true,
+        found: true,
+        valid: false,
+        count: record.printableNumbers.length,
+        transactionNo: record.transactionNo,
+      });
+    }
+    const query = record.printableNumbers[index - 1];
+    await this.storage.delete(key);
+    return Response.json({
+      ok: true,
+      found: true,
+      valid: true,
+      query,
+      index,
+      count: record.printableNumbers.length,
+      transactionNo: record.transactionNo,
+    });
+  }
+
+  async clearErpOrderRecentSelection(request) {
+    const { userId: rawUserId } = await request.json();
+    const userId = String(rawUserId || "").trim();
+    if (!userId || userId.length > 120) {
+      return Response.json({ ok: false, error: "INVALID_ORDER_SELECTION_USER" }, { status: 400 });
+    }
+    const key = await lineOrderRecentSelectionStorageKey(userId);
+    const existed = Boolean(await this.storage.get(key));
+    if (existed) await this.storage.delete(key);
+    return Response.json({ ok: true, cleared: existed });
+  }
+
   async bindErpOrderUser(request) {
     const { userId, bindToken } = await request.json();
     const normalizedUserId = String(userId || "").trim();
@@ -3538,8 +3715,10 @@ export class LineActivation {
     if (!normalizedUserId || normalizedUserId.length > 120) {
       return Response.json({ ok: true, authorized: false });
     }
-    const record = await this.storage.get(await lineOrderAuthorizationStorageKey(normalizedUserId));
-    return Response.json({ ok: true, authorized: Boolean(record?.authorizedAt) });
+    return Response.json({
+      ok: true,
+      authorized: await this.erpOrderUserIsAuthorized(normalizedUserId),
+    });
   }
 
   async queryWarehouseLocation(request) {
@@ -3800,6 +3979,15 @@ export class LineActivation {
     }
     if (url.pathname === "/erp-orders/query" && request.method === "POST") {
       return this.queryErpOrder(request);
+    }
+    if (url.pathname === "/erp-orders/recent-selection/save" && request.method === "POST") {
+      return this.saveErpOrderRecentSelection(request);
+    }
+    if (url.pathname === "/erp-orders/recent-selection/resolve" && request.method === "POST") {
+      return this.resolveErpOrderRecentSelection(request);
+    }
+    if (url.pathname === "/erp-orders/recent-selection/clear" && request.method === "POST") {
+      return this.clearErpOrderRecentSelection(request);
     }
     if (url.pathname === "/erp-orders/bind-user" && request.method === "POST") {
       return this.bindErpOrderUser(request);
@@ -4119,6 +4307,10 @@ async function lineOrderAuthorizationStorageKey(userId) {
   return `line-order-authorized-user:${await sha256Hex(userId)}`;
 }
 
+async function lineOrderRecentSelectionStorageKey(userId) {
+  return `line-order-recent-selection:${await sha256Hex(userId)}`;
+}
+
 async function lineOrderBindingTokenStorageKey(token) {
   return `line-order-binding-token:${await sha256Hex(token)}`;
 }
@@ -4193,6 +4385,45 @@ async function erpOrderRequest(env, lookup) {
     },
   );
   if (!response.ok) throw httpError("ERP 訂單查詢暫時無法使用", 503);
+  return response.json();
+}
+
+async function updateLineOrderRecentSelection(event, result, lookup, env, now = Date.now()) {
+  if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) return false;
+  const context = erpOrderRecentSelectionContext(result, lookup, now);
+  const path = context
+    ? "/erp-orders/recent-selection/save"
+    : "/erp-orders/recent-selection/clear";
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    `https://line-schedule${path}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(context
+        ? { userId: event.source.userId, ...context }
+        : { userId: event.source.userId }),
+    },
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    console.error("LINE order recent selection update error", error?.error || response.status);
+    return false;
+  }
+  if (!context) return false;
+  return Boolean((await response.json())?.saved);
+}
+
+async function resolveLineOrderRecentSelection(event, index, env, now = Date.now()) {
+  if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) return null;
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/erp-orders/recent-selection/resolve",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: event.source.userId, index, now }),
+    },
+  );
+  if (!response.ok) throw httpError("出貨單編號選擇暫時無法使用", 503);
   return response.json();
 }
 
@@ -4934,6 +5165,42 @@ async function processLineEvent(event, env) {
     return;
   }
 
+  const recentOrderSelectionIndex = event.source?.type === "user"
+    ? parseScheduleSelection(text)
+    : null;
+  if (recentOrderSelectionIndex) {
+    try {
+      const selection = await resolveLineOrderRecentSelection(
+        event,
+        recentOrderSelectionIndex,
+        env,
+      );
+      if (selection?.found) {
+        if (!selection.valid) {
+          await replyLine(
+            event.replyToken,
+            `📦 交易 ${selection.transactionNo} 共有 ${selection.count} 張完整出貨單，請輸入 1～${selection.count}。`,
+            env,
+          );
+          return;
+        }
+        const lookup = { query: selection.query, mode: "auto", page: 1 };
+        const result = await erpOrderRequest(env, lookup);
+        console.log("LINE_ORDER_SELECTION", JSON.stringify({
+          selected: true,
+          index: recentOrderSelectionIndex,
+          hit: Boolean(result?.order),
+        }));
+        await replyLine(event.replyToken, createErpOrderMessage(result, lookup), env);
+        return;
+      }
+    } catch (error) {
+      console.error("LINE order recent selection error", error?.message || error);
+      await replyLine(event.replyToken, `目前無法讀取剛才的出貨單選項：${error?.message || "請稍後再試"}`, env);
+      return;
+    }
+  }
+
   if (isWarehousePositionDryRunCommand(text)) {
     if (isWarehousePositionPromptCommand(text)) {
       await replyWarehousePositionPrompt(event, env);
@@ -4971,8 +5238,23 @@ async function processLineEvent(event, env) {
     }
     try {
       const result = await erpOrderRequest(env, orderLookup);
+      let numericSelectionAvailable = false;
+      try {
+        numericSelectionAvailable = await updateLineOrderRecentSelection(
+          event,
+          result,
+          orderLookup,
+          env,
+        );
+      } catch (selectionError) {
+        console.error("LINE order recent selection update error", selectionError?.message || selectionError);
+      }
       console.log("LINE_ORDER_LOOKUP", JSON.stringify({ authorized: true, hit: Boolean(result?.order) }));
-      await replyLine(event.replyToken, createErpOrderMessage(result, orderLookup), env);
+      await replyLine(
+        event.replyToken,
+        createErpOrderMessage(result, orderLookup, Date.now(), { numericSelectionAvailable }),
+        env,
+      );
     } catch (error) {
       console.error("LINE order lookup error", error?.message || error);
       await replyLine(event.replyToken, `目前無法查詢 ERP 訂單：${error?.message || "請稍後再試"}`, env);

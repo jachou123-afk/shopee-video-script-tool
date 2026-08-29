@@ -2107,6 +2107,82 @@ test("LineActivation binds the real LINE webhook user with a one-time token and 
   assert.equal([...values.keys()].some((key) => key.includes(firstUser) || key.includes(bindToken)), false);
 });
 
+test("LineActivation keeps a short-lived private order-number selection without storing the raw user ID", async () => {
+  const values = new Map([
+    ["erp-order-active", { version: "snapshot-v1", updatedAt: new Date().toISOString() }],
+  ]);
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const userId = "U-order-selection-owner";
+  const otherUserId = "U-order-selection-other";
+  await object.fetch(new Request("https://line-schedule/erp-orders/bind-user", {
+    method: "POST",
+    body: JSON.stringify({ userId, bindToken: "Selection_9xK2" }),
+  }));
+  const saveSelection = (overrides = {}) => object.fetch(new Request(
+    "https://line-schedule/erp-orders/recent-selection/save",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        userId,
+        snapshotVersion: "snapshot-v1",
+        transactionNo: "10745966",
+        printableNumbers: ["0350000-10745966", "0350001-10745966"],
+        savedAt: 1_000,
+        ...overrides,
+      }),
+    },
+  ));
+  const resolveSelection = (index, now = 1_001, selectedUserId = userId) => object.fetch(new Request(
+    "https://line-schedule/erp-orders/recent-selection/resolve",
+    {
+      method: "POST",
+      body: JSON.stringify({ userId: selectedUserId, index, now }),
+    },
+  ));
+
+  let response = await saveSelection({ userId: otherUserId });
+  assert.equal(response.status, 403);
+
+  response = await saveSelection();
+  let data = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(data.saved, true);
+  assert.equal(data.count, 2);
+  assert.equal([...values.keys()].some((key) => key.includes(userId)), false);
+
+  response = await resolveSelection(3);
+  data = await response.json();
+  assert.equal(data.found, true);
+  assert.equal(data.valid, false);
+  assert.equal(data.count, 2);
+
+  response = await resolveSelection(2);
+  data = await response.json();
+  assert.equal(data.valid, true);
+  assert.equal(data.query, "0350001-10745966");
+  response = await resolveSelection(2);
+  assert.equal((await response.json()).found, false, "a successful number selection is one-time");
+
+  await saveSelection();
+  response = await resolveSelection(1, 1_000 + 5 * 60_000 + 1);
+  data = await response.json();
+  assert.equal(data.found, false);
+  assert.equal(data.expired, true);
+
+  await saveSelection();
+  values.set("erp-order-active", { version: "snapshot-v2", updatedAt: new Date().toISOString() });
+  response = await resolveSelection(1);
+  data = await response.json();
+  assert.equal(data.found, false);
+  assert.equal(data.snapshotChanged, true);
+});
+
 test("a one-time LINE binding command authorizes the exact webhook user for later order lookups", async () => {
   const originalFetch = globalThis.fetch;
   const values = new Map();
@@ -2153,6 +2229,100 @@ test("a one-time LINE binding command authorizes the exact webhook user for late
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("a bare number after an ambiguous order list opens that exact printable instead of the Shopee schedule", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const replies = [];
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const userId = "U-order-number-choice";
+  await object.fetch(new Request("https://line-schedule/erp-orders/bind-user", {
+    method: "POST",
+    body: JSON.stringify({ userId, bindToken: "Choose_7kP3m9" }),
+  }));
+  let response = await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      orders: [{
+        transactionNo: "10745966",
+        platform: "蝦皮購物",
+        totalQuantity: 2,
+        totalAmount: 50,
+        printableOrderNumbers: ["0350001-10745966", "0350000-10745966"],
+        items: [
+          { sku: "A100-01", name: "第一張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 },
+          { sku: "A200-01", name: "第二張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 },
+        ],
+        printableOrders: [
+          {
+            number: "0350001-10745966",
+            totalQuantity: 1,
+            subtotalAmount: 25,
+            items: [{ sku: "A200-01", name: "第二張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 }],
+          },
+          {
+            number: "0350000-10745966",
+            totalQuantity: 1,
+            subtotalAmount: 25,
+            items: [{ sku: "A100-01", name: "第一張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 }],
+          },
+        ],
+      }],
+    }),
+  }));
+  assert.equal(response.status, 200);
+
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() { return { fetch: (input, init) => object.fetch(new Request(input, init)) }; },
+    },
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(options.body));
+      return Response.json({ ok: true });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  const send = (text, replyToken) => processLineEvent({
+    type: "message",
+    replyToken,
+    source: { type: "user", userId },
+    message: { type: "text", text },
+  }, env);
+  const recentSelectionKeys = () => [...values.keys()]
+    .filter((key) => key.startsWith("line-order-recent-selection:"));
+  try {
+    await send("10745966", "order-list-1");
+    assert.match(replies.at(-1).messages[0].text, /1\. 0350000-10745966/);
+    assert.match(replies.at(-1).messages[0].text, /2\. 0350001-10745966/);
+    assert.match(replies.at(-1).messages[0].text, /直接輸入上方左側編號/);
+    assert.equal(recentSelectionKeys().length, 1);
+
+    await send("0350000-10745966", "manual-exact");
+    assert.match(replies.at(-1).messages[0].text, /📦 0350000-10745966/);
+    assert.equal(recentSelectionKeys().length, 0, "a new exact lookup clears the old number context");
+
+    await send("10745966", "order-list-2");
+    assert.equal(recentSelectionKeys().length, 1);
+    await send("2", "order-choice-2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.match(replies.at(-1).messages[0].text, /📦 0350001-10745966/);
+  assert.match(replies.at(-1).messages[0].text, /A200-01/);
+  assert.doesNotMatch(replies.at(-1).messages[0].text, /A100-01|廣告影片排程|蝦皮廣告/u);
+  assert.equal(recentSelectionKeys().length, 0);
 });
 
 test("LineActivation builds an exact reverse index and paginates every item at a storage location", async () => {
