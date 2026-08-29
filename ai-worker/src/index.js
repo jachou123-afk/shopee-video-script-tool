@@ -36,6 +36,9 @@ const erpOrderChunkTargetBytes = 96 * 1024;
 const erpOrderMaxSnapshotAgeMs = 30 * 60_000;
 const erpOrderMaxInputItems = 20_000;
 const erpOrderMaxStoredItems = 100;
+const erpOrderMaxPrintableOrders = 100;
+const erpOrderMaxAliases = 500;
+const erpOrderPrintablePageSize = 20;
 const warehousePositionWizardOptions = Object.freeze({
   zones: ["01", "02", "03", "04", "05", "06"],
   sides: ["L", "R"],
@@ -1374,22 +1377,67 @@ function normalizeErpOrderAlias(value) {
 function erpOrderLookupCandidates(value) {
   const normalized = normalizeErpOrderAlias(value);
   if (!normalized) return [];
+  if (/^\d{4,10}-\d{6,12}$/.test(normalized)) return [normalized];
   const candidates = new Set([normalized]);
-  const printable = normalized.match(/^\d{4,10}-(\d{6,12})$/);
-  if (printable) candidates.add(printable[1]);
   if (/^\d{12,24}$/.test(normalized)) {
     candidates.add(normalized.slice(-8));
   }
   return [...candidates];
 }
 
+function collectErpOrderAliases(values) {
+  const aliases = [];
+  const seen = new Set();
+  for (const value of values) {
+    for (const alias of erpOrderLookupCandidates(value)) {
+      if (!alias || seen.has(alias)) continue;
+      if (aliases.length >= erpOrderMaxAliases) {
+        return { aliases, limitExceeded: true };
+      }
+      seen.add(alias);
+      aliases.push(alias);
+    }
+  }
+  return { aliases, limitExceeded: false };
+}
+
+function compareErpOrderAliases(left, right) {
+  return String(left || "").localeCompare(String(right || ""), "en", {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function parseLineOrderLookupRequest(text) {
+  let normalized = normalizeScheduleDigits(text).normalize("NFKC").replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  let page = 1;
+  const pageMatch = normalized.match(/\s+第\s*(\d{1,4})\s*頁$/u);
+  if (pageMatch) {
+    page = Math.max(1, Number.parseInt(pageMatch[1], 10) || 1);
+    normalized = normalized.slice(0, pageMatch.index).trim();
+  }
+  const explicitOrder = /^訂單(?:編號)?(?:\s*[+＋:：]\s*|\s+)/u.test(normalized);
+  if (explicitOrder) {
+    normalized = normalized.replace(/^訂單(?:編號)?(?:\s*[+＋:：]\s*|\s+)/u, "").trim();
+  }
+  let mode = "auto";
+  if (/^全部(?:\s*[+＋:：]\s*|\s+)/u.test(normalized)) {
+    mode = "all";
+    normalized = normalized.replace(/^全部(?:\s*[+＋:：]\s*|\s+)/u, "").trim();
+  }
+  const query = normalizeErpOrderAlias(normalized);
+  if (!query) return null;
+  const explicitLookup = explicitOrder || mode === "all";
+  const isPrintable = /^\d{4,10}-\d{6,12}$/u.test(query);
+  const isTransaction = /^\d{7,12}$/u.test(query);
+  const isExplicitAlias = explicitLookup && /^[A-Z0-9-]{6,160}$/u.test(query);
+  if (!isPrintable && !isTransaction && !isExplicitAlias) return null;
+  return { query, mode, page };
+}
+
 function parseLineOrderLookupCommand(text) {
-  const normalized = normalizeScheduleDigits(text).normalize("NFKC").trim();
-  const explicit = normalized.match(/^訂單(?:編號)?\s*[+＋:：]?\s*([A-Za-z0-9-]{6,160})$/iu);
-  if (explicit) return normalizeErpOrderAlias(explicit[1]);
-  if (/^\d{4,10}-\d{6,12}$/.test(normalized)) return normalizeErpOrderAlias(normalized);
-  if (/^\d{7,12}$/.test(normalized)) return normalized;
-  return "";
+  return parseLineOrderLookupRequest(text)?.query || "";
 }
 
 function isLineOrderPromptCommand(text) {
@@ -1398,18 +1446,86 @@ function isLineOrderPromptCommand(text) {
   );
 }
 
+function normalizeErpOrderMoney(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? Math.round(amount * 10000) / 10000 : 0;
+}
+
+function hasErpOrderMoney(value) {
+  return value !== null
+    && value !== undefined
+    && String(value).trim() !== ""
+    && Number.isFinite(Number(value));
+}
+
+function normalizeErpOrderItem(rawItem) {
+  const quantity = normalizeErpOrderMoney(rawItem?.quantity);
+  const unitPrice = normalizeErpOrderMoney(rawItem?.unitPrice);
+  const rawSubtotal = rawItem?.subtotalAmount;
+  const hasSubtotal = hasErpOrderMoney(rawSubtotal);
+  return {
+    orderNo: String(rawItem?.orderNo || "").replace(/\s+/g, "").slice(0, 120),
+    subOrderNo: String(rawItem?.subOrderNo || "").replace(/\s+/g, "").slice(0, 120),
+    sku: normalizeWarehouseSku(rawItem?.sku),
+    name: String(rawItem?.name || "商品").replace(/\s+/g, " ").trim().slice(0, 240) || "商品",
+    style: String(rawItem?.style || "").replace(/\s+/g, " ").trim().slice(0, 120),
+    quantity,
+    unitPrice,
+    subtotalAmount: hasSubtotal
+      ? normalizeErpOrderMoney(rawSubtotal)
+      : normalizeErpOrderMoney(quantity * unitPrice),
+    warehouseArea: String(rawItem?.warehouseArea || "").replace(/\s+/g, " ").trim().slice(0, 160),
+  };
+}
+
+function normalizeErpOrderItems(rawItems) {
+  const source = Array.isArray(rawItems) ? rawItems : [];
+  const normalized = source.slice(0, erpOrderMaxInputItems).map(normalizeErpOrderItem);
+  const collapsed = collapseErpOrderItems(normalized);
+  return {
+    items: collapsed.slice(0, erpOrderMaxStoredItems),
+    itemsTruncated: source.length > erpOrderMaxInputItems
+      || collapsed.length > erpOrderMaxStoredItems,
+    aliases: normalized.flatMap((item) => [item.orderNo, item.subOrderNo]),
+  };
+}
+
+function normalizeErpPrintableOrder(rawPrintable) {
+  const number = normalizeErpOrderAlias(rawPrintable?.number).slice(0, 120);
+  if (!number) return null;
+  const normalizedItems = normalizeErpOrderItems(rawPrintable?.items);
+  const derivedQuantity = normalizedItems.items.reduce(
+    (sum, item) => sum + (Number(item?.quantity) || 0),
+    0,
+  );
+  const derivedAmount = normalizedItems.items.reduce(
+    (sum, item) => sum + erpOrderItemSubtotal(item),
+    0,
+  );
+  return {
+    number,
+    subOrderNo: String(rawPrintable?.subOrderNo || "").replace(/\s+/g, "").slice(0, 120),
+    totalQuantity: hasErpOrderMoney(rawPrintable?.totalQuantity)
+      ? normalizeErpOrderMoney(rawPrintable.totalQuantity)
+      : derivedQuantity,
+    subtotalAmount: hasErpOrderMoney(rawPrintable?.subtotalAmount)
+      ? normalizeErpOrderMoney(rawPrintable.subtotalAmount)
+      : derivedAmount,
+    items: normalizedItems.items,
+    itemsTruncated: Boolean(rawPrintable?.itemsTruncated)
+      || normalizedItems.itemsTruncated,
+    aliases: normalizedItems.aliases,
+  };
+}
+
 function normalizeErpOrder(rawOrder) {
   const transactionNo = normalizeErpOrderAlias(rawOrder?.transactionNo).slice(0, 80);
-  if (!transactionNo) return null;
+  if (!/^\d{7,12}$/.test(transactionNo)) return null;
   const uniqueStrings = (values, limit = 100) => [...new Set(
     (Array.isArray(values) ? values : [])
       .map((value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 160))
       .filter(Boolean),
   )].slice(0, limit);
-  const money = (value) => {
-    const amount = Number(value);
-    return Number.isFinite(amount) ? Math.round(amount * 10000) / 10000 : 0;
-  };
   const order = {
     transactionNo,
     orderNumbers: uniqueStrings(rawOrder?.orderNumbers),
@@ -1425,40 +1541,70 @@ function normalizeErpOrder(rawOrder) {
     shippedAt: String(rawOrder?.shippedAt || "").replace(/\s+/g, " ").trim().slice(0, 80),
     dispatchAt: String(rawOrder?.dispatchAt || "").replace(/\s+/g, " ").trim().slice(0, 80),
     pickedAt: String(rawOrder?.pickedAt || "").replace(/\s+/g, " ").trim().slice(0, 80),
-    totalAmount: money(rawOrder?.totalAmount),
-    totalQuantity: money(rawOrder?.totalQuantity),
+    totalAmount: normalizeErpOrderMoney(rawOrder?.totalAmount),
+    totalAmountAvailable: rawOrder?.totalAmountAvailable === false
+      ? false
+      : hasErpOrderMoney(rawOrder?.totalAmount),
+    totalQuantity: normalizeErpOrderMoney(rawOrder?.totalQuantity),
+    totalQuantityAvailable: rawOrder?.totalQuantityAvailable === false
+      ? false
+      : hasErpOrderMoney(rawOrder?.totalQuantity),
     lastSeenAt: String(rawOrder?.lastSeenAt || "").slice(0, 80),
     items: [],
   };
-  const rawItems = Array.isArray(rawOrder?.items) ? rawOrder.items : [];
-  const normalizedItems = [];
-  const itemAliases = [];
-  for (const rawItem of rawItems.slice(0, erpOrderMaxInputItems)) {
-    const item = {
-      orderNo: String(rawItem?.orderNo || "").replace(/\s+/g, "").slice(0, 120),
-      subOrderNo: String(rawItem?.subOrderNo || "").replace(/\s+/g, "").slice(0, 120),
-      sku: normalizeWarehouseSku(rawItem?.sku),
-      name: String(rawItem?.name || "商品").replace(/\s+/g, " ").trim().slice(0, 240) || "商品",
-      style: String(rawItem?.style || "").replace(/\s+/g, " ").trim().slice(0, 120),
-      quantity: money(rawItem?.quantity),
-      unitPrice: money(rawItem?.unitPrice),
-      warehouseArea: String(rawItem?.warehouseArea || "").replace(/\s+/g, " ").trim().slice(0, 160),
-    };
-    normalizedItems.push(item);
-    itemAliases.push(item.orderNo, item.subOrderNo);
+  const normalizedItems = normalizeErpOrderItems(rawOrder?.items);
+  order.items = normalizedItems.items;
+  order.itemsTruncated = Boolean(rawOrder?.itemsTruncated)
+    || normalizedItems.itemsTruncated;
+  const printableAliases = [];
+  if (Array.isArray(rawOrder?.printableOrders)) {
+    const printableByNumber = new Map();
+    for (const rawPrintable of rawOrder.printableOrders.slice(0, erpOrderMaxPrintableOrders)) {
+      const printable = normalizeErpPrintableOrder(rawPrintable);
+      if (!printable || printableByNumber.has(printable.number)) continue;
+      printableByNumber.set(printable.number, printable);
+      printableAliases.push(printable.number, printable.subOrderNo, ...printable.aliases);
+    }
+    order.printableOrders = [...printableByNumber.values()]
+      .map(({ aliases, ...printable }) => printable)
+      .sort((left, right) => compareErpOrderAliases(left.number, right.number));
+    order.printableOrdersTruncated = Boolean(rawOrder?.printableOrdersTruncated)
+      || rawOrder.printableOrders.length > erpOrderMaxPrintableOrders
+      || (Array.isArray(rawOrder?.printableOrderNumbers)
+        && rawOrder.printableOrderNumbers.length > erpOrderMaxPrintableOrders);
+    order.printableOrderNumbers = uniqueStrings([
+      ...order.printableOrderNumbers,
+      ...order.printableOrders.map((printable) => printable.number),
+    ]).sort(compareErpOrderAliases);
   }
-  const collapsedItems = collapseErpOrderItems(normalizedItems);
-  order.items = collapsedItems.slice(0, erpOrderMaxStoredItems);
-  order.itemsTruncated = rawItems.length > erpOrderMaxInputItems
-    || collapsedItems.length > erpOrderMaxStoredItems;
-  order.aliases = [...new Set([
+  const collectedAliases = collectErpOrderAliases([
     transactionNo,
     ...order.orderNumbers,
     ...order.printableOrderNumbers,
     ...order.platformOrderNumbers,
-    ...itemAliases,
-  ].flatMap(erpOrderLookupCandidates))].slice(0, 500);
+    ...normalizedItems.aliases,
+    ...printableAliases,
+  ]);
+  order.aliases = collectedAliases.aliases;
+  if (collectedAliases.limitExceeded) order.aliasLimitExceeded = true;
   return order;
+}
+
+function normalizeStoredErpOrder(rawOrder, expectedTransactionNo, matchedAlias) {
+  const order = normalizeErpOrder(rawOrder);
+  const expected = normalizeErpOrderAlias(expectedTransactionNo).slice(0, 80);
+  const alias = normalizeErpOrderAlias(matchedAlias);
+  if (
+    !order
+    || order.aliasLimitExceeded
+    || order.transactionNo !== expected
+    || !alias
+    || !order.aliases.includes(alias)
+  ) {
+    return null;
+  }
+  const { aliases, aliasLimitExceeded, ...safeOrder } = order;
+  return safeOrder;
 }
 
 function buildErpOrderChunks(orders) {
@@ -1558,14 +1704,6 @@ function resolveErpOrderItemWarehouseDetails(item, warehouseItems) {
   };
 }
 
-function erpOrderItemDisplay(item) {
-  const sku = normalizeWarehouseSku(item?.sku);
-  const style = erpOrderItemStyle(item);
-  const specification = style === "未標示規格" ? "" : style;
-  const quantity = Number(item?.quantity) || 0;
-  return [sku, `${specification ? `${specification}x` : "x"}${quantity}`].filter(Boolean).join(" ");
-}
-
 function collapseErpOrderItems(items) {
   const collapsed = [];
   const indexes = new Map();
@@ -1581,31 +1719,222 @@ function collapseErpOrderItems(items) {
     const existingIndex = indexes.get(key);
     if (existingIndex === undefined) {
       indexes.set(key, collapsed.length);
-      collapsed.push({ ...item, quantity: Number(item.quantity) || 0 });
+      collapsed.push({
+        ...item,
+        quantity: Number(item.quantity) || 0,
+        subtotalAmount: erpOrderItemSubtotal(item),
+      });
     } else {
       collapsed[existingIndex].quantity += Number(item.quantity) || 0;
+      collapsed[existingIndex].subtotalAmount += erpOrderItemSubtotal(item);
     }
   }
   return collapsed;
 }
 
-function erpOrderItemMetadata(item) {
-  return `${item?.warehouseArea ? `儲位 ${item.warehouseArea}｜` : ""}單價 ${formatErpOrderMoney(item?.unitPrice)}`;
-}
-
-function joinErpOrderMessageLines(lines, limit = 4900) {
-  const message = lines.join("\n");
+function joinErpOrderMessageLines(lines, limit = 4900, footerCount = 0) {
+  const normalizedLines = lines.map((line) => String(line));
+  const message = normalizedLines.join("\n");
   if (message.length <= limit) return message;
   const notice = "…內容過長，後續品項已省略";
+  const safeFooterCount = Math.min(normalizedLines.length, Math.max(0, Math.trunc(footerCount)));
+  const body = safeFooterCount ? normalizedLines.slice(0, -safeFooterCount) : normalizedLines;
+  const footer = safeFooterCount ? normalizedLines.slice(-safeFooterCount) : [];
   const kept = [];
-  let length = notice.length + 1;
-  for (const line of lines) {
-    const nextLength = length + String(line).length + (kept.length ? 1 : 0);
-    if (nextLength > limit) break;
+  for (const line of body) {
+    const candidate = [...kept, line, notice, ...footer].join("\n");
+    if (candidate.length > limit) break;
     kept.push(line);
-    length = nextLength;
   }
-  return [...kept, notice].join("\n");
+  return [...kept, notice, ...footer].join("\n");
+}
+
+function normalizeErpOrderLookupRequest(value) {
+  if (value && typeof value === "object") {
+    return {
+      query: normalizeErpOrderAlias(value.query),
+      mode: value.mode === "all" ? "all" : "auto",
+      page: Math.max(1, Math.trunc(Number(value.page) || 1)),
+    };
+  }
+  return {
+    query: normalizeErpOrderAlias(value),
+    mode: "auto",
+    page: 1,
+  };
+}
+
+function erpOrderPrintableNumbers(order) {
+  return [...new Set([
+    ...(Array.isArray(order?.printableOrderNumbers) ? order.printableOrderNumbers : []),
+    ...(Array.isArray(order?.printableOrders)
+      ? order.printableOrders.map((printable) => printable?.number)
+      : []),
+  ].map(normalizeErpOrderAlias).filter(Boolean))].sort(compareErpOrderAliases);
+}
+
+function erpOrderItemSubtotal(item) {
+  const subtotal = item?.subtotalAmount;
+  if (hasErpOrderMoney(subtotal)) {
+    return Number(subtotal);
+  }
+  return (Number(item?.unitPrice) || 0) * (Number(item?.quantity) || 0);
+}
+
+function erpOrderPlatformNumberLine(order, limit = 3) {
+  const numbers = [...new Set(
+    (Array.isArray(order?.platformOrderNumbers) ? order.platformOrderNumbers : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  )];
+  if (!numbers.length) return "";
+  const shown = numbers.slice(0, limit);
+  const omitted = numbers.length - shown.length;
+  return `平台單號：${shown.join("、")}${omitted > 0 ? `（另 ${omitted} 筆）` : ""}`;
+}
+
+function erpOrderSummaryView(order, printable = null, all = false) {
+  const sourceItems = printable?.items ?? order?.items;
+  const items = collapseErpOrderItems(sourceItems);
+  const derivedQuantity = items.reduce((sum, item) => sum + (Number(item?.quantity) || 0), 0);
+  const derivedAmount = items.reduce((sum, item) => sum + erpOrderItemSubtotal(item), 0);
+  const transactionItems = collapseErpOrderItems(order?.items);
+  const transactionDerivedAmount = transactionItems.reduce(
+    (sum, item) => sum + erpOrderItemSubtotal(item),
+    0,
+  );
+  const printableQuantity = Number(printable?.totalQuantity);
+  const printableAmount = Number(printable?.subtotalAmount);
+  const transactionTotalProvided = order?.totalAmountAvailable === true
+    || (order?.totalAmountAvailable !== false
+      && hasErpOrderMoney(order?.totalAmount)
+      && Number(order.totalAmount) !== 0);
+  const transactionTotalAmount = transactionTotalProvided
+    ? Number(order.totalAmount)
+    : transactionDerivedAmount;
+  return {
+    kind: "summary",
+    all,
+    isPrintable: Boolean(printable),
+    displayNo: all
+      ? `全部訂單｜交易 ${order.transactionNo}`
+      : printable?.number || erpOrderPrintableNumbers(order)[0] || order.transactionNo,
+    items,
+    totalQuantity: printable && hasErpOrderMoney(printable?.totalQuantity)
+      ? printableQuantity
+      : Number(order?.totalQuantity) || derivedQuantity,
+    totalAmount: printable && hasErpOrderMoney(printable?.subtotalAmount)
+      ? printableAmount
+      : printable ? derivedAmount : transactionTotalAmount,
+    transactionTotalAmount,
+    transactionTotalKnown: Boolean(order?.totalAmountAvailable)
+      || Number(order?.totalAmount) !== 0
+      || transactionItems.length > 0,
+    itemsTruncated: Boolean(printable?.itemsTruncated || (!printable && order?.itemsTruncated)),
+  };
+}
+
+function selectErpOrderView(order, lookup) {
+  if (lookup.mode === "all") return erpOrderSummaryView(order, null, true);
+  const printableNumbers = erpOrderPrintableNumbers(order);
+  const printableDetailsAvailable = Array.isArray(order?.printableOrders);
+  const printableByNumber = new Map(
+    (printableDetailsAvailable ? order.printableOrders : [])
+      .filter((printable) => printable?.number)
+      .map((printable) => [normalizeErpOrderAlias(printable.number), printable]),
+  );
+  const exactPrintable = printableByNumber.get(lookup.query);
+  if (exactPrintable) return erpOrderSummaryView(order, exactPrintable);
+  if (order?.printableOrdersTruncated) {
+    return { kind: "pending", printableNumbers };
+  }
+  if (printableNumbers.length <= 1) {
+    const onlyPrintable = printableByNumber.get(printableNumbers[0]);
+    return erpOrderSummaryView(order, onlyPrintable || null);
+  }
+  const detailsComplete = printableDetailsAvailable
+    && printableNumbers.every((number) => printableByNumber.has(number));
+  if (!detailsComplete) {
+    return { kind: "pending", printableNumbers };
+  }
+  return { kind: "list", printableNumbers };
+}
+
+function createErpOrderSelectionMessage(order, view, lookup, updatedLine) {
+  if (view.kind === "pending") {
+    return joinErpOrderMessageLines([
+      "⚠️ 訂單明細待更新",
+      `交易序號：${order.transactionNo}`,
+      `這筆交易有 ${view.printableNumbers.length} 張完整出貨單，目前快照尚未包含逐張品項，無法安全判斷指定出貨單內容。`,
+      "請等 NAS 下一次同步後再查完整號。",
+      `如要查看整筆交易彙總：全部 ${order.transactionNo}`,
+      updatedLine,
+    ], 4900, 1);
+  }
+  const totalPages = Math.max(1, Math.ceil(view.printableNumbers.length / erpOrderPrintablePageSize));
+  const page = Math.min(totalPages, lookup.page);
+  const start = (page - 1) * erpOrderPrintablePageSize;
+  const shown = view.printableNumbers.slice(start, start + erpOrderPrintablePageSize);
+  const lines = [
+    `📦 交易 ${order.transactionNo}｜${view.printableNumbers.length} 張完整出貨單`,
+  ];
+  lines.push(`平台：${order.platform || "未提供"}`);
+  const platformNumberLine = erpOrderPlatformNumberLine(order);
+  if (platformNumberLine) lines.push(platformNumberLine);
+  const statusAndShipment = [
+    order.status ? `狀態：${order.status}` : "",
+    order.shippedAt ? `出貨：${order.shippedAt}` : "出貨：未提供",
+  ].filter(Boolean).join("｜");
+  if (statusAndShipment) lines.push(statusAndShipment);
+  lines.push(`第 ${page}/${totalPages} 頁`);
+  shown.forEach((number, index) => lines.push(`${start + index + 1}. ${number}`));
+  lines.push("", "請複製完整號碼查詢其中一張。");
+  if (page > 1) lines.push(`上一頁：訂單 ${order.transactionNo} 第${page - 1}頁`);
+  if (page < totalPages) lines.push(`下一頁：訂單 ${order.transactionNo} 第${page + 1}頁`);
+  lines.push(`查看整筆交易：全部 ${order.transactionNo}`, updatedLine);
+  return joinErpOrderMessageLines(lines, 4900, 1);
+}
+
+function createErpOrderSummaryMessage(order, view, updatedLine) {
+  const itemGroups = groupErpOrderItemsByName(view.items);
+  const lines = [`📦 ${view.displayNo}`];
+  lines.push(`平台：${order.platform || "未提供"}`);
+  const platformNumberLine = erpOrderPlatformNumberLine(order);
+  if (platformNumberLine) lines.push(platformNumberLine);
+  const statusAndShipment = [
+    order.status ? `狀態：${order.status}` : "",
+    order.shippedAt ? `出貨：${order.shippedAt}` : "出貨：未提供",
+  ].filter(Boolean).join("｜");
+  if (statusAndShipment) lines.push(statusAndShipment);
+  if (order.shippingStatus) lines.push(`配送：${order.shippingStatus}`);
+  if (order.shipmentType) lines.push(`出貨方式：${order.shipmentType}`);
+  if (order.shipmentNo) lines.push(`出貨單號：${order.shipmentNo}`);
+  const differsFromTransaction = view.isPrintable
+    && view.transactionTotalKnown
+    && Math.abs(Number(view.totalAmount) - Number(view.transactionTotalAmount)) > 0.0001;
+  lines.push(
+    `商品 ${itemGroups.length} 款｜規格 ${view.items.length} 項｜共 ${view.totalQuantity || 0} 件｜${differsFromTransaction ? "本張商品小計" : "總額"} ${formatErpOrderMoney(view.totalAmount)}`,
+  );
+  if (differsFromTransaction) {
+    lines.push(`整筆交易總計：${formatErpOrderMoney(view.transactionTotalAmount)}`);
+  }
+  lines.push("");
+  if (!itemGroups.length) lines.push("目前沒有可顯示的商品明細。");
+  for (const [index, group] of itemGroups.slice(0, 12).entries()) {
+    lines.push(`${index + 1}. ${group.name}`);
+    for (const item of group.items) {
+      const sku = normalizeWarehouseSku(item?.sku) || "未提供貨號";
+      lines.push(`   ${sku}｜${erpOrderItemStyle(item)}｜×${Number(item?.quantity) || 0}`);
+      lines.push(
+        `   📍${item?.warehouseArea || "未提供"}｜單價 ${formatErpOrderMoney(item?.unitPrice)}｜小計 ${formatErpOrderMoney(erpOrderItemSubtotal(item))}`,
+      );
+    }
+  }
+  if (itemGroups.length > 12) lines.push(`…另有 ${itemGroups.length - 12} 款未顯示`);
+  if (view.itemsTruncated) lines.push(`⚠️ 品項過多，僅保留前 ${erpOrderMaxStoredItems} 個合併規格`);
+  if (order.cancelReason) lines.push(`取消原因：${order.cancelReason}`);
+  lines.push(`建立：${order.createdAt || "未提供"}`, updatedLine);
+  return joinErpOrderMessageLines(lines, 4900, 2);
 }
 
 function createErpOrderMessage(result, query, now = Date.now()) {
@@ -1620,39 +1949,14 @@ function createErpOrderMessage(result, query, now = Date.now()) {
   if (stale) {
     return `⚠️ 訂單查詢暫停\n\nERP 訂單資料已超過 30 分鐘或時間無效，為避免回覆舊資料，請先確認 NAS 同步。\n${updatedLine}`;
   }
+  const lookup = normalizeErpOrderLookupRequest(query);
   const order = result?.order;
-  if (!order) return `🔎 查無訂單「${String(query || "").slice(0, 160)}」\n${updatedLine}`;
-  const displayNo = order.printableOrderNumbers?.[0] || String(query || order.transactionNo);
-  const lines = [`📦 訂單 ${displayNo}`];
-  if (order.platformOrderNumbers?.length) lines.push(`平台單號：${order.platformOrderNumbers.join("、")}`);
-  if (order.platform) lines.push(`平台：${order.platform}`);
-  if (order.status) lines.push(`狀態：${order.status}`);
-  if (order.shippingStatus) lines.push(`配送：${order.shippingStatus}`);
-  if (order.shipmentType) lines.push(`出貨方式：${order.shipmentType}`);
-  if (order.shipmentNo) lines.push(`出貨單號：${order.shipmentNo}`);
-  if (order.createdAt) lines.push(`建立：${order.createdAt}`);
-  if (order.shippedAt) lines.push(`出貨：${order.shippedAt}`);
-  const items = collapseErpOrderItems(order.items);
-  const itemGroups = groupErpOrderItemsByName(items);
-  lines.push(`共 ${itemGroups.length} 款／${items.length} 規格／${order.totalQuantity || 0} 件｜交易總計 ${formatErpOrderMoney(order.totalAmount)}`);
-  if (order.itemsTruncated) lines.push(`⚠️ 品項過多，僅保留前 ${erpOrderMaxStoredItems} 個合併規格`);
-  for (const [index, group] of itemGroups.slice(0, 12).entries()) {
-    lines.push(`${index + 1}. ${group.name}`);
-    const metadata = group.items.map(erpOrderItemMetadata);
-    const sharedMetadata = metadata.every((value) => value === metadata[0]);
-    if (sharedMetadata) {
-      for (const item of group.items) lines.push(`   ${erpOrderItemDisplay(item)}`);
-      lines.push(`   ${metadata[0]}`);
-      continue;
-    }
-    for (const [itemIndex, item] of group.items.entries()) {
-      lines.push(`   ${erpOrderItemDisplay(item)}｜${metadata[itemIndex]}`);
-    }
+  if (!order) return `🔎 查無訂單「${lookup.query.slice(0, 160)}」\n${updatedLine}`;
+  const view = selectErpOrderView(order, lookup);
+  if (view.kind !== "summary") {
+    return createErpOrderSelectionMessage(order, view, lookup, updatedLine);
   }
-  if (itemGroups.length > 12) lines.push(`…另有 ${itemGroups.length - 12} 款未顯示`);
-  if (order.cancelReason) lines.push(`取消原因：${order.cancelReason}`);
-  lines.push(updatedLine);
-  return joinErpOrderMessageLines(lines);
+  return createErpOrderSummaryMessage(order, view, updatedLine);
 }
 
 function warehouseUnitCostText(item) {
@@ -2965,14 +3269,60 @@ export class LineActivation {
     if (!Array.isArray(body?.orders)) {
       return Response.json({ ok: false, error: "INVALID_ORDER_DATA" }, { status: 400 });
     }
+    if (body.orders.length > 20000) {
+      return Response.json({
+        ok: false,
+        error: "ORDER_LIMIT_EXCEEDED",
+        limit: 20000,
+        received: body.orders.length,
+      }, { status: 413 });
+    }
+    if (!body.orders.length) {
+      return Response.json({ ok: false, error: "EMPTY_ORDER_DATA" }, { status: 400 });
+    }
     const byTransaction = new Map();
-    for (const rawOrder of body.orders.slice(0, 20000)) {
+    for (let index = 0; index < body.orders.length; index += 1) {
+      const rawOrder = body.orders[index];
       const order = normalizeErpOrder(rawOrder);
-      if (order) byTransaction.set(order.transactionNo, order);
+      if (!order) {
+        return Response.json({
+          ok: false,
+          error: "INVALID_ORDER_DATA",
+          index,
+        }, { status: 400 });
+      }
+      if (order.aliasLimitExceeded) {
+        return Response.json({
+          ok: false,
+          error: "ORDER_ALIAS_LIMIT_EXCEEDED",
+          transactionNo: order.transactionNo,
+          limit: erpOrderMaxAliases,
+        }, { status: 413 });
+      }
+      if (byTransaction.has(order.transactionNo)) {
+        return Response.json({
+          ok: false,
+          error: "DUPLICATE_TRANSACTION",
+          transactionNo: order.transactionNo,
+        }, { status: 409 });
+      }
+      byTransaction.set(order.transactionNo, order);
     }
     const orders = [...byTransaction.values()].sort((a, b) =>
       a.transactionNo.localeCompare(b.transactionNo, "en", { numeric: true })
     );
+    for (const order of orders) {
+      const entryBytes = encoder.encode(JSON.stringify({ [order.transactionNo]: order })).byteLength;
+      if (entryBytes > erpOrderChunkTargetBytes) {
+        return Response.json({
+          ok: false,
+          error: "ORDER_TOO_LARGE",
+          transactionNo: order.transactionNo,
+          limitBytes: erpOrderChunkTargetBytes,
+          receivedBytes: entryBytes,
+        }, { status: 413 });
+      }
+    }
     const chunks = buildErpOrderChunks(orders);
     const chunkByTransaction = new Map();
     chunks.forEach((chunk, index) => {
@@ -2984,8 +3334,29 @@ export class LineActivation {
       const chunkIndex = chunkByTransaction.get(order.transactionNo);
       for (const alias of order.aliases) {
         const bucket = aliases[warehouseLocationBucket(alias, erpOrderAliasBucketCount)];
-        if (!bucket[alias]) aliasCount += 1;
+        const existing = bucket[alias];
+        if (existing && existing.transactionNo !== order.transactionNo) {
+          return Response.json({
+            ok: false,
+            error: "ORDER_ALIAS_COLLISION",
+            alias,
+            transactionNos: [existing.transactionNo, order.transactionNo],
+          }, { status: 409 });
+        }
+        if (!existing) aliasCount += 1;
         bucket[alias] = { transactionNo: order.transactionNo, chunkIndex };
+      }
+    }
+    for (let index = 0; index < aliases.length; index += 1) {
+      const receivedBytes = encoder.encode(JSON.stringify(aliases[index])).byteLength;
+      if (receivedBytes > erpOrderChunkTargetBytes) {
+        return Response.json({
+          ok: false,
+          error: "ORDER_ALIAS_BUCKET_TOO_LARGE",
+          bucketIndex: index,
+          limitBytes: erpOrderChunkTargetBytes,
+          receivedBytes,
+        }, { status: 413 });
       }
     }
     const previous = await this.storage.get("erp-order-active");
@@ -3026,8 +3397,15 @@ export class LineActivation {
 
   async resolveErpOrderWarehouseSkus(order) {
     const items = Array.isArray(order?.items) ? order.items : [];
+    const printableOrders = Array.isArray(order?.printableOrders) ? order.printableOrders : null;
+    const allItems = [
+      ...items,
+      ...(printableOrders ? printableOrders.flatMap((printable) =>
+        Array.isArray(printable?.items) ? printable.items : []
+      ) : []),
+    ];
     const metadata = await this.storage.get("warehouse-location-active");
-    if (!items.length || !metadata?.version) return order;
+    if (!allItems.length || !metadata?.version) return order;
     const warehouseUpdatedAt = Date.parse(String(metadata.updatedAt || ""));
     const warehouseName = String(metadata.warehouseName || "").replace(/\s+/g, "").trim();
     const warehouseIsCurrentMain = Number(metadata.warehouseId) === 1
@@ -3036,8 +3414,8 @@ export class LineActivation {
       && Date.now() - warehouseUpdatedAt <= erpOrderMaxSnapshotAgeMs
       && warehouseUpdatedAt <= Date.now() + 5 * 60_000;
     if (!warehouseIsCurrentMain) return order;
-    const directSkus = new Set(items.map((item) => normalizeWarehouseSku(item?.sku)).filter(Boolean));
-    const unresolvedNames = new Set(items
+    const directSkus = new Set(allItems.map((item) => normalizeWarehouseSku(item?.sku)).filter(Boolean));
+    const unresolvedNames = new Set(allItems
       .map((item) => normalizeWarehouseSearchText(item?.name))
       .filter(Boolean));
     const skusByName = new Map([...unresolvedNames].map((name) => [name, new Set()]));
@@ -3081,19 +3459,27 @@ export class LineActivation {
       const bucket = buckets.get(warehouseLocationBucket(sku, bucketCount));
       return [sku, bucket && typeof bucket === "object" ? bucket[sku] || null : null];
     }));
-    return {
-      ...order,
-      items: items.map((item) => {
-        const directSku = normalizeWarehouseSku(item?.sku);
-        const directItem = directSku ? warehouseItems.get(directSku) : null;
-        const candidateItems = directItem
-          ? [directItem]
-          : [...(skusByName.get(normalizeWarehouseSearchText(item?.name)) || [])]
-            .map((sku) => warehouseItems.get(sku))
-            .filter(Boolean);
-        return resolveErpOrderItemWarehouseDetails(item, candidateItems);
-      }),
+    const resolveItem = (item) => {
+      const directSku = normalizeWarehouseSku(item?.sku);
+      const directItem = directSku ? warehouseItems.get(directSku) : null;
+      const candidateItems = directItem
+        ? [directItem]
+        : [...(skusByName.get(normalizeWarehouseSearchText(item?.name)) || [])]
+          .map((sku) => warehouseItems.get(sku))
+          .filter(Boolean);
+      return resolveErpOrderItemWarehouseDetails(item, candidateItems);
     };
+    const resolvedOrder = {
+      ...order,
+      items: items.map(resolveItem),
+    };
+    if (printableOrders) {
+      resolvedOrder.printableOrders = printableOrders.map((printable) => ({
+        ...printable,
+        items: (Array.isArray(printable?.items) ? printable.items : []).map(resolveItem),
+      }));
+    }
+    return resolvedOrder;
   }
 
   async queryErpOrder(request) {
@@ -3112,14 +3498,18 @@ export class LineActivation {
       const chunk = await this.storage.get(
         `erp-order:${metadata.version}:${Math.max(0, Number(location.chunkIndex) || 0)}`,
       );
-      const order = chunk && typeof chunk === "object" ? chunk[location.transactionNo] || null : null;
-      if (order) {
-        return Response.json({
-          ok: true,
-          order: await this.resolveErpOrderWarehouseSkus(order),
-          metadata,
-        });
+      const rawOrder = chunk && typeof chunk === "object"
+        ? chunk[location.transactionNo] || null
+        : null;
+      const order = normalizeStoredErpOrder(rawOrder, location.transactionNo, alias);
+      if (!order) {
+        return Response.json({ ok: false, error: "UNSAFE_STORED_ORDER" }, { status: 503 });
       }
+      return Response.json({
+        ok: true,
+        order: await this.resolveErpOrderWarehouseSkus(order),
+        metadata,
+      });
     }
     return Response.json({ ok: true, order: null, metadata });
   }
@@ -3791,14 +4181,15 @@ async function bindLineOrderLookupUser(event, bindToken, env) {
   return result;
 }
 
-async function erpOrderRequest(env, query) {
+async function erpOrderRequest(env, lookup) {
   if (!env.LINE_ACTIVATION) throw httpError("ERP 訂單查詢服務尚未設定", 503);
+  const normalizedLookup = normalizeErpOrderLookupRequest(lookup);
   const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
     "https://line-schedule/erp-orders/query",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({ query: normalizedLookup.query }),
     },
   );
   if (!response.ok) throw httpError("ERP 訂單查詢暫時無法使用", 503);
@@ -4566,22 +4957,22 @@ async function processLineEvent(event, env) {
     return;
   }
 
-  const orderLookupQuery = parseLineOrderLookupCommand(text);
-  if (orderLookupQuery || isLineOrderPromptCommand(text)) {
+  const orderLookup = parseLineOrderLookupRequest(text);
+  if (orderLookup || isLineOrderPromptCommand(text)) {
     if (event.source?.type !== "user") return;
     if (!await lineOrderLookupAllowed(event, env)) {
       console.log("LINE_ORDER_LOOKUP", JSON.stringify({ authorized: false, sourceType: event.source?.type || "unknown" }));
       await replyLine(event.replyToken, "🔒 訂單查詢只限已授權的 LINE 私訊帳號使用。", env);
       return;
     }
-    if (!orderLookupQuery) {
+    if (!orderLookup) {
       await replyLine(event.replyToken, "請輸入出貨單右上角的訂單編號，例如：0350000-10747554", env);
       return;
     }
     try {
-      const result = await erpOrderRequest(env, orderLookupQuery);
+      const result = await erpOrderRequest(env, orderLookup);
       console.log("LINE_ORDER_LOOKUP", JSON.stringify({ authorized: true, hit: Boolean(result?.order) }));
-      await replyLine(event.replyToken, createErpOrderMessage(result, orderLookupQuery), env);
+      await replyLine(event.replyToken, createErpOrderMessage(result, orderLookup), env);
     } catch (error) {
       console.error("LINE order lookup error", error?.message || error);
       await replyLine(event.replyToken, `目前無法查詢 ERP 訂單：${error?.message || "請稍後再試"}`, env);
@@ -5096,6 +5487,7 @@ export {
   parseLineFollowup,
   parseLineOrderBindingCommand,
   parseLineOrderLookupCommand,
+  parseLineOrderLookupRequest,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
   parseWarehouseStorageLocationAvailabilityCommand,

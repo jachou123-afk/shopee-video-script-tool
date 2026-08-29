@@ -36,6 +36,7 @@ import worker, {
   parseLineFollowup,
   parseLineOrderBindingCommand,
   parseLineOrderLookupCommand,
+  parseLineOrderLookupRequest,
   parseWarehouseLocationDetailCommand,
   parseWarehouseLocationCommand,
   parseWarehouseStorageLocationAvailabilityCommand,
@@ -132,6 +133,22 @@ test("ERP order commands recognize the printed transaction number without captur
   assert.equal(parseLineOrderLookupCommand("10747554"), "10747554");
   assert.equal(parseLineOrderLookupCommand("A725"), "");
   assert.equal(normalizeErpOrderAlias("０３５００００－１０７４７５５４"), "0350000-10747554");
+  assert.deepEqual(parseLineOrderLookupRequest("全部 10747554"), {
+    query: "10747554",
+    mode: "all",
+    page: 1,
+  });
+  assert.deepEqual(parseLineOrderLookupRequest("訂單 10745675 第２頁"), {
+    query: "10745675",
+    mode: "auto",
+    page: 2,
+  });
+  assert.deepEqual(parseLineOrderLookupRequest("訂單 全部 0354000-10747956"), {
+    query: "0354000-10747956",
+    mode: "all",
+    page: 1,
+  });
+  assert.equal(parseLineOrderLookupRequest("全部"), null);
 });
 
 test("ERP order binding command accepts only an explicit private binding token", () => {
@@ -160,13 +177,16 @@ test("ERP order reply is operational only and fails closed for stale data", () =
       ],
     },
   }, "0350000-10747554", now);
-  assert.match(message, /訂單 0350000-10747554/);
+  assert.match(message, /📦 0350000-10747554/);
   assert.match(message, /260827EYQGCNGU/);
-  assert.match(message, /共 1 款／2 規格／180 件/);
-  assert.match(message, /糖果化妝包\n   A032-03 粉x100\n   A032-09 玫瑰紅x80/);
+  assert.match(message, /商品 1 款｜規格 2 項｜共 180 件｜總額 NT\$360/);
+  assert.match(message, /糖果化妝包\n   A032-03｜粉｜×100/);
+  assert.match(message, /A032-09｜玫瑰紅｜×80/);
   assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
-  assert.equal((message.match(/單價 NT\$2/gu) || []).length, 1);
-  assert.equal((message.match(/儲位 02-L09-03\/T2/gu) || []).length, 1);
+  assert.equal((message.match(/單價 NT\$2/gu) || []).length, 2);
+  assert.equal((message.match(/📍02-L09-03\/T2/gu) || []).length, 2);
+  assert.match(message, /小計 NT\$200/);
+  assert.match(message, /小計 NT\$160/);
   assert.doesNotMatch(message, /姓名|電話|地址/);
 
   const legacy = createErpOrderMessage({
@@ -178,7 +198,7 @@ test("ERP order reply is operational only and fails closed for stale data", () =
       items: [{ name: "糖果化妝包", style: "粉", quantity: 1, unitPrice: 2 }],
     },
   }, "10747554", now);
-  assert.match(legacy, /糖果化妝包\n   粉x1/);
+  assert.match(legacy, /糖果化妝包\n   未提供貨號｜粉｜×1/);
   assert.doesNotMatch(legacy, /undefined|null/);
 
   const stale = createErpOrderMessage({
@@ -203,8 +223,8 @@ test("ERP order reply keeps per-style prices and locations when a grouped produc
       ],
     },
   }, "10747554", now);
-  assert.match(message, /A032-03 粉x1｜儲位 A-01｜單價 NT\$2/);
-  assert.match(message, /A032-09 玫瑰紅x1｜儲位 B-02｜單價 NT\$3/);
+  assert.match(message, /A032-03｜粉｜×1\n   📍A-01｜單價 NT\$2｜小計 NT\$2/);
+  assert.match(message, /A032-09｜玫瑰紅｜×1\n   📍B-02｜單價 NT\$3｜小計 NT\$3/);
   assert.equal((message.match(/糖果化妝包/gu) || []).length, 1);
 });
 
@@ -238,10 +258,242 @@ test("ERP order reply aggregates unit rows into color quantities", () => {
     },
   }, "10747554", now);
 
-  assert.match(message, /共 1 款／2 規格／180 件/);
-  assert.match(message, /A032-03 粉x100/);
-  assert.match(message, /A032-09 玫瑰紅x80/);
-  assert.equal((message.match(/儲位 02-L09-03\/T2/gu) || []).length, 1);
+  assert.match(message, /商品 1 款｜規格 2 項｜共 180 件｜總額 NT\$1250/);
+  assert.match(message, /A032-03｜粉｜×100/);
+  assert.match(message, /A032-09｜玫瑰紅｜×80/);
+  assert.equal((message.match(/📍02-L09-03\/T2/gu) || []).length, 2);
+});
+
+test("ERP order reply selects one printable, lists ambiguous suffixes, and supports all mode", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const result = {
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10745675",
+      printableOrderNumbers: ["0354000-10745675", "0354001-10745675"],
+      platformOrderNumbers: [
+        "260828EXAMPLE-1",
+        "260828EXAMPLE-2",
+        "260828EXAMPLE-3",
+        "260828EXAMPLE-4",
+        "260828EXAMPLE-5",
+      ],
+      platform: "蝦皮購物",
+      status: "已出貨",
+      shippedAt: "2026/08/28 09:30",
+      createdAt: "2026/08/28 08:00",
+      totalQuantity: 3,
+      totalAmount: 28,
+      items: [
+        { sku: "A100-01", name: "測試商品", style: "粉", quantity: 1, unitPrice: 10, subtotalAmount: 8, warehouseArea: "01-L01-01" },
+        { sku: "A100-02", name: "測試商品", style: "藍", quantity: 2, unitPrice: 10, subtotalAmount: 20, warehouseArea: "01-L01-02" },
+      ],
+      printableOrders: [
+        {
+          number: "0354000-10745675",
+          subOrderNo: "035400010745675",
+          totalQuantity: 1,
+          subtotalAmount: 8,
+          items: [{ sku: "A100-01", name: "測試商品", style: "粉", quantity: 1, unitPrice: 10, subtotalAmount: 8, warehouseArea: "01-L01-01" }],
+        },
+        {
+          number: "0354001-10745675",
+          subOrderNo: "035400110745675",
+          totalQuantity: 2,
+          subtotalAmount: 20,
+          items: [{ sku: "A100-02", name: "測試商品", style: "藍", quantity: 2, unitPrice: 10, subtotalAmount: 20, warehouseArea: "01-L01-02" }],
+        },
+      ],
+    },
+  };
+
+  const precise = createErpOrderMessage(result, "0354000-10745675", now);
+  assert.match(precise, /📦 0354000-10745675/);
+  assert.match(precise, /平台：蝦皮購物/);
+  assert.match(precise, /平台單號：260828EXAMPLE-1、260828EXAMPLE-2、260828EXAMPLE-3（另 2 筆）/);
+  assert.doesNotMatch(precise, /260828EXAMPLE-4|260828EXAMPLE-5/);
+  assert.match(precise, /商品 1 款｜規格 1 項｜共 1 件｜本張商品小計 NT\$8/);
+  assert.match(precise, /整筆交易總計：NT\$28/);
+  assert.match(precise, /A100-01｜粉｜×1/);
+  assert.match(precise, /📍01-L01-01｜單價 NT\$10｜小計 NT\$8/);
+  assert.doesNotMatch(precise, /A100-02|01-L01-02/);
+  assert.match(precise, /建立：2026\/08\/28 08:00[\s\S]*ERP 更新/u);
+
+  const ambiguous = createErpOrderMessage(result, "10745675", now);
+  assert.match(ambiguous, /2 張完整出貨單/);
+  assert.match(ambiguous, /平台：蝦皮購物/);
+  assert.match(ambiguous, /1\. 0354000-10745675/);
+  assert.match(ambiguous, /2\. 0354001-10745675/);
+  assert.match(ambiguous, /查看整筆交易：全部 10745675/);
+  assert.doesNotMatch(ambiguous, /A100-01|A100-02/);
+
+  for (const lookup of [
+    { query: "10745675", mode: "all", page: 1 },
+    { query: "0354000-10745675", mode: "all", page: 1 },
+  ]) {
+    const all = createErpOrderMessage(result, lookup, now);
+    assert.match(all, /📦 全部訂單｜交易 10745675/);
+    assert.match(all, /商品 1 款｜規格 2 項｜共 3 件｜總額 NT\$28/);
+    assert.match(all, /A100-01｜粉｜×1/);
+    assert.match(all, /A100-02｜藍｜×2/);
+  }
+});
+
+test("ERP order reply shows a single printable from the suffix and paginates at twenty", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const metadata = { updatedAt: "2026-08-28T09:55:00+08:00" };
+  const one = {
+    metadata,
+    order: {
+      transactionNo: "10747956",
+      printableOrderNumbers: ["0354000-10747956"],
+      totalQuantity: 1,
+      totalAmount: 9,
+      items: [{ sku: "B001-01", name: "單一商品", style: "白", quantity: 1, unitPrice: 9 }],
+      printableOrders: [{
+        number: "0354000-10747956",
+        subOrderNo: "035400010747956",
+        totalQuantity: 1,
+        subtotalAmount: 9,
+        items: [{ sku: "B001-01", name: "單一商品", style: "白", quantity: 1, unitPrice: 9 }],
+      }],
+    },
+  };
+  const single = createErpOrderMessage(one, "10747956", now);
+  assert.match(single, /📦 0354000-10747956/);
+  assert.match(single, /共 1 件｜總額 NT\$9/);
+  assert.doesNotMatch(single, /整筆交易總計/);
+  assert.match(single, /B001-01｜白｜×1/);
+
+  const printableOrders = Array.from({ length: 45 }, (_, index) => ({
+    number: `0354${String(index).padStart(3, "0")}-10745675`,
+    subOrderNo: `0354${String(index).padStart(3, "0")}10745675`,
+    totalQuantity: 1,
+    subtotalAmount: 1,
+    items: [{ sku: `T${index}`, name: "分頁商品", style: String(index), quantity: 1, unitPrice: 1 }],
+  }));
+  const paged = {
+    metadata,
+    order: {
+      transactionNo: "10745675",
+      printableOrderNumbers: [...printableOrders].reverse().map((item) => item.number),
+      totalQuantity: 45,
+      totalAmount: 45,
+      items: [...printableOrders].reverse().flatMap((item) => item.items),
+      printableOrders: [...printableOrders].reverse(),
+    },
+  };
+  const page2 = createErpOrderMessage(paged, { query: "10745675", mode: "auto", page: 2 }, now);
+  assert.match(page2, /第 2\/3 頁/);
+  assert.match(page2, /21\. 0354020-10745675/);
+  assert.match(page2, /40\. 0354039-10745675/);
+  assert.doesNotMatch(page2, /0354019-10745675|0354040-10745675/);
+  assert.match(page2, /上一頁：訂單 10745675 第1頁/);
+  assert.match(page2, /下一頁：訂單 10745675 第3頁/);
+});
+
+test("legacy multi-printable snapshots wait for detail while all mode remains available", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const result = {
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10745675",
+      printableOrderNumbers: ["0354000-10745675", "0354001-10745675"],
+      printableOrders: [],
+      totalQuantity: 3,
+      totalAmount: 30,
+      items: [{ sku: "A100", name: "不得假裝精準", style: "混合", quantity: 3, unitPrice: 10 }],
+    },
+  };
+  for (const lookup of ["10745675", "0354000-10745675"]) {
+    const pending = createErpOrderMessage(result, lookup, now);
+    assert.match(pending, /訂單明細待更新/);
+    assert.match(pending, /無法安全判斷指定出貨單內容/);
+    assert.doesNotMatch(pending, /A100|不得假裝精準/);
+  }
+  const all = createErpOrderMessage(result, { query: "10745675", mode: "all", page: 1 }, now);
+  assert.match(all, /全部訂單｜交易 10745675/);
+  assert.match(all, /A100｜混合｜×3/);
+
+  const stale = createErpOrderMessage({
+    metadata: { updatedAt: "2026-08-28T09:00:00+08:00" },
+    order: {
+      ...result.order,
+      recipientName: "不得洩漏姓名",
+      printableOrders: [{
+        number: "0354000-10745675",
+        totalQuantity: 1,
+        subtotalAmount: 10,
+        recipientPhone: "0900000000",
+        items: [{ name: "不得洩漏商品", quantity: 1 }],
+      }],
+    },
+  }, "0354000-10745675", now);
+  assert.match(stale, /訂單查詢暫停/);
+  assert.doesNotMatch(stale, /不得洩漏|0900000000/);
+});
+
+test("truncated printable-order snapshots never claim the suffix list is complete", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const result = {
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10745676",
+      printableOrderNumbers: ["0354000-10745676", "0354001-10745676"],
+      printableOrdersTruncated: true,
+      printableOrders: [
+        {
+          number: "0354000-10745676",
+          totalQuantity: 1,
+          subtotalAmount: 10,
+          items: [{ sku: "A100", name: "第一張", quantity: 1, unitPrice: 10 }],
+        },
+        {
+          number: "0354001-10745676",
+          totalQuantity: 1,
+          subtotalAmount: 10,
+          items: [{ sku: "A101", name: "第二張", quantity: 1, unitPrice: 10 }],
+        },
+      ],
+      items: [],
+    },
+  };
+
+  const suffix = createErpOrderMessage(result, "10745676", now);
+  assert.match(suffix, /訂單明細待更新/);
+  assert.doesNotMatch(suffix, /第一張|第二張/);
+
+  const exact = createErpOrderMessage(result, "0354000-10745676", now);
+  assert.match(exact, /📦 0354000-10745676/);
+  assert.match(exact, /A100/);
+});
+
+test("ERP order reply keeps the ERP footer when a long item list is truncated", () => {
+  const now = Date.parse("2026-08-28T10:00:00+08:00");
+  const items = Array.from({ length: 20 }, (_, index) => ({
+    sku: `LONG-${String(index).padStart(2, "0")}`,
+    name: `很長的商品-${index}-${"測".repeat(220)}`,
+    style: `規格-${index}-${"長".repeat(100)}`,
+    quantity: 1,
+    unitPrice: 1,
+    subtotalAmount: 1,
+    warehouseArea: `01-L01-${String(index).padStart(2, "0")}/${"位".repeat(120)}`,
+  }));
+  const message = createErpOrderMessage({
+    metadata: { updatedAt: "2026-08-28T09:55:00+08:00" },
+    order: {
+      transactionNo: "10749999",
+      createdAt: "2026/08/28 08:00",
+      totalQuantity: 20,
+      totalAmount: 20,
+      items,
+    },
+  }, "10749999", now);
+
+  assert.ok(message.length <= 4900);
+  assert.match(message, /…內容過長，後續品項已省略/);
+  assert.match(message, /建立：2026\/08\/28 08:00\nERP 更新：/);
+  assert.match(message, /ERP 更新：2026\/08\/28\s09:55$/u);
 });
 
 test("warehouse location command accepts common LINE input forms", () => {
@@ -1430,6 +1682,32 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
           status: "已出貨",
           totalAmount: 1260,
           totalQuantity: 180,
+          printableOrders: [{
+            number: "０３５００００－１０７４７５５４",
+            subOrderNo: "035000010747554",
+            totalQuantity: 180,
+            subtotalAmount: 1260,
+            recipientName: "巢狀資料也不應儲存",
+            items: [
+              {
+                sku: "A032-03",
+                name: "糖果化妝包",
+                style: "粉-1",
+                quantity: 100,
+                unitPrice: 7,
+                subtotalAmount: 700,
+                recipientPhone: "0900000000",
+              },
+              {
+                sku: "A032-09",
+                name: "糖果化妝包",
+                style: "玫瑰紅-1",
+                quantity: 80,
+                unitPrice: 7,
+                subtotalAmount: 560,
+              },
+            ],
+          }],
           items: [
             ...Array.from({ length: 100 }, () => ({
               orderNo: "SP1",
@@ -1439,6 +1717,7 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
               style: "粉-1",
               quantity: 1,
               unitPrice: 7,
+              subtotalAmount: 7,
             })),
             ...Array.from({ length: 80 }, () => ({
               orderNo: "SP2",
@@ -1448,6 +1727,7 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
               style: "玫瑰紅-1",
               quantity: 1,
               unitPrice: 7,
+              subtotalAmount: 7,
             })),
           ],
         },
@@ -1455,6 +1735,13 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
           transactionNo: "10747555",
           totalQuantity: 1,
           items: [{ sku: "UNKNOWN-03", name: "糖果化妝包", style: "粉-1", quantity: 1, unitPrice: 2 }],
+          printableOrderNumbers: ["0350000-10747555"],
+          printableOrders: [{
+            number: "0350000-10747555",
+            totalQuantity: 1,
+            subtotalAmount: 2,
+            items: [{ sku: "", name: "糖果化妝包", style: "粉-1", quantity: 1, unitPrice: 2 }],
+          }],
         },
         {
           transactionNo: "10747556",
@@ -1466,6 +1753,20 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
             quantity: 1,
             unitPrice: 2,
             warehouseArea: "ORDER-LOCK",
+          }],
+          printableOrderNumbers: ["0350000-10747556"],
+          printableOrders: [{
+            number: "0350000-10747556",
+            totalQuantity: 1,
+            subtotalAmount: 2,
+            items: [{
+              sku: "A032-03",
+              name: "糖果化妝包",
+              style: "粉-1",
+              quantity: 1,
+              unitPrice: 2,
+              warehouseArea: "ORDER-LOCK",
+            }],
           }],
         },
       ],
@@ -1485,16 +1786,37 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
     assert.equal(data.order.items.length, 2);
     assert.deepEqual(data.order.items.map((item) => item.sku), ["A032-03", "A032-09"]);
     assert.deepEqual(data.order.items.map((item) => item.quantity), [100, 80]);
+    assert.deepEqual(data.order.items.map((item) => item.subtotalAmount), [700, 560]);
     assert.deepEqual(data.order.items.map((item) => item.style), ["粉-1", "玫瑰紅-1"]);
     assert.deepEqual(data.order.items.map((item) => item.displayStyle), ["粉", "玫瑰紅"]);
     assert.deepEqual(data.order.items.map((item) => item.warehouseArea), ["02-L09-03/T2", "02-L09-03/T2"]);
-    assert.doesNotMatch(JSON.stringify(data.order), /不應儲存|0912345678/);
+    assert.equal(data.order.printableOrders[0].number, "0350000-10747554");
+    assert.deepEqual(data.order.printableOrders[0].items.map((item) => item.displayStyle), ["粉", "玫瑰紅"]);
+    assert.deepEqual(data.order.printableOrders[0].items.map((item) => item.warehouseArea), ["02-L09-03/T2", "02-L09-03/T2"]);
+    assert.deepEqual(data.order.printableOrders[0].items.map((item) => item.subtotalAmount), [700, 560]);
+    assert.doesNotMatch(JSON.stringify(data.order), /不應儲存|0912345678|巢狀資料|0900000000/);
   }
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: "9999999-10747554" }),
+  }));
+  data = await response.json();
+  assert.equal(data.order, null);
   const reply = createErpOrderMessage(data, "0350000-10747554", Date.now());
-  assert.match(reply, /A032-03 粉x100/);
-  assert.match(reply, /A032-09 玫瑰紅x80/);
-  assert.equal((reply.match(/儲位 02-L09-03\/T2/gu) || []).length, 1);
-  assert.equal((reply.match(/單價 NT\$7/gu) || []).length, 1);
+  assert.match(reply, /查無訂單/);
+
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: "0350000-10747554" }),
+  }));
+  data = await response.json();
+  const exactReply = createErpOrderMessage(data, "0350000-10747554", Date.now());
+  assert.match(exactReply, /A032-03｜粉｜×100/);
+  assert.match(exactReply, /A032-09｜玫瑰紅｜×80/);
+  assert.equal((exactReply.match(/📍02-L09-03\/T2/gu) || []).length, 2);
+  assert.equal((exactReply.match(/單價 NT\$7/gu) || []).length, 2);
+  assert.match(exactReply, /A032-03｜粉｜×100\n   📍02-L09-03\/T2｜單價 NT\$7｜小計 NT\$700/);
+  assert.match(exactReply, /A032-09｜玫瑰紅｜×80\n   📍02-L09-03\/T2｜單價 NT\$7｜小計 NT\$560/);
 
   response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
     method: "POST",
@@ -1505,6 +1827,9 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
   assert.equal(data.order.items[0].style, "粉-1");
   assert.equal(data.order.items[0].displayStyle, undefined);
   assert.equal(data.order.items[0].warehouseArea, "");
+  assert.equal(data.order.printableOrders[0].items[0].sku, "");
+  assert.equal(data.order.printableOrders[0].items[0].displayStyle, undefined);
+  assert.equal(data.order.printableOrders[0].items[0].warehouseArea, "");
 
   response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
     method: "POST",
@@ -1513,6 +1838,8 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
   data = await response.json();
   assert.equal(data.order.items[0].sku, "A032-03");
   assert.equal(data.order.items[0].warehouseArea, "ORDER-LOCK");
+  assert.equal(data.order.printableOrders[0].items[0].sku, "A032-03");
+  assert.equal(data.order.printableOrders[0].items[0].warehouseArea, "ORDER-LOCK");
 
   const currentWarehouseMetadata = values.get("warehouse-location-active");
   values.set("warehouse-location-active", {
@@ -1538,6 +1865,207 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
   }));
   data = await response.json();
   assert.deepEqual(data.order.items.map((item) => item.warehouseArea), ["", ""]);
+});
+
+test("LineActivation rejects unsafe ERP order snapshots before replacing the active version", async () => {
+  const stableMetadata = {
+    version: "stable-version",
+    orderCount: 1,
+    aliasCount: 1,
+    chunkCount: 1,
+    aliasBucketCount: 128,
+    updatedAt: "2026-08-28T09:55:00+08:00",
+  };
+  const values = new Map([
+    ["erp-order-active", stableMetadata],
+    ["erp-order:stable-version:0", { 10740000: { transactionNo: "10740000" } }],
+  ]);
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const expectedEntries = structuredClone([...values.entries()]);
+  const sync = (orders) => object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({ updatedAt: new Date().toISOString(), orders }),
+  }));
+
+  let response = await sync(Array.from({ length: 20001 }, (_, index) => ({
+    transactionNo: String(10750000 + index),
+  })));
+  let data = await response.json();
+  assert.equal(response.status, 413);
+  assert.equal(data.error, "ORDER_LIMIT_EXCEEDED");
+  assert.equal(data.received, 20001);
+  assert.deepEqual([...values.entries()], expectedEntries);
+
+  response = await sync([]);
+  data = await response.json();
+  assert.equal(response.status, 400);
+  assert.equal(data.error, "EMPTY_ORDER_DATA");
+  assert.deepEqual([...values.entries()], expectedEntries);
+
+  response = await sync([{ transactionNo: "not-a-transaction" }]);
+  data = await response.json();
+  assert.equal(response.status, 400);
+  assert.equal(data.error, "INVALID_ORDER_DATA");
+  assert.equal(data.index, 0);
+  assert.deepEqual([...values.entries()], expectedEntries);
+
+  response = await sync([
+    { transactionNo: "10740001", items: [{ sku: "A1", name: "第一份", quantity: 1, unitPrice: 1 }] },
+    { transactionNo: "10740001", items: [{ sku: "A2", name: "第二份", quantity: 1, unitPrice: 1 }] },
+  ]);
+  data = await response.json();
+  assert.equal(response.status, 409);
+  assert.equal(data.error, "DUPLICATE_TRANSACTION");
+  assert.equal(data.transactionNo, "10740001");
+  assert.deepEqual([...values.entries()], expectedEntries);
+
+  response = await sync([{
+    transactionNo: "10740001",
+    items: Array.from({ length: 251 }, (_, index) => ({
+      orderNo: `ORDER-${String(index).padStart(3, "0")}`,
+      subOrderNo: `SUB-${String(index).padStart(3, "0")}`,
+      sku: "A100",
+      name: "別名上限測試",
+      style: "同規格",
+      quantity: 1,
+      unitPrice: 1,
+    })),
+  }]);
+  data = await response.json();
+  assert.equal(response.status, 413);
+  assert.equal(data.error, "ORDER_ALIAS_LIMIT_EXCEEDED");
+  assert.equal(data.limit, 500);
+  assert.deepEqual([...values.entries()], expectedEntries);
+
+  const oversizedItems = (prefix) => Array.from({ length: 100 }, (_, index) => ({
+    orderNo: `${prefix}-ORDER-${index}`,
+    subOrderNo: `${prefix}-SUB-${index}`,
+    sku: `${prefix}-${index}`,
+    name: `${prefix}-${index}-${"測".repeat(230)}`,
+    style: `${index}-${"長".repeat(115)}`,
+    quantity: 1,
+    unitPrice: 1,
+    subtotalAmount: 1,
+    warehouseArea: `01-L01-01/${"位".repeat(145)}`,
+  }));
+  response = await sync([{
+    transactionNo: "10740001",
+    printableOrderNumbers: ["0354000-10740001"],
+    items: oversizedItems("PARENT"),
+    printableOrders: [{
+      number: "0354000-10740001",
+      subOrderNo: "035400010740001",
+      totalQuantity: 100,
+      subtotalAmount: 100,
+      items: oversizedItems("PRINT"),
+    }],
+  }]);
+  data = await response.json();
+  assert.equal(response.status, 413);
+  assert.equal(data.error, "ORDER_TOO_LARGE");
+  assert.equal(data.transactionNo, "10740001");
+  assert.ok(data.receivedBytes > data.limitBytes);
+  assert.deepEqual([...values.entries()], expectedEntries);
+
+  response = await sync([
+    { transactionNo: "10740002", platformOrderNumbers: ["PLATFORM-DUPLICATE"] },
+    { transactionNo: "10740003", platformOrderNumbers: ["PLATFORM-DUPLICATE"] },
+  ]);
+  data = await response.json();
+  assert.equal(response.status, 409);
+  assert.equal(data.error, "ORDER_ALIAS_COLLISION");
+  assert.equal(data.alias, "PLATFORM-DUPLICATE");
+  assert.deepEqual(data.transactionNos, ["10740002", "10740003"]);
+  assert.deepEqual([...values.entries()], expectedEntries);
+
+  const crowdedAliases = [];
+  for (let candidate = 0; crowdedAliases.length < 600; candidate += 1) {
+    const alias = `BUCKET-${String(candidate).padStart(7, "0")}-${"X".repeat(130)}`;
+    if (warehouseLocationBucket(alias, 128) === 0) crowdedAliases.push(alias);
+  }
+  response = await sync(crowdedAliases.map((alias, index) => ({
+    transactionNo: String(10800000 + index),
+    platformOrderNumbers: [alias],
+  })));
+  data = await response.json();
+  assert.equal(response.status, 413);
+  assert.equal(data.error, "ORDER_ALIAS_BUCKET_TOO_LARGE");
+  assert.equal(data.bucketIndex, 0);
+  assert.ok(data.receivedBytes > data.limitBytes);
+  assert.deepEqual([...values.entries()], expectedEntries);
+});
+
+test("LineActivation re-sanitizes legacy stored orders and fails closed on corrupt records", async () => {
+  const version = "legacy-order-version";
+  const transactionNo = "10748888";
+  const aliasBucket = warehouseLocationBucket(transactionNo, 128);
+  const values = new Map([
+    ["erp-order-active", {
+      version,
+      orderCount: 1,
+      aliasCount: 1,
+      chunkCount: 1,
+      aliasBucketCount: 128,
+      updatedAt: "2026-08-28T09:55:00+08:00",
+    }],
+    [`erp-order-alias:${version}:${aliasBucket}`, {
+      [transactionNo]: { transactionNo, chunkIndex: 0 },
+    }],
+    [`erp-order:${version}:0`, {
+      [transactionNo]: {
+        transactionNo,
+        platform: "蝦皮購物",
+        recipientName: "不應回傳的姓名",
+        recipientPhone: "0912345678",
+        recipientAddress: "不應回傳的地址",
+        unknownTopLevel: "不應回傳",
+        items: [{
+          sku: "A100",
+          name: "安全商品",
+          quantity: 1,
+          unitPrice: 10,
+          recipientName: "巢狀姓名",
+          unknownItemField: "不應回傳",
+        }],
+      },
+    }],
+  ]);
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const query = () => object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: transactionNo }),
+  }));
+
+  let response = await query();
+  let data = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(data.order.transactionNo, transactionNo);
+  assert.equal(data.order.items[0].name, "安全商品");
+  assert.doesNotMatch(
+    JSON.stringify(data.order),
+    /不應回傳|0912345678|巢狀姓名|recipientName|recipientPhone|recipientAddress|unknown/u,
+  );
+
+  values.set(`erp-order:${version}:0`, {
+    [transactionNo]: { transactionNo: "INVALID", recipientName: "仍不可洩漏" },
+  });
+  response = await query();
+  data = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(data.error, "UNSAFE_STORED_ORDER");
+  assert.doesNotMatch(JSON.stringify(data), /仍不可洩漏/u);
 });
 
 test("LineActivation binds the real LINE webhook user with a one-time token and stores only hashes", async () => {
