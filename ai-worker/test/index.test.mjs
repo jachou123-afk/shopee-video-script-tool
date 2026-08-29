@@ -2145,6 +2145,8 @@ test("LineActivation keeps a short-lived private order-number selection without 
       body: JSON.stringify({ userId: selectedUserId, index, now }),
     },
   ));
+  const selectionKeys = () => [...values.keys()]
+    .filter((key) => key.startsWith("line-order-recent-selection:"));
 
   let response = await saveSelection({ userId: otherUserId });
   assert.equal(response.status, 403);
@@ -2177,6 +2179,13 @@ test("LineActivation keeps a short-lived private order-number selection without 
 
   await saveSelection();
   values.set("erp-order-active", { version: "snapshot-v2", updatedAt: new Date().toISOString() });
+  response = await saveSelection();
+  assert.equal(response.status, 409);
+  assert.equal(selectionKeys().length, 0, "a failed replacement must remove the previous context");
+
+  response = await saveSelection({ snapshotVersion: "snapshot-v2" });
+  assert.equal(response.status, 200);
+  values.set("erp-order-active", { version: "snapshot-v3", updatedAt: new Date().toISOString() });
   response = await resolveSelection(1);
   data = await response.json();
   assert.equal(data.found, false);
@@ -2247,6 +2256,18 @@ test("a bare number after an ambiguous order list opens that exact printable ins
     method: "POST",
     body: JSON.stringify({ userId, bindToken: "Choose_7kP3m9" }),
   }));
+  const printableOrders = Array.from({ length: 16 }, (_, index) => ({
+    number: `035${String(index).padStart(4, "0")}-10745966`,
+    totalQuantity: 1,
+    subtotalAmount: 25,
+    items: [{
+      sku: `A${100 + index}-01`,
+      name: `第 ${index + 1} 張商品`,
+      quantity: 1,
+      unitPrice: 25,
+      subtotalAmount: 25,
+    }],
+  }));
   let response = await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
     method: "POST",
     body: JSON.stringify({
@@ -2254,27 +2275,11 @@ test("a bare number after an ambiguous order list opens that exact printable ins
       orders: [{
         transactionNo: "10745966",
         platform: "蝦皮購物",
-        totalQuantity: 2,
-        totalAmount: 50,
-        printableOrderNumbers: ["0350001-10745966", "0350000-10745966"],
-        items: [
-          { sku: "A100-01", name: "第一張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 },
-          { sku: "A200-01", name: "第二張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 },
-        ],
-        printableOrders: [
-          {
-            number: "0350001-10745966",
-            totalQuantity: 1,
-            subtotalAmount: 25,
-            items: [{ sku: "A200-01", name: "第二張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 }],
-          },
-          {
-            number: "0350000-10745966",
-            totalQuantity: 1,
-            subtotalAmount: 25,
-            items: [{ sku: "A100-01", name: "第一張商品", quantity: 1, unitPrice: 25, subtotalAmount: 25 }],
-          },
-        ],
+        totalQuantity: 16,
+        totalAmount: 400,
+        printableOrderNumbers: [...printableOrders].reverse().map((item) => item.number),
+        items: [...printableOrders].reverse().flatMap((item) => item.items),
+        printableOrders: [...printableOrders].reverse(),
       }],
     }),
   }));
@@ -2306,6 +2311,7 @@ test("a bare number after an ambiguous order list opens that exact printable ins
     await send("10745966", "order-list-1");
     assert.match(replies.at(-1).messages[0].text, /1\. 0350000-10745966/);
     assert.match(replies.at(-1).messages[0].text, /2\. 0350001-10745966/);
+    assert.match(replies.at(-1).messages[0].text, /11\. 0350010-10745966/);
     assert.match(replies.at(-1).messages[0].text, /直接輸入上方左側編號/);
     assert.equal(recentSelectionKeys().length, 1);
 
@@ -2315,13 +2321,33 @@ test("a bare number after an ambiguous order list opens that exact printable ins
 
     await send("10745966", "order-list-2");
     assert.equal(recentSelectionKeys().length, 1);
-    await send("2", "order-choice-2");
+    await send("11", "order-choice-11");
+    assert.match(replies.at(-1).messages[0].text, /📦 0350010-10745966/);
+    assert.match(replies.at(-1).messages[0].text, /A110-01/);
+    assert.doesNotMatch(replies.at(-1).messages[0].text, /A100-01|廣告影片排程|蝦皮廣告/u);
+    assert.equal(recentSelectionKeys().length, 0);
+
+    await send("10745966", "order-list-before-schedule");
+    assert.equal(recentSelectionKeys().length, 1);
+    await send("要拍什麼", "switch-to-schedule");
+    assert.equal(recentSelectionKeys().length, 0, "opening the Shopee schedule clears the order-number context");
+
+    await send("10745966", "order-list-before-expiry");
+    const selectionKey = recentSelectionKeys()[0];
+    const expiredRecord = values.get(selectionKey);
+    const expiredSavedAt = Date.now() - 5 * 60_000 - 1_000;
+    values.set(selectionKey, {
+      ...expiredRecord,
+      savedAt: expiredSavedAt,
+      expiresAt: expiredSavedAt + 5 * 60_000,
+    });
+    await send("1", "expired-order-choice");
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.match(replies.at(-1).messages[0].text, /📦 0350001-10745966/);
-  assert.match(replies.at(-1).messages[0].text, /A200-01/);
-  assert.doesNotMatch(replies.at(-1).messages[0].text, /A100-01|廣告影片排程|蝦皮廣告/u);
+  assert.match(replies.at(-1).messages[0].text, /出貨單選項已失效/);
+  assert.match(replies.at(-1).messages[0].text, /重新輸入 10745966/);
+  assert.doesNotMatch(replies.at(-1).messages[0].text, /廣告影片排程|蝦皮廣告/u);
   assert.equal(recentSelectionKeys().length, 0);
 });
 

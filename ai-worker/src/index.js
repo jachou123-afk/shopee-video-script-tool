@@ -3597,6 +3597,8 @@ export class LineActivation {
     if (!await this.erpOrderUserIsAuthorized(userId)) {
       return Response.json({ ok: false, error: "ORDER_SELECTION_NOT_AUTHORIZED" }, { status: 403 });
     }
+    const key = await lineOrderRecentSelectionStorageKey(userId);
+    await this.storage.delete(key);
     const savedAt = Number.isFinite(Number(body?.savedAt)) ? Number(body.savedAt) : Date.now();
     const record = normalizeErpOrderRecentSelectionRecord({
       snapshotVersion: body?.snapshotVersion,
@@ -3621,7 +3623,7 @@ export class LineActivation {
         limitBytes: erpOrderChunkTargetBytes,
       }, { status: 413 });
     }
-    await this.storage.put(await lineOrderRecentSelectionStorageKey(userId), record);
+    await this.storage.put(key, record);
     return Response.json({
       ok: true,
       saved: true,
@@ -3655,7 +3657,13 @@ export class LineActivation {
     const snapshotChanged = !metadata?.version || String(metadata.version) !== record.snapshotVersion;
     if (expired || snapshotChanged) {
       await this.storage.delete(key);
-      return Response.json({ ok: true, found: false, expired, snapshotChanged });
+      return Response.json({
+        ok: true,
+        found: false,
+        expired,
+        snapshotChanged,
+        transactionNo: record.transactionNo,
+      });
     }
     if (index > record.printableNumbers.length) {
       return Response.json({
@@ -4388,28 +4396,38 @@ async function erpOrderRequest(env, lookup) {
   return response.json();
 }
 
-async function updateLineOrderRecentSelection(event, result, lookup, env, now = Date.now()) {
+async function clearLineOrderRecentSelection(event, env) {
   if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) return false;
-  const context = erpOrderRecentSelectionContext(result, lookup, now);
-  const path = context
-    ? "/erp-orders/recent-selection/save"
-    : "/erp-orders/recent-selection/clear";
   const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
-    `https://line-schedule${path}`,
+    "https://line-schedule/erp-orders/recent-selection/clear",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(context
-        ? { userId: event.source.userId, ...context }
-        : { userId: event.source.userId }),
+      body: JSON.stringify({ userId: event.source.userId }),
     },
   );
   if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    console.error("LINE order recent selection update error", error?.error || response.status);
+    throw httpError("ERP 訂單選單暫時無法安全清除", 503);
+  }
+  return true;
+}
+
+async function updateLineOrderRecentSelection(event, result, lookup, env, now = Date.now()) {
+  if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) return false;
+  const context = erpOrderRecentSelectionContext(result, lookup, now);
+  if (!context) {
+    await clearLineOrderRecentSelection(event, env);
     return false;
   }
-  if (!context) return false;
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/erp-orders/recent-selection/save",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: event.source.userId, ...context }),
+    },
+  );
+  if (!response.ok) throw httpError("ERP 訂單選單暫時無法安全更新", 503);
   return Boolean((await response.json())?.saved);
 }
 
@@ -5175,6 +5193,15 @@ async function processLineEvent(event, env) {
         recentOrderSelectionIndex,
         env,
       );
+      if (selection?.expired || selection?.snapshotChanged) {
+        const reason = selection.snapshotChanged ? "ERP 訂單資料已更新" : "選單已超過 5 分鐘";
+        await replyLine(
+          event.replyToken,
+          `⌛ 剛才交易 ${selection.transactionNo} 的出貨單選項已失效（${reason}）。\n\n請重新輸入 ${selection.transactionNo}，再選一次編號。`,
+          env,
+        );
+        return;
+      }
       if (selection?.found) {
         if (!selection.valid) {
           await replyLine(
@@ -5238,17 +5265,12 @@ async function processLineEvent(event, env) {
     }
     try {
       const result = await erpOrderRequest(env, orderLookup);
-      let numericSelectionAvailable = false;
-      try {
-        numericSelectionAvailable = await updateLineOrderRecentSelection(
-          event,
-          result,
-          orderLookup,
-          env,
-        );
-      } catch (selectionError) {
-        console.error("LINE order recent selection update error", selectionError?.message || selectionError);
-      }
+      const numericSelectionAvailable = await updateLineOrderRecentSelection(
+        event,
+        result,
+        orderLookup,
+        env,
+      );
       console.log("LINE_ORDER_LOOKUP", JSON.stringify({ authorized: true, hit: Boolean(result?.order) }));
       await replyLine(
         event.replyToken,
@@ -5305,6 +5327,7 @@ async function processLineEvent(event, env) {
 
   if (isScheduleAddCommand(text)) {
     try {
+      await clearLineOrderRecentSelection(event, env);
       await addLineSchedule(event, text, env);
     } catch (error) {
       console.error("LINE schedule add error", error?.message || error);
@@ -5315,6 +5338,7 @@ async function processLineEvent(event, env) {
 
   if (isPendingScheduleCommand(text) || isCompletedScheduleCommand(text)) {
     try {
+      await clearLineOrderRecentSelection(event, env);
       await replyLineScheduleList(event, env, isCompletedScheduleCommand(text));
     } catch (error) {
       console.error("LINE schedule list error", error?.message || error);
@@ -5368,6 +5392,7 @@ async function processLineEvent(event, env) {
   const undoCompletedIndex = parseScheduleUndoCompletion(text);
   if (undoCompletedIndex) {
     try {
+      await clearLineOrderRecentSelection(event, env);
       await reopenLineScheduleItem(event, undoCompletedIndex, env);
     } catch (error) {
       console.error("LINE schedule reopen error", error?.message || error);
@@ -5379,6 +5404,7 @@ async function processLineEvent(event, env) {
   const completedIndex = parseScheduleCompletion(text);
   if (completedIndex) {
     try {
+      await clearLineOrderRecentSelection(event, env);
       await completeLineScheduleItem(event, completedIndex, env);
     } catch (error) {
       console.error("LINE schedule complete error", error?.message || error);
