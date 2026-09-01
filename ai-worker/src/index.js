@@ -42,6 +42,7 @@ const erpOrderMaxAliases = 500;
 const erpOrderPrintablePageSize = 20;
 const erpOrderSkuStatusPageSize = 10;
 const erpOrderRecentSelectionTtlMs = 5 * 60_000;
+const erpOrderSkuStatusSelectionTtlMs = 5_000;
 const erpOrderSkuAction = "erp_order_sku_lookup";
 const erpOrderSkuStatuses = Object.freeze(["新訂單", "可出貨", "出貨中"]);
 const warehousePositionWizardOptions = Object.freeze({
@@ -2031,19 +2032,92 @@ function erpOrderRecentSelectionContext(result, query, now = Date.now()) {
   };
 }
 
+function erpOrderSkuStatusSelectionContext(result, request, now = Date.now()) {
+  const lookup = normalizeErpOrderSkuStatusRequest(request);
+  const metadata = result?.metadata || null;
+  const snapshotVersion = String(metadata?.version || "").trim();
+  const updatedAt = Date.parse(String(metadata?.updatedAt || ""));
+  const stale = !Number.isFinite(updatedAt)
+    || Number(now) - updatedAt > erpOrderMaxSnapshotAgeMs
+    || updatedAt > Number(now) + 5 * 60_000;
+  const orders = Array.isArray(result?.orders) ? result.orders : [];
+  const page = Math.max(1, Number(result?.page) || lookup.page);
+  const queries = orders.map((order) => normalizeErpOrderAlias(order?.number));
+  if (
+    !snapshotVersion
+    || stale
+    || !lookup.sku
+    || !lookup.status
+    || !queries.length
+    || queries.length > erpOrderSkuStatusPageSize
+    || queries.some((query) => !/^(?:\d{7,12}|\d{4,10}-\d{6,12})$/u.test(query))
+    || new Set(queries).size !== queries.length
+  ) return null;
+  return {
+    kind: "sku-status",
+    snapshotVersion,
+    sku: lookup.sku,
+    status: lookup.status,
+    page,
+    firstIndex: (page - 1) * erpOrderSkuStatusPageSize + 1,
+    queries,
+    savedAt: Number(now),
+  };
+}
+
 function normalizeErpOrderRecentSelectionRecord(rawRecord) {
   const snapshotVersion = String(rawRecord?.snapshotVersion || "").trim();
-  const transactionNo = normalizeErpOrderAlias(rawRecord?.transactionNo).slice(0, 80);
-  const rawNumbers = Array.isArray(rawRecord?.printableNumbers)
-    ? rawRecord.printableNumbers
-    : [];
-  const printableNumbers = rawNumbers.map(normalizeErpOrderAlias);
+  const kind = rawRecord?.kind === "sku-status" ? "sku-status" : "transaction-list";
   const savedAt = Number(rawRecord?.savedAt);
   const expiresAt = Number(rawRecord?.expiresAt);
   if (
     !snapshotVersion
     || snapshotVersion.length > 160
-    || !/^\d{7,12}$/u.test(transactionNo)
+    || !Number.isFinite(savedAt)
+    || !Number.isFinite(expiresAt)
+    || expiresAt <= savedAt
+  ) return null;
+
+  if (kind === "sku-status") {
+    const sku = erpOrderSkuKeys(rawRecord?.sku)?.[0] || "";
+    const status = String(rawRecord?.status || "").normalize("NFKC").replace(/\s+/gu, "").trim();
+    const page = Number(rawRecord?.page);
+    const firstIndex = Number(rawRecord?.firstIndex);
+    const rawQueries = Array.isArray(rawRecord?.queries) ? rawRecord.queries : [];
+    const queries = rawQueries.map(normalizeErpOrderAlias);
+    if (
+      !sku
+      || !erpOrderSkuStatuses.includes(status)
+      || !Number.isInteger(page)
+      || page < 1
+      || !Number.isInteger(firstIndex)
+      || firstIndex !== (page - 1) * erpOrderSkuStatusPageSize + 1
+      || rawQueries.length < 1
+      || rawQueries.length > erpOrderSkuStatusPageSize
+      || queries.some((query) => !/^(?:\d{7,12}|\d{4,10}-\d{6,12})$/u.test(query))
+      || new Set(queries).size !== queries.length
+      || expiresAt - savedAt > erpOrderSkuStatusSelectionTtlMs
+    ) return null;
+    return {
+      kind,
+      snapshotVersion,
+      sku,
+      status,
+      page,
+      firstIndex,
+      queries,
+      savedAt,
+      expiresAt,
+    };
+  }
+
+  const transactionNo = normalizeErpOrderAlias(rawRecord?.transactionNo).slice(0, 80);
+  const rawNumbers = Array.isArray(rawRecord?.printableNumbers)
+    ? rawRecord.printableNumbers
+    : [];
+  const printableNumbers = rawNumbers.map(normalizeErpOrderAlias);
+  if (
+    !/^\d{7,12}$/u.test(transactionNo)
     || rawNumbers.length < 2
     || rawNumbers.length > erpOrderMaxPrintableOrders
     || printableNumbers.some((number) => (
@@ -2051,12 +2125,10 @@ function normalizeErpOrderRecentSelectionRecord(rawRecord) {
       || !number.endsWith(`-${transactionNo}`)
     ))
     || new Set(printableNumbers).size !== printableNumbers.length
-    || !Number.isFinite(savedAt)
-    || !Number.isFinite(expiresAt)
-    || expiresAt <= savedAt
     || expiresAt - savedAt > erpOrderRecentSelectionTtlMs
   ) return null;
   return {
+    kind,
     snapshotVersion,
     transactionNo,
     printableNumbers,
@@ -3803,12 +3875,21 @@ export class LineActivation {
     const key = await lineOrderRecentSelectionStorageKey(userId);
     await this.storage.delete(key);
     const savedAt = Number.isFinite(Number(body?.savedAt)) ? Number(body.savedAt) : Date.now();
+    const kind = body?.kind === "sku-status" ? "sku-status" : "transaction-list";
     const record = normalizeErpOrderRecentSelectionRecord({
+      kind,
       snapshotVersion: body?.snapshotVersion,
       transactionNo: body?.transactionNo,
       printableNumbers: body?.printableNumbers,
+      sku: body?.sku,
+      status: body?.status,
+      page: body?.page,
+      firstIndex: body?.firstIndex,
+      queries: body?.queries,
       savedAt,
-      expiresAt: savedAt + erpOrderRecentSelectionTtlMs,
+      expiresAt: savedAt + (kind === "sku-status"
+        ? erpOrderSkuStatusSelectionTtlMs
+        : erpOrderRecentSelectionTtlMs),
     });
     if (!record) {
       return Response.json({ ok: false, error: "INVALID_ORDER_SELECTION" }, { status: 400 });
@@ -3830,7 +3911,7 @@ export class LineActivation {
     return Response.json({
       ok: true,
       saved: true,
-      count: record.printableNumbers.length,
+      count: record.kind === "sku-status" ? record.queries.length : record.printableNumbers.length,
       expiresAt: record.expiresAt,
     });
   }
@@ -3865,28 +3946,44 @@ export class LineActivation {
         found: false,
         expired,
         snapshotChanged,
+        kind: record.kind,
         transactionNo: record.transactionNo,
+        sku: record.sku,
+        status: record.status,
       });
     }
-    if (index > record.printableNumbers.length) {
+    const firstIndex = record.kind === "sku-status" ? record.firstIndex : 1;
+    const selectableQueries = record.kind === "sku-status" ? record.queries : record.printableNumbers;
+    const lastIndex = firstIndex + selectableQueries.length - 1;
+    if (index < firstIndex || index > lastIndex) {
       return Response.json({
         ok: true,
         found: true,
         valid: false,
-        count: record.printableNumbers.length,
+        kind: record.kind,
+        count: selectableQueries.length,
+        firstIndex,
+        lastIndex,
         transactionNo: record.transactionNo,
+        sku: record.sku,
+        status: record.status,
       });
     }
-    const query = record.printableNumbers[index - 1];
+    const query = selectableQueries[index - firstIndex];
     await this.storage.delete(key);
     return Response.json({
       ok: true,
       found: true,
       valid: true,
+      kind: record.kind,
       query,
       index,
-      count: record.printableNumbers.length,
+      count: selectableQueries.length,
+      firstIndex,
+      lastIndex,
       transactionNo: record.transactionNo,
+      sku: record.sku,
+      status: record.status,
     });
   }
 
@@ -4692,6 +4789,7 @@ function createErpOrderSkuStatusMessage(result, request, now = Date.now()) {
     }
     if (order?.detailsIncomplete) lines.push("   ⚠️ 此筆逐張明細不完整，請用單號再查一次");
   });
+  if (orders.length) lines.push("", "⏱️ 5 秒內直接輸入上方編號，可查看完整訂單。");
   const partialCount = Math.max(0, Number(result?.partialCount) || 0);
   if (partialCount) lines.push("", `⚠️ 共 ${partialCount} 筆逐張明細尚未完整同步。`);
   lines.push("", updatedLine);
@@ -4791,7 +4889,13 @@ async function replyErpOrderSkuPostback(event, params, env) {
       totalCount: Number(result?.totalCount) || 0,
       page: Number(result?.page) || state.page,
     }));
-    await replyLine(event.replyToken, [createErpOrderSkuStatusMessage(result, state)], env);
+    const orders = Array.isArray(result?.orders) ? result.orders : [];
+    const message = createErpOrderSkuStatusMessage(result, state);
+    const selectionSaved = await updateLineOrderSkuStatusSelection(event, result, state, env);
+    if (orders.length && /5 秒內直接輸入上方編號/u.test(message.text) && !selectionSaved) {
+      throw httpError("訂單編號選單暫時無法安全啟用，請重新選擇狀態", 503);
+    }
+    await replyLine(event.replyToken, [message], env);
   } catch (error) {
     console.error("LINE order SKU status lookup error", error?.message || error);
     await replyLine(event.replyToken, `目前無法依貨號查詢 ERP 訂單：${error?.message || "請稍後再試"}`, env);
@@ -4830,6 +4934,25 @@ async function updateLineOrderRecentSelection(event, result, lookup, env, now = 
     },
   );
   if (!response.ok) throw httpError("ERP 訂單選單暫時無法安全更新", 503);
+  return Boolean((await response.json())?.saved);
+}
+
+async function updateLineOrderSkuStatusSelection(event, result, request, env, now = Date.now()) {
+  if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) return false;
+  const context = erpOrderSkuStatusSelectionContext(result, request, now);
+  if (!context) {
+    await clearLineOrderRecentSelection(event, env);
+    return false;
+  }
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/erp-orders/recent-selection/save",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: event.source.userId, ...context }),
+    },
+  );
+  if (!response.ok) throw httpError("ERP 訂單編號選單暫時無法安全更新", 503);
   return Boolean((await response.json())?.saved);
 }
 
@@ -5600,19 +5723,34 @@ async function processLineEvent(event, env) {
         env,
       );
       if (selection?.expired || selection?.snapshotChanged) {
-        const reason = selection.snapshotChanged ? "ERP 訂單資料已更新" : "選單已超過 5 分鐘";
+        const skuStatusSelection = selection.kind === "sku-status";
+        const reason = selection.snapshotChanged
+          ? "ERP 訂單資料已更新"
+          : skuStatusSelection ? "選單已超過 5 秒" : "選單已超過 5 分鐘";
+        const subject = skuStatusSelection
+          ? `${selection.sku || "貨號"}｜${selection.status || "訂單狀態"}`
+          : `交易 ${selection.transactionNo}`;
+        const retry = skuStatusSelection
+          ? "請重新選擇訂單狀態，再輸入編號。"
+          : `請重新輸入 ${selection.transactionNo}，再選一次編號。`;
         await replyLine(
           event.replyToken,
-          `⌛ 剛才交易 ${selection.transactionNo} 的出貨單選項已失效（${reason}）。\n\n請重新輸入 ${selection.transactionNo}，再選一次編號。`,
+          `⌛ 剛才 ${subject} 的出貨單選項已失效（${reason}）。\n\n${retry}`,
           env,
         );
         return;
       }
       if (selection?.found) {
         if (!selection.valid) {
+          const selectionRange = selection.firstIndex === selection.lastIndex
+            ? String(selection.firstIndex)
+            : `${selection.firstIndex}～${selection.lastIndex}`;
+          const selectionSubject = selection.kind === "sku-status"
+            ? `${selection.sku || "貨號"}｜${selection.status || "訂單狀態"}`
+            : `交易 ${selection.transactionNo} 共有 ${selection.count} 張完整出貨單`;
           await replyLine(
             event.replyToken,
-            `📦 交易 ${selection.transactionNo} 共有 ${selection.count} 張完整出貨單，請輸入 1～${selection.count}。`,
+            `📦 ${selectionSubject}，請輸入 ${selectionRange}。`,
             env,
           );
           return;

@@ -2271,6 +2271,47 @@ test("LineActivation keeps a short-lived private order-number selection without 
   response = await resolveSelection(2);
   assert.equal((await response.json()).found, false, "a successful number selection is one-time");
 
+  response = await saveSelection({
+    kind: "sku-status",
+    transactionNo: undefined,
+    printableNumbers: undefined,
+    sku: "A817",
+    status: "可出貨",
+    page: 2,
+    firstIndex: 11,
+    queries: ["0350010-10745966", "0350011-10745966"],
+  });
+  data = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(data.count, 2);
+  assert.equal(data.expiresAt, 6_000, "SKU status selections last exactly five seconds");
+  response = await resolveSelection(10, 5_999);
+  data = await response.json();
+  assert.equal(data.valid, false);
+  assert.equal(data.firstIndex, 11);
+  assert.equal(data.lastIndex, 12);
+  response = await resolveSelection(12, 5_999);
+  data = await response.json();
+  assert.equal(data.valid, true);
+  assert.equal(data.kind, "sku-status");
+  assert.equal(data.query, "0350011-10745966");
+
+  await saveSelection({
+    kind: "sku-status",
+    transactionNo: undefined,
+    printableNumbers: undefined,
+    sku: "A817",
+    status: "可出貨",
+    page: 1,
+    firstIndex: 1,
+    queries: ["0350000-10745966"],
+  });
+  response = await resolveSelection(1, 6_001);
+  data = await response.json();
+  assert.equal(data.found, false);
+  assert.equal(data.expired, true);
+  assert.equal(data.kind, "sku-status");
+
   await saveSelection();
   response = await resolveSelection(1, 1_000 + 5 * 60_000 + 1);
   data = await response.json();
@@ -2302,7 +2343,7 @@ test("a private bare SKU opens warehouse or authorized status-filtered order loo
       async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
       async delete(key) { values.delete(key); },
     },
-  });
+  }, { LINE_ORDER_ALLOWED_USER_IDS: "U-owner" });
   await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
     method: "POST",
     body: JSON.stringify({
@@ -2367,8 +2408,20 @@ test("a private bare SKU opens warehouse or authorized status-filtered order loo
     assert.match(result.text, /A817｜可出貨/);
     assert.match(result.text, /0350000-10761001/);
     assert.match(result.text, /A817-01｜炫彩吊飾｜紅色｜×2/);
+    assert.match(result.text, /5 秒內直接輸入上方編號/);
     assert.doesNotMatch(result.text, /不應回覆的姓名|0912345678/);
     assert.deepEqual(result.quickReply.items.map((item) => item.action.label), ["新訂單", "可出貨", "出貨中"]);
+
+    await processLineEvent({
+      type: "message",
+      replyToken: "sku-ready-selection",
+      source,
+      message: { type: "text", text: "1" },
+    }, env);
+    const selected = replies.at(-1).messages[0];
+    assert.match(selected.text, /📦 0350000-10761001/);
+    assert.match(selected.text, /A817-01｜紅色｜×2/);
+    assert.doesNotMatch(selected.text, /不應回覆的姓名|0912345678/);
 
     const orderButtonData = createErpOrderSkuChoiceMessage("A817").quickReply.items[1].action.data;
     await processLineEvent({
