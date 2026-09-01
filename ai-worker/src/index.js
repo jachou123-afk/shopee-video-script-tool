@@ -32,6 +32,7 @@ const warehouseStorageLocationPageSize = 10;
 const warehouseStorageLocationBucketCount = 64;
 const warehouseStorageLocationIndexChunkSize = 50;
 const erpOrderAliasBucketCount = 128;
+const erpOrderSkuStatusBucketCount = 128;
 const erpOrderChunkTargetBytes = 96 * 1024;
 const erpOrderMaxSnapshotAgeMs = 30 * 60_000;
 const erpOrderMaxInputItems = 20_000;
@@ -39,7 +40,10 @@ const erpOrderMaxStoredItems = 100;
 const erpOrderMaxPrintableOrders = 100;
 const erpOrderMaxAliases = 500;
 const erpOrderPrintablePageSize = 20;
+const erpOrderSkuStatusPageSize = 10;
 const erpOrderRecentSelectionTtlMs = 5 * 60_000;
+const erpOrderSkuAction = "erp_order_sku_lookup";
+const erpOrderSkuStatuses = Object.freeze(["新訂單", "可出貨", "出貨中"]);
 const warehousePositionWizardOptions = Object.freeze({
   zones: ["01", "02", "03", "04", "05", "06"],
   sides: ["L", "R"],
@@ -1373,6 +1377,70 @@ function normalizeErpOrderAlias(value) {
     .replace(/\s+/g, "")
     .replace(/[‐‑‒–—―]/g, "-")
     .slice(0, 160);
+}
+
+function erpOrderSkuKeys(value) {
+  const sku = normalizeWarehouseSku(value);
+  const isSku = /^(?=[A-Z0-9._-]{2,80}$)(?=[A-Z0-9._-]*[A-Z])(?=[A-Z0-9._-]*\d)[A-Z0-9._-]+$/u.test(sku);
+  if (!isSku) return [];
+  const keys = new Set([sku]);
+  const parent = sku.match(/^([A-Z]+\d+)[._-].+$/u)?.[1] || "";
+  if (parent) keys.add(parent);
+  return [...keys];
+}
+
+function normalizeErpOrderSkuStatusRequest(value) {
+  const sku = erpOrderSkuKeys(value?.sku)?.[0] || "";
+  const status = String(value?.status || "").normalize("NFKC").replace(/\s+/gu, "").trim();
+  return {
+    sku,
+    status: erpOrderSkuStatuses.includes(status) ? status : "",
+    page: Math.max(1, Math.trunc(Number(value?.page) || 1)),
+  };
+}
+
+function erpOrderSkuStatusIndexKey(status, sku) {
+  return `${status}\u001f${sku}`;
+}
+
+function erpOrderMatchesSku(item, sku) {
+  return erpOrderSkuKeys(item?.sku).includes(sku);
+}
+
+function erpOrderSkuStatusRows(order, sku) {
+  const base = {
+    transactionNo: order.transactionNo,
+    platform: order.platform,
+    status: order.status,
+    createdAt: order.createdAt,
+  };
+  const printableOrders = Array.isArray(order?.printableOrders) ? order.printableOrders : [];
+  const rows = [];
+  for (const printable of printableOrders) {
+    const matchedItems = collapseErpOrderItems(printable?.items)
+      .filter((item) => erpOrderMatchesSku(item, sku));
+    if (!matchedItems.length) continue;
+    rows.push({
+      ...base,
+      number: normalizeErpOrderAlias(printable?.number) || order.transactionNo,
+      matchedItems,
+      matchedQuantity: matchedItems.reduce((sum, item) => sum + (Number(item?.quantity) || 0), 0),
+      detailsIncomplete: Boolean(printable?.itemsTruncated || order?.printableOrdersTruncated),
+    });
+  }
+  if (rows.length) return rows;
+
+  const matchedItems = collapseErpOrderItems(order?.items)
+    .filter((item) => erpOrderMatchesSku(item, sku));
+  if (!matchedItems.length) return [];
+  const printableNumbers = erpOrderPrintableNumbers(order);
+  return [{
+    ...base,
+    number: printableNumbers.length === 1 ? printableNumbers[0] : order.transactionNo,
+    matchedItems,
+    matchedQuantity: matchedItems.reduce((sum, item) => sum + (Number(item?.quantity) || 0), 0),
+    detailsIncomplete: Boolean(order?.itemsTruncated || order?.printableOrdersTruncated || printableNumbers.length > 1),
+  }];
 }
 
 function erpOrderLookupCandidates(value) {
@@ -3389,7 +3457,9 @@ export class LineActivation {
       for (const transactionNo of Object.keys(chunk)) chunkByTransaction.set(transactionNo, index);
     });
     const aliases = Array.from({ length: erpOrderAliasBucketCount }, () => ({}));
+    const skuStatusBuckets = Array.from({ length: erpOrderSkuStatusBucketCount }, () => ({}));
     let aliasCount = 0;
+    let skuStatusEntryCount = 0;
     for (const order of orders) {
       const chunkIndex = chunkByTransaction.get(order.transactionNo);
       for (const alias of order.aliases) {
@@ -3406,6 +3476,22 @@ export class LineActivation {
         if (!existing) aliasCount += 1;
         bucket[alias] = { transactionNo: order.transactionNo, chunkIndex };
       }
+      if (erpOrderSkuStatuses.includes(order.status)) {
+        const orderSkuKeys = new Set([
+          ...(Array.isArray(order.items) ? order.items : []),
+          ...(Array.isArray(order.printableOrders)
+            ? order.printableOrders.flatMap((printable) => Array.isArray(printable?.items) ? printable.items : [])
+            : []),
+        ].flatMap((item) => erpOrderSkuKeys(item?.sku)));
+        for (const sku of orderSkuKeys) {
+          const indexKey = erpOrderSkuStatusIndexKey(order.status, sku);
+          const bucket = skuStatusBuckets[warehouseLocationBucket(indexKey, erpOrderSkuStatusBucketCount)];
+          const locations = Array.isArray(bucket[indexKey]) ? bucket[indexKey] : [];
+          locations.push([order.transactionNo, chunkIndex]);
+          bucket[indexKey] = locations;
+          skuStatusEntryCount += 1;
+        }
+      }
     }
     for (let index = 0; index < aliases.length; index += 1) {
       const receivedBytes = encoder.encode(JSON.stringify(aliases[index])).byteLength;
@@ -3413,6 +3499,18 @@ export class LineActivation {
         return Response.json({
           ok: false,
           error: "ORDER_ALIAS_BUCKET_TOO_LARGE",
+          bucketIndex: index,
+          limitBytes: erpOrderChunkTargetBytes,
+          receivedBytes,
+        }, { status: 413 });
+      }
+    }
+    for (let index = 0; index < skuStatusBuckets.length; index += 1) {
+      const receivedBytes = encoder.encode(JSON.stringify(skuStatusBuckets[index])).byteLength;
+      if (receivedBytes > erpOrderChunkTargetBytes) {
+        return Response.json({
+          ok: false,
+          error: "ORDER_SKU_STATUS_BUCKET_TOO_LARGE",
           bucketIndex: index,
           limitBytes: erpOrderChunkTargetBytes,
           receivedBytes,
@@ -3427,12 +3525,17 @@ export class LineActivation {
     for (let index = 0; index < aliases.length; index += 1) {
       await this.storage.put(`erp-order-alias:${version}:${index}`, aliases[index]);
     }
+    for (let index = 0; index < skuStatusBuckets.length; index += 1) {
+      await this.storage.put(`erp-order-sku-status:${version}:${index}`, skuStatusBuckets[index]);
+    }
     const metadata = {
       version,
       orderCount: orders.length,
       aliasCount,
       chunkCount: chunks.length,
       aliasBucketCount: erpOrderAliasBucketCount,
+      skuStatusBucketCount: erpOrderSkuStatusBucketCount,
+      skuStatusEntryCount,
       retentionDays: Math.min(365, Math.max(1, Number(body?.retentionDays) || 90)),
       updatedAt: String(body?.updatedAt || new Date().toISOString()).slice(0, 80),
     };
@@ -3446,11 +3549,16 @@ export class LineActivation {
       for (let index = 0; index < previousAliasCount; index += 1) {
         await this.storage.delete(`erp-order-alias:${previous.version}:${index}`);
       }
+      const previousSkuStatusCount = Math.min(512, Math.max(0, Number(previous.skuStatusBucketCount) || 0));
+      for (let index = 0; index < previousSkuStatusCount; index += 1) {
+        await this.storage.delete(`erp-order-sku-status:${previous.version}:${index}`);
+      }
     }
     return Response.json({
       ok: true,
       orderCount: metadata.orderCount,
       aliasCount: metadata.aliasCount,
+      skuStatusEntryCount: metadata.skuStatusEntryCount,
       updatedAt: metadata.updatedAt,
     });
   }
@@ -3572,6 +3680,101 @@ export class LineActivation {
       });
     }
     return Response.json({ ok: true, order: null, metadata });
+  }
+
+  async queryErpOrdersBySkuStatus(request) {
+    const lookup = normalizeErpOrderSkuStatusRequest(await request.json());
+    if (!lookup.sku || !lookup.status) {
+      return Response.json({ ok: false, error: "INVALID_ORDER_SKU_STATUS_QUERY" }, { status: 400 });
+    }
+    const metadata = await this.storage.get("erp-order-active");
+    if (!metadata?.version) {
+      return Response.json({
+        ok: true,
+        ...lookup,
+        orders: [],
+        totalCount: 0,
+        totalPages: 1,
+        metadata: metadata || null,
+      });
+    }
+
+    const storedOrders = [];
+    const seenTransactions = new Set();
+    const skuStatusBucketCount = Math.min(512, Math.max(0, Number(metadata.skuStatusBucketCount) || 0));
+    if (skuStatusBucketCount) {
+      const indexKey = erpOrderSkuStatusIndexKey(lookup.status, lookup.sku);
+      const bucket = await this.storage.get(
+        `erp-order-sku-status:${metadata.version}:${warehouseLocationBucket(indexKey, skuStatusBucketCount)}`,
+      );
+      const locations = bucket && typeof bucket === "object" && Array.isArray(bucket[indexKey])
+        ? bucket[indexKey]
+        : [];
+      const chunkIndexes = [...new Set(locations.map((location) => Math.max(0, Number(location?.[1]) || 0)))];
+      const chunks = new Map(await Promise.all(chunkIndexes.map(async (chunkIndex) => [
+        chunkIndex,
+        await this.storage.get(`erp-order:${metadata.version}:${chunkIndex}`),
+      ])));
+      for (const location of locations) {
+        const transactionNo = normalizeErpOrderAlias(location?.[0]).slice(0, 80);
+        if (!/^\d{7,12}$/u.test(transactionNo) || seenTransactions.has(transactionNo)) continue;
+        const chunkIndex = Math.max(0, Number(location?.[1]) || 0);
+        const chunk = chunks.get(chunkIndex);
+        const rawOrder = chunk && typeof chunk === "object" ? chunk[transactionNo] : null;
+        const order = normalizeStoredErpOrder(rawOrder, transactionNo, transactionNo);
+        if (!order) return Response.json({ ok: false, error: "UNSAFE_STORED_ORDER" }, { status: 503 });
+        seenTransactions.add(transactionNo);
+        storedOrders.push(order);
+      }
+    } else {
+      const chunkCount = Math.min(5000, Math.max(0, Number(metadata.chunkCount) || 0));
+      const chunks = await Promise.all(Array.from({ length: chunkCount }, (_, index) =>
+        this.storage.get(`erp-order:${metadata.version}:${index}`)
+      ));
+      for (const chunk of chunks) {
+        for (const [transactionNo, rawOrder] of Object.entries(
+          chunk && typeof chunk === "object" ? chunk : {},
+        )) {
+          const normalizedTransactionNo = normalizeErpOrderAlias(transactionNo).slice(0, 80);
+          const order = normalizeStoredErpOrder(rawOrder, normalizedTransactionNo, normalizedTransactionNo);
+          if (!order) return Response.json({ ok: false, error: "UNSAFE_STORED_ORDER" }, { status: 503 });
+          if (order.status !== lookup.status) continue;
+          const hasSku = [
+            ...(Array.isArray(order.items) ? order.items : []),
+            ...(Array.isArray(order.printableOrders)
+              ? order.printableOrders.flatMap((printable) => Array.isArray(printable?.items) ? printable.items : [])
+              : []),
+          ].some((item) => erpOrderMatchesSku(item, lookup.sku));
+          if (hasSku) storedOrders.push(order);
+        }
+      }
+    }
+
+    const rows = storedOrders
+      .filter((order) => order.status === lookup.status)
+      .flatMap((order) => erpOrderSkuStatusRows(order, lookup.sku))
+      .sort((left, right) => {
+        const leftAt = Date.parse(String(left.createdAt || ""));
+        const rightAt = Date.parse(String(right.createdAt || ""));
+        if (Number.isFinite(leftAt) && Number.isFinite(rightAt) && leftAt !== rightAt) return rightAt - leftAt;
+        return compareErpOrderAliases(right.number, left.number);
+      });
+    const totalCount = rows.length;
+    const totalPages = Math.max(1, Math.ceil(totalCount / erpOrderSkuStatusPageSize));
+    const page = Math.min(lookup.page, totalPages);
+    const start = (page - 1) * erpOrderSkuStatusPageSize;
+    return Response.json({
+      ok: true,
+      sku: lookup.sku,
+      status: lookup.status,
+      page,
+      pageSize: erpOrderSkuStatusPageSize,
+      totalPages,
+      totalCount,
+      partialCount: rows.filter((row) => row.detailsIncomplete).length,
+      orders: rows.slice(start, start + erpOrderSkuStatusPageSize),
+      metadata,
+    });
   }
 
   async erpOrderUserIsAuthorized(userId) {
@@ -3988,6 +4191,9 @@ export class LineActivation {
     if (url.pathname === "/erp-orders/query" && request.method === "POST") {
       return this.queryErpOrder(request);
     }
+    if (url.pathname === "/erp-orders/query-sku-status" && request.method === "POST") {
+      return this.queryErpOrdersBySkuStatus(request);
+    }
     if (url.pathname === "/erp-orders/recent-selection/save" && request.method === "POST") {
       return this.saveErpOrderRecentSelection(request);
     }
@@ -4362,6 +4568,154 @@ async function lineOrderLookupAllowed(event, env) {
   }
 }
 
+function erpOrderSkuPostback(state = {}) {
+  const params = new URLSearchParams({
+    action: erpOrderSkuAction,
+    step: String(state.step || "menu"),
+    sku: String(state.sku || ""),
+  });
+  if (state.status) params.set("status", String(state.status));
+  if (state.page) params.set("page", String(state.page));
+  return params.toString();
+}
+
+function erpOrderSkuQuickReplyItem(label, state, displayText = label) {
+  return {
+    type: "action",
+    action: {
+      type: "postback",
+      label,
+      data: erpOrderSkuPostback(state),
+      displayText,
+    },
+  };
+}
+
+function createErpOrderSkuChoiceMessage(sku) {
+  const normalizedSku = erpOrderSkuKeys(sku)[0] || "";
+  if (!normalizedSku) return null;
+  return {
+    type: "text",
+    text: `📦 ${normalizedSku}\n你要查什麼？`,
+    quickReply: {
+      items: [
+        erpOrderSkuQuickReplyItem("查儲位", { step: "warehouse", sku: normalizedSku }, `查儲位 ${normalizedSku}`),
+        erpOrderSkuQuickReplyItem("查訂單", { step: "order", sku: normalizedSku }, `查訂單 ${normalizedSku}`),
+      ],
+    },
+  };
+}
+
+function createErpOrderSkuStatusPrompt(sku) {
+  const normalizedSku = erpOrderSkuKeys(sku)[0] || "";
+  if (!normalizedSku) return null;
+  return {
+    type: "text",
+    text: `📦 ${normalizedSku}\n請選擇訂單狀態：`,
+    quickReply: {
+      items: erpOrderSkuStatuses.map((status) => erpOrderSkuQuickReplyItem(
+        status,
+        { step: "status", sku: normalizedSku, status, page: 1 },
+        `${normalizedSku}｜${status}`,
+      )),
+    },
+  };
+}
+
+function erpOrderSkuResultQuickReplies(sku, status, page, totalPages) {
+  const items = [];
+  if (page > 1) {
+    items.push(erpOrderSkuQuickReplyItem(
+      "⬅️ 上一頁",
+      { step: "status", sku, status, page: page - 1 },
+      `${sku}｜${status}｜上一頁`,
+    ));
+  }
+  if (page < totalPages) {
+    items.push(erpOrderSkuQuickReplyItem(
+      "➡️ 下一頁",
+      { step: "status", sku, status, page: page + 1 },
+      `${sku}｜${status}｜下一頁`,
+    ));
+  }
+  for (const choice of erpOrderSkuStatuses) {
+    items.push(erpOrderSkuQuickReplyItem(
+      choice,
+      { step: "status", sku, status: choice, page: 1 },
+      `${sku}｜${choice}`,
+    ));
+  }
+  return items;
+}
+
+function createErpOrderSkuStatusMessage(result, request, now = Date.now()) {
+  const lookup = normalizeErpOrderSkuStatusRequest(request);
+  const metadata = result?.metadata || null;
+  const updatedAt = Date.parse(String(metadata?.updatedAt || ""));
+  const updatedLine = Number.isFinite(updatedAt)
+    ? `ERP 更新：${formatTaipeiDate(updatedAt)}`
+    : "ERP 更新：時間不明";
+  const stale = !Number.isFinite(updatedAt)
+    || Number(now) - updatedAt > erpOrderMaxSnapshotAgeMs
+    || updatedAt > Number(now) + 5 * 60_000;
+  if (stale) {
+    return {
+      type: "text",
+      text: `⚠️ 訂單查詢暫停\n\nERP 訂單資料已超過 30 分鐘或時間無效，為避免回覆舊資料，請先確認 NAS 同步。\n${updatedLine}`,
+    };
+  }
+  const orders = Array.isArray(result?.orders) ? result.orders : [];
+  const totalCount = Math.max(0, Number(result?.totalCount) || 0);
+  const totalPages = Math.max(1, Number(result?.totalPages) || 1);
+  const page = Math.min(totalPages, Math.max(1, Number(result?.page) || lookup.page));
+  const lines = [
+    `📦 ${lookup.sku}｜${lookup.status}`,
+    totalCount
+      ? `找到 ${totalCount} 筆符合的訂單｜第 ${page}/${totalPages} 頁`
+      : "目前查無符合的訂單。",
+  ];
+  if (orders.length) lines.push("");
+  orders.forEach((order, index) => {
+    const number = normalizeErpOrderAlias(order?.number);
+    const printable = /^\d{4,10}-\d{6,12}$/u.test(number);
+    lines.push(`${(page - 1) * erpOrderSkuStatusPageSize + index + 1}. ${printable ? number : `交易 ${order?.transactionNo || number || "未提供"}`}`);
+    const items = collapseErpOrderItems(order?.matchedItems).slice(0, 5);
+    for (const item of items) {
+      const itemSku = normalizeWarehouseSku(item?.sku) || lookup.sku;
+      const details = [itemSku, String(item?.name || "商品").trim(), erpOrderItemStyle(item)]
+        .filter((value, detailIndex) => value && !(detailIndex === 2 && value === "未標示規格"))
+        .join("｜");
+      lines.push(`   ${details}｜×${Number(item?.quantity) || 0}`);
+    }
+    if (Array.isArray(order?.matchedItems) && order.matchedItems.length > items.length) {
+      lines.push(`   …另有 ${order.matchedItems.length - items.length} 個符合規格`);
+    }
+    if (order?.detailsIncomplete) lines.push("   ⚠️ 此筆逐張明細不完整，請用單號再查一次");
+  });
+  const partialCount = Math.max(0, Number(result?.partialCount) || 0);
+  if (partialCount) lines.push("", `⚠️ 共 ${partialCount} 筆逐張明細尚未完整同步。`);
+  lines.push("", updatedLine);
+  const message = { type: "text", text: joinErpOrderMessageLines(lines, 4900, 1) };
+  const quickReplyItems = erpOrderSkuResultQuickReplies(lookup.sku, lookup.status, page, totalPages);
+  if (quickReplyItems.length) message.quickReply = { items: quickReplyItems };
+  return message;
+}
+
+function erpOrderSkuPostbackState(params) {
+  if (params.get("action") !== erpOrderSkuAction) return null;
+  const sku = erpOrderSkuKeys(params.get("sku"))[0] || "";
+  const step = String(params.get("step") || "");
+  if (!sku || !["warehouse", "order", "status"].includes(step)) return null;
+  const status = String(params.get("status") || "").normalize("NFKC").replace(/\s+/gu, "").trim();
+  if (step === "status" && !erpOrderSkuStatuses.includes(status)) return null;
+  return {
+    sku,
+    step,
+    status,
+    page: Math.max(1, Number.parseInt(params.get("page"), 10) || 1),
+  };
+}
+
 async function bindLineOrderLookupUser(event, bindToken, env) {
   if (event?.source?.type !== "user" || !event.source.userId || !env.LINE_ACTIVATION) {
     throw httpError("訂單授權服務尚未設定", 503);
@@ -4394,6 +4748,54 @@ async function erpOrderRequest(env, lookup) {
   );
   if (!response.ok) throw httpError("ERP 訂單查詢暫時無法使用", 503);
   return response.json();
+}
+
+async function erpOrderSkuStatusRequest(env, request) {
+  if (!env.LINE_ACTIVATION) throw httpError("ERP 訂單查詢服務尚未設定", 503);
+  const lookup = normalizeErpOrderSkuStatusRequest(request);
+  if (!lookup.sku || !lookup.status) throw httpError("貨號或訂單狀態無效", 400);
+  const response = await lineScheduleStub(env, globalLineScheduleName).fetch(
+    "https://line-schedule/erp-orders/query-sku-status",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(lookup),
+    },
+  );
+  if (!response.ok) throw httpError("ERP 貨號訂單查詢暫時無法使用", 503);
+  return response.json();
+}
+
+async function replyErpOrderSkuPostback(event, params, env) {
+  if (event.source?.type !== "user") return;
+  const state = erpOrderSkuPostbackState(params);
+  if (!state) return;
+  if (state.step === "warehouse") {
+    await replyWarehouseLocation(event, state.sku, env);
+    return;
+  }
+  if (!await lineOrderLookupAllowed(event, env)) {
+    await replyLine(event.replyToken, "🔒 訂單查詢只限已授權的 LINE 私訊帳號使用。", env);
+    return;
+  }
+  if (state.step === "order") {
+    await replyLine(event.replyToken, [createErpOrderSkuStatusPrompt(state.sku)], env);
+    return;
+  }
+  try {
+    const result = await erpOrderSkuStatusRequest(env, state);
+    console.log("LINE_ORDER_SKU_STATUS", JSON.stringify({
+      authorized: true,
+      sku: state.sku,
+      status: state.status,
+      totalCount: Number(result?.totalCount) || 0,
+      page: Number(result?.page) || state.page,
+    }));
+    await replyLine(event.replyToken, [createErpOrderSkuStatusMessage(result, state)], env);
+  } catch (error) {
+    console.error("LINE order SKU status lookup error", error?.message || error);
+    await replyLine(event.replyToken, `目前無法依貨號查詢 ERP 訂單：${error?.message || "請稍後再試"}`, env);
+  }
 }
 
 async function clearLineOrderRecentSelection(event, env) {
@@ -5126,6 +5528,10 @@ async function processLineEvent(event, env) {
       );
       return;
     }
+    if (action === erpOrderSkuAction) {
+      await replyErpOrderSkuPostback(event, params, env);
+      return;
+    }
     if (action !== "generate" && action !== "choose_focus") return;
     const productUrl = findShopeeUrl(params.get("url") || "");
     if (!productUrl) {
@@ -5377,6 +5783,18 @@ async function processLineEvent(event, env) {
 
   const warehouseSku = parseWarehouseLocationCommand(text);
   if (warehouseSku) {
+    const normalizedWarehouseInput = normalizeScheduleDigits(text).normalize("NFKC").trim().toUpperCase();
+    if (event.source?.type === "user" && normalizedWarehouseInput === warehouseSku) {
+      try {
+        await clearLineOrderRecentSelection(event, env);
+      } catch (error) {
+        console.error("LINE order SKU menu reset error", error?.message || error);
+        await replyLine(event.replyToken, `目前無法安全開啟貨號查詢選單：${error?.message || "請稍後再試"}`, env);
+        return;
+      }
+      await replyLine(event.replyToken, [createErpOrderSkuChoiceMessage(warehouseSku)], env);
+      return;
+    }
     await replyWarehouseLocation(event, warehouseSku, env);
     return;
   }
@@ -5818,11 +6236,17 @@ export {
   formatWarehouseLocation,
   createWarehousePositionDryRunPreview,
   createWarehousePositionWizardMessage,
+  createErpOrderSkuChoiceMessage,
+  createErpOrderSkuStatusMessage,
+  createErpOrderSkuStatusPrompt,
   warehousePositionWizardLocation,
   warehousePositionWizardPostback,
   warehouseLocationBucket,
   normalizeWarehouseStorageLocation,
   normalizeErpOrderAlias,
+  normalizeErpOrderSkuStatusRequest,
+  erpOrderSkuKeys,
+  erpOrderSkuPostback,
   warehouseSearchScore,
   withAbortTimeout,
   armLineGroup,

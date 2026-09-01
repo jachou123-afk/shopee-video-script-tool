@@ -8,6 +8,9 @@ import worker, {
   createWarehousePositionDryRunPreview,
   createWarehousePositionWizardMessage,
   createErpOrderMessage,
+  createErpOrderSkuChoiceMessage,
+  createErpOrderSkuStatusMessage,
+  createErpOrderSkuStatusPrompt,
   createWarehouseSearchMessage,
   createWarehouseStorageLocationFilterPrompt,
   createWarehouseStorageLocationMessage,
@@ -60,6 +63,7 @@ import worker, {
   verifyLineSignature,
   warehouseLocationBucket,
   normalizeErpOrderAlias,
+  normalizeErpOrderSkuStatusRequest,
   normalizeWarehouseStorageLocation,
   warehousePositionWizardLocation,
   warehouseSearchScore,
@@ -149,6 +153,32 @@ test("ERP order commands recognize the printed transaction number without captur
     page: 1,
   });
   assert.equal(parseLineOrderLookupRequest("全部"), null);
+});
+
+test("SKU order menu keeps the requested three ERP statuses in postback state", () => {
+  assert.deepEqual(normalizeErpOrderSkuStatusRequest({ sku: "ａ８１７－０１", status: " 可出貨 ", page: 2 }), {
+    sku: "A817-01",
+    status: "可出貨",
+    page: 2,
+  });
+  assert.equal(normalizeErpOrderSkuStatusRequest({ sku: "A817", status: "已出貨" }).status, "");
+  const menu = createErpOrderSkuChoiceMessage("a817");
+  assert.deepEqual(menu.quickReply.items.map((item) => item.action.label), ["查儲位", "查訂單"]);
+  const prompt = createErpOrderSkuStatusPrompt("A817");
+  assert.deepEqual(prompt.quickReply.items.map((item) => item.action.label), ["新訂單", "可出貨", "出貨中"]);
+  const result = createErpOrderSkuStatusMessage({
+    metadata: { updatedAt: new Date().toISOString() },
+    page: 1,
+    totalPages: 2,
+    totalCount: 11,
+    orders: Array.from({ length: 10 }, (_, index) => ({
+      transactionNo: String(10760000 + index),
+      number: `0350000-${10760000 + index}`,
+      matchedItems: [{ sku: "A817", name: "測試商品", quantity: 1 }],
+    })),
+  }, { sku: "A817", status: "新訂單", page: 1 });
+  assert.match(result.text, /第 1\/2 頁/);
+  assert.deepEqual(result.quickReply.items.map((item) => item.action.label), ["➡️ 下一頁", "新訂單", "可出貨", "出貨中"]);
 });
 
 test("ERP order binding command accepts only an explicit private binding token", () => {
@@ -1867,6 +1897,76 @@ test("LineActivation publishes a sanitized ERP order index with printed and plat
   assert.deepEqual(data.order.items.map((item) => item.warehouseArea), ["", ""]);
 });
 
+test("LineActivation indexes orders by parent SKU and the three selectable ERP statuses", async () => {
+  const values = new Map();
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const snapshotAt = new Date().toISOString();
+  const makeOrder = (transactionNo, status, sku, number, quantity = 1) => ({
+    transactionNo,
+    status,
+    platform: "蝦皮購物",
+    createdAt: `2026-09-01T${transactionNo.slice(-2)}:00:00+08:00`,
+    printableOrderNumbers: [number],
+    items: [{ sku, name: "A817 測試商品", style: "紅色", quantity }],
+    printableOrders: [{
+      number,
+      items: [{ sku, name: "A817 測試商品", style: "紅色", quantity }],
+    }],
+  });
+  let response = await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: snapshotAt,
+      orders: [
+        makeOrder("10760001", "新訂單", "A817-01", "0350000-10760001", 2),
+        makeOrder("10760002", "可出貨", "A817", "0350000-10760002", 3),
+        makeOrder("10760003", "出貨中", "B900-01", "0350000-10760003", 1),
+        makeOrder("10760004", "已完成", "A817-02", "0350000-10760004", 4),
+      ],
+    }),
+  }));
+  let data = await response.json();
+  assert.equal(response.status, 200);
+  assert.ok(data.skuStatusEntryCount >= 4);
+  const metadata = values.get("erp-order-active");
+  assert.equal(metadata.skuStatusBucketCount, 128);
+  assert.ok([...values.keys()].some((key) => key.startsWith(`erp-order-sku-status:${metadata.version}:`)));
+
+  const query = (sku, status, page = 1) => object.fetch(new Request(
+    "https://line-schedule/erp-orders/query-sku-status",
+    { method: "POST", body: JSON.stringify({ sku, status, page }) },
+  ));
+  response = await query("A817", "新訂單");
+  data = await response.json();
+  assert.equal(data.totalCount, 1, "a parent SKU must include matching child SKUs");
+  assert.equal(data.orders[0].number, "0350000-10760001");
+  assert.equal(data.orders[0].matchedItems[0].sku, "A817-01");
+  assert.equal(data.orders[0].matchedQuantity, 2);
+
+  response = await query("A817-01", "新訂單");
+  data = await response.json();
+  assert.equal(data.totalCount, 1, "an exact child SKU must remain queryable");
+
+  response = await query("A817", "可出貨");
+  data = await response.json();
+  assert.equal(data.totalCount, 1);
+  assert.equal(data.orders[0].number, "0350000-10760002");
+
+  response = await query("A817", "已完成");
+  assert.equal(response.status, 400, "unlisted ERP statuses must not be accepted");
+
+  values.set("erp-order-active", { ...metadata, skuStatusBucketCount: 0 });
+  response = await query("A817", "新訂單");
+  data = await response.json();
+  assert.equal(data.totalCount, 1, "the active pre-index snapshot must remain queryable until the next NAS sync");
+});
+
 test("LineActivation rejects unsafe ERP order snapshots before replacing the active version", async () => {
   const stableMetadata = {
     version: "stable-version",
@@ -2190,6 +2290,97 @@ test("LineActivation keeps a short-lived private order-number selection without 
   data = await response.json();
   assert.equal(data.found, false);
   assert.equal(data.snapshotChanged, true);
+});
+
+test("a private bare SKU opens warehouse or authorized status-filtered order lookup", async () => {
+  const originalFetch = globalThis.fetch;
+  const values = new Map();
+  const replies = [];
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  await object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      orders: [{
+        transactionNo: "10761001",
+        status: "可出貨",
+        platform: "蝦皮購物",
+        printableOrderNumbers: ["0350000-10761001"],
+        recipientName: "不應回覆的姓名",
+        recipientPhone: "0912345678",
+        items: [{ sku: "A817-01", name: "炫彩吊飾", style: "紅色", quantity: 2 }],
+        printableOrders: [{
+          number: "0350000-10761001",
+          items: [{ sku: "A817-01", name: "炫彩吊飾", style: "紅色", quantity: 2 }],
+        }],
+      }],
+    }),
+  }));
+  const env = {
+    LINE_CHANNEL_ACCESS_TOKEN: "test-token",
+    LINE_ORDER_ALLOWED_USER_IDS: "U-owner",
+    LINE_ACTIVATION: {
+      idFromName(name) { return name; },
+      get() { return { fetch: (input, init) => object.fetch(new Request(input, init)) }; },
+    },
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === "https://api.line.me/v2/bot/message/reply") {
+      replies.push(JSON.parse(options.body));
+      return Response.json({ ok: true });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  const source = { type: "user", userId: "U-owner" };
+  const press = async (label, replyToken, sourceOverride = source) => {
+    const item = replies.at(-1).messages[0].quickReply.items
+      .find((candidate) => candidate.action.label === label);
+    assert.ok(item, `missing quick reply button: ${label}`);
+    await processLineEvent({
+      type: "postback",
+      replyToken,
+      source: sourceOverride,
+      postback: { data: item.action.data },
+    }, env);
+  };
+  try {
+    await processLineEvent({
+      type: "message",
+      replyToken: "sku-menu",
+      source,
+      message: { type: "text", text: "a817" },
+    }, env);
+    assert.match(replies.at(-1).messages[0].text, /A817.*你要查什麼/su);
+    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.map((item) => item.action.label), ["查儲位", "查訂單"]);
+
+    await press("查訂單", "sku-order");
+    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.map((item) => item.action.label), ["新訂單", "可出貨", "出貨中"]);
+
+    await press("可出貨", "sku-ready");
+    const result = replies.at(-1).messages[0];
+    assert.match(result.text, /A817｜可出貨/);
+    assert.match(result.text, /0350000-10761001/);
+    assert.match(result.text, /A817-01｜炫彩吊飾｜紅色｜×2/);
+    assert.doesNotMatch(result.text, /不應回覆的姓名|0912345678/);
+    assert.deepEqual(result.quickReply.items.map((item) => item.action.label), ["新訂單", "可出貨", "出貨中"]);
+
+    const orderButtonData = createErpOrderSkuChoiceMessage("A817").quickReply.items[1].action.data;
+    await processLineEvent({
+      type: "postback",
+      replyToken: "sku-order-denied",
+      source: { type: "user", userId: "U-not-authorized" },
+      postback: { data: orderButtonData },
+    }, env);
+    assert.match(replies.at(-1).messages[0].text, /只限已授權的 LINE 私訊帳號/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("a one-time LINE binding command authorizes the exact webhook user for later order lookups", async () => {
@@ -3024,6 +3215,15 @@ test("group users can query a warehouse location without mentioning the bot", as
       source: { type: "user", userId: "u1" },
       message: { type: "text", text: "K501" },
     }, env);
+    const warehousePostback = replies.at(-1).messages[0].quickReply.items
+      .find((item) => item.action.label === "查儲位").action.data;
+    await processLineEvent({
+      type: "postback",
+      replyToken: "warehouse-private-choice",
+      timestamp: Date.now(),
+      source: { type: "user", userId: "u1" },
+      postback: { data: warehousePostback },
+    }, env);
     await processLineEvent({
       type: "message",
       replyToken: "warehouse-private-details",
@@ -3034,7 +3234,7 @@ test("group users can query a warehouse location without mentioning the bot", as
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.equal(replies.length, 4);
+  assert.equal(replies.length, 5);
   assert.equal(replies[0].messages[0].type, "flex");
   assert.match(replies[0].messages[0].altText, /K501.*找到 1 項/);
   assert.equal(replies[0].messages[0].contents.contents[0].footer.contents[0].action.text, "完整儲位 K501");
@@ -3042,10 +3242,11 @@ test("group users can query a warehouse location without mentioning the bot", as
   assert.match(replies[1].messages[0].text, /K501｜頭盔小鴨吊飾/);
   assert.match(replies[1].messages[0].text, /K區-01/);
   assert.doesNotMatch(replies[1].messages[0].text, /存貨成本|ERP 售價|NT\$/);
-  assert.match(JSON.stringify(replies[2]), /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
-  assert.match(JSON.stringify(replies[2]), /💰 ERP 售價：NT\$35～NT\$38\.50／個/);
-  assert.match(replies[3].messages[0].text, /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
-  assert.match(replies[3].messages[0].text, /💰 ERP 售價：NT\$35～NT\$38\.50／個/);
+  assert.deepEqual(replies[2].messages[0].quickReply.items.map((item) => item.action.label), ["查儲位", "查訂單"]);
+  assert.match(JSON.stringify(replies[3]), /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
+  assert.match(JSON.stringify(replies[3]), /💰 ERP 售價：NT\$35～NT\$38\.50／個/);
+  assert.match(replies[4].messages[0].text, /🔒 單個存貨成本：NT\$23～NT\$24\.50／個/);
+  assert.match(replies[4].messages[0].text, /💰 ERP 售價：NT\$35～NT\$38\.50／個/);
 });
 
 test("warehouse position dry run is private, account-bound, and read-only", async () => {
@@ -3705,7 +3906,7 @@ test("private LINE users can page through ERP-known storage locations while grou
       replyToken: "unknown-location-falls-back-to-sku",
       timestamp: Date.now(),
       source: { type: "user", userId: "owner-user" },
-      message: { type: "text", text: "AR99-99" },
+      message: { type: "text", text: "儲位 AR99-99" },
     }, env);
     assert.equal(replies.length, 8);
     assert.match(replies[7].messages[0].text, /ERP 主倉查無此貨號/);

@@ -26,6 +26,14 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 ## LINE 私訊查 ERP 訂單（2026-08-28 起；2026-08-29 子貨號／儲位版已正式部署並完成 LINE 畫面驗收）
 
+### 2026-09-01 貨號導向的訂單狀態查詢（已完成，尚未部署）
+
+- 目標帳號僅 `@059hdfyo`。一對一私訊只輸入貨號（例如 `A817`）時，先顯示 `查儲位`／`查訂單`；選 `查訂單` 後再顯示 `新訂單`／`可出貨`／`出貨中`，選完直接列出符合的完整出貨單號、符合貨號的品名／規格／數量，每頁 10 張並可翻頁或切換狀態。
+- `儲位 A817`、`完整儲位 A817` 保留既有直接查儲位行為；群組的裸貨號也維持原本查儲位，不顯示訂單選項。訂單查詢仍只允許已授權的一對一 LINE user，按鈕只帶貨號、狀態及頁碼，不保存新的使用者選單狀態。
+- ERP 訂單同步新增 128 個 `status + SKU` bucket，只索引上述三種狀態；子貨號（例如 `A817-01`）同時索引 parent `A817`，所以查主貨號會包含其子貨號，查子貨號仍維持精確。既有 active 快照在下一次 NAS 同步前會使用有界 chunk 掃描相容，不需先改 NAS 程式或重建資料。
+- 回覆不包含收件人、姓名、電話、地址或金額；Worker 原有 PII 白名單、30 分鐘快照失效保護及一次性訂單授權均保留。這版依使用者最後指定只做 ERP 訂單狀態篩選，不宣稱是列印時間篩選，也沒有寫入 ERP、修改 Secret、D1／KV schema、NAS 程式或 `@037vajci`。
+- 驗證：`node --check ai-worker/src/index.js` 與 84/84 項 Worker 測試通過；涵蓋私人貨號兩段式按鈕、三種狀態、未授權拒絕、parent／child SKU、舊快照相容、PII 不回覆、既有群組與直接儲位指令回歸。正式部署與真實 LINE 畫面驗收尚未完成。
+
 ### 2026-08-29 完整出貨單精準查詢／同尾號分流（已部署，待新版 LINE 畫面驗收）
 
 #### 清單後直接輸入序號（已部署，待 LINE 畫面驗收）
@@ -193,7 +201,7 @@ git pull --ff-only origin agent/line-schedule-handoff
 - `完成2`: move pending item 2 to completed.
 - `已拍完`: list completed details, employee, and completion time.
 - `取消完成1`: move completed item 1 back to pending.
-- `A12345`: return the same product card as a keyword search, including the cached image when available, stock, and primary ERP 主倉 locations; no mention is required. Lowercase input is normalized to uppercase.
+- `A12345`: in a private chat, ask `查儲位` or `查訂單`; order lookup then asks for `新訂單`, `可出貨`, or `出貨中`. In groups, a bare SKU keeps the original direct warehouse-card behavior. Lowercase input is normalized to uppercase.
 - `儲位 A12345`: remains supported for backward compatibility.
 - `完整儲位 A12345`: return the full text location details for every variant. Product-card buttons emit this command so exact-SKU cards do not loop back into themselves.
 - A bare product keyword such as `洗衣袋`: search the ERP catalog without mentioning the bot and return up to ten Flex cards with product image (when available), SKU, name, stock, primary locations, a full-location button, and a Shopee product button.
