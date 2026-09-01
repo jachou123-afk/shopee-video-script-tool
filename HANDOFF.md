@@ -26,13 +26,13 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 ## LINE 私訊查 ERP 訂單（2026-08-28 起；2026-08-29 子貨號／儲位版已正式部署並完成 LINE 畫面驗收）
 
-### 2026-09-01 貨號導向的訂單狀態查詢（已完成，尚未部署）
+### 2026-09-01 貨號導向的訂單狀態查詢（已正式部署，待 LINE 畫面驗收）
 
 - 目標帳號僅 `@059hdfyo`。一對一私訊只輸入貨號（例如 `A817`）時，先顯示 `查儲位`／`查訂單`；選 `查訂單` 後再顯示 `新訂單`／`可出貨`／`出貨中`，選完直接列出符合的完整出貨單號、符合貨號的品名／規格／數量，每頁 10 張並可翻頁或切換狀態。
 - `儲位 A817`、`完整儲位 A817` 保留既有直接查儲位行為；群組的裸貨號也維持原本查儲位，不顯示訂單選項。訂單查詢仍只允許已授權的一對一 LINE user，按鈕只帶貨號、狀態及頁碼，不保存新的使用者選單狀態。
 - ERP 訂單同步新增 128 個 `status + SKU` bucket，只索引上述三種狀態；子貨號（例如 `A817-01`）同時索引 parent `A817`，所以查主貨號會包含其子貨號，查子貨號仍維持精確。既有 active 快照在下一次 NAS 同步前會使用有界 chunk 掃描相容，不需先改 NAS 程式或重建資料。
 - 回覆不包含收件人、姓名、電話、地址或金額；Worker 原有 PII 白名單、30 分鐘快照失效保護及一次性訂單授權均保留。這版依使用者最後指定只做 ERP 訂單狀態篩選，不宣稱是列印時間篩選，也沒有寫入 ERP、修改 Secret、D1／KV schema、NAS 程式或 `@037vajci`。
-- 驗證：`node --check ai-worker/src/index.js` 與 84/84 項 Worker 測試通過；涵蓋私人貨號兩段式按鈕、三種狀態、未授權拒絕、parent／child SKU、舊快照相容、PII 不回覆、既有群組與直接儲位指令回歸。正式部署與真實 LINE 畫面驗收尚未完成。
+- 驗證：`node --check ai-worker/src/index.js` 與 84/84 項 Worker 測試通過；涵蓋私人貨號兩段式按鈕、三種狀態、未授權拒絕、parent／child SKU、舊快照相容、PII 不回覆、既有群組與直接儲位指令回歸。功能 commit `270700842f34b967135fdb22ee0b3b2f582dd69b` 已推送到正式 `agent/line-schedule-handoff` 分支；Cloudflare Worker version `3797b587-83df-4be7-856d-7b246f0739d5` 已於 2026-09-01 17:29（Asia/Taipei）正式部署並承接 100% 流量。部署後公開根網址為預期 HTTP 405，未授權 `/erp/orders/push` POST 為 HTTP 401。待驗收：在 `@059hdfyo` 一對一私訊重新輸入 `A817`，應先看到 `查儲位`／`查訂單`，再確認三種訂單狀態按鈕與結果。
 
 ### 2026-08-29 完整出貨單精準查詢／同尾號分流（已部署，待新版 LINE 畫面驗收）
 
@@ -133,11 +133,11 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 - Frontend: <https://jachou123-afk.github.io/shopee-video-script-tool/>
 - Cloudflare Worker: <https://shopee-video-script-ai.jachou123-afk.workers.dev>
-- Latest feature source: `49cda26a2e647bdfff51abdd0d4cee27ff499509` (`feat(line): 訂單顯示子貨號與儲位`).
-- Latest production deployment: `6be578f0-6639-4da4-8e74-8fccbbc508a0` on 2026-08-29, containing the order child-SKU/location release plus all earlier formal-branch changes.
+- Latest feature source: `270700842f34b967135fdb22ee0b3b2f582dd69b` (`feat(line): add SKU order status lookup`).
+- Latest production deployment: `3797b587-83df-4be7-856d-7b246f0739d5` on 2026-09-01, containing the SKU-guided order-status workflow plus all earlier formal-branch changes.
 - LINE bot commands and schedules are implemented in `ai-worker/src/index.js`.
 - The authenticated Shopee reader source is in `nas-shopee-reader/` and runs separately on the NAS. Its `.env`, browser profile, login session, and token are intentionally not committed.
-- Validation status: `node --check ai-worker/src/index.js`, all 72 Worker tests, and all 12 NAS reader tests pass on the integrated formal source.
+- Validation status: `node --check ai-worker/src/index.js`, all 84 Worker tests, and all 12 NAS reader tests pass on the integrated formal source.
 
 ## Shopee reader restart repair deployed (2026-08-28)
 
