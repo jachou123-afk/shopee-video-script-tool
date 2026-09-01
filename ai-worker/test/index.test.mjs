@@ -2284,13 +2284,13 @@ test("LineActivation keeps a short-lived private order-number selection without 
   data = await response.json();
   assert.equal(response.status, 200);
   assert.equal(data.count, 2);
-  assert.equal(data.expiresAt, 6_000, "SKU status selections last exactly five seconds");
-  response = await resolveSelection(10, 5_999);
+  assert.equal(data.expiresAt, 11_000, "SKU status selections last exactly ten seconds");
+  response = await resolveSelection(10, 10_999);
   data = await response.json();
   assert.equal(data.valid, false);
   assert.equal(data.firstIndex, 11);
   assert.equal(data.lastIndex, 12);
-  response = await resolveSelection(12, 5_999);
+  response = await resolveSelection(12, 10_999);
   data = await response.json();
   assert.equal(data.valid, true);
   assert.equal(data.kind, "sku-status");
@@ -2306,7 +2306,7 @@ test("LineActivation keeps a short-lived private order-number selection without 
     firstIndex: 1,
     queries: ["0350000-10745966"],
   });
-  response = await resolveSelection(1, 6_001);
+  response = await resolveSelection(1, 11_001);
   data = await response.json();
   assert.equal(data.found, false);
   assert.equal(data.expired, true);
@@ -2408,7 +2408,7 @@ test("a private bare SKU opens warehouse or authorized status-filtered order loo
     assert.match(result.text, /A817｜可出貨/);
     assert.match(result.text, /0350000-10761001/);
     assert.match(result.text, /A817-01｜炫彩吊飾｜紅色｜×2/);
-    assert.match(result.text, /5 秒內直接輸入上方編號/);
+    assert.match(result.text, /10 秒內直接輸入上方編號/);
     assert.doesNotMatch(result.text, /不應回覆的姓名|0912345678/);
     assert.deepEqual(result.quickReply.items.map((item) => item.action.label), ["新訂單", "可出貨", "出貨中"]);
 

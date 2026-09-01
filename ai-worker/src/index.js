@@ -42,7 +42,7 @@ const erpOrderMaxAliases = 500;
 const erpOrderPrintablePageSize = 20;
 const erpOrderSkuStatusPageSize = 10;
 const erpOrderRecentSelectionTtlMs = 5 * 60_000;
-const erpOrderSkuStatusSelectionTtlMs = 5_000;
+const erpOrderSkuStatusSelectionTtlMs = 10_000;
 const erpOrderSkuAction = "erp_order_sku_lookup";
 const erpOrderSkuStatuses = Object.freeze(["新訂單", "可出貨", "出貨中"]);
 const warehousePositionWizardOptions = Object.freeze({
@@ -4789,7 +4789,7 @@ function createErpOrderSkuStatusMessage(result, request, now = Date.now()) {
     }
     if (order?.detailsIncomplete) lines.push("   ⚠️ 此筆逐張明細不完整，請用單號再查一次");
   });
-  if (orders.length) lines.push("", "⏱️ 5 秒內直接輸入上方編號，可查看完整訂單。");
+  if (orders.length) lines.push("", "⏱️ 10 秒內直接輸入上方編號，可查看完整訂單。");
   const partialCount = Math.max(0, Number(result?.partialCount) || 0);
   if (partialCount) lines.push("", `⚠️ 共 ${partialCount} 筆逐張明細尚未完整同步。`);
   lines.push("", updatedLine);
@@ -4892,7 +4892,7 @@ async function replyErpOrderSkuPostback(event, params, env) {
     const orders = Array.isArray(result?.orders) ? result.orders : [];
     const message = createErpOrderSkuStatusMessage(result, state);
     const selectionSaved = await updateLineOrderSkuStatusSelection(event, result, state, env);
-    if (orders.length && /5 秒內直接輸入上方編號/u.test(message.text) && !selectionSaved) {
+    if (orders.length && /10 秒內直接輸入上方編號/u.test(message.text) && !selectionSaved) {
       throw httpError("訂單編號選單暫時無法安全啟用，請重新選擇狀態", 503);
     }
     await replyLine(event.replyToken, [message], env);
@@ -5726,7 +5726,7 @@ async function processLineEvent(event, env) {
         const skuStatusSelection = selection.kind === "sku-status";
         const reason = selection.snapshotChanged
           ? "ERP 訂單資料已更新"
-          : skuStatusSelection ? "選單已超過 5 秒" : "選單已超過 5 分鐘";
+          : skuStatusSelection ? "選單已超過 10 秒" : "選單已超過 5 分鐘";
         const subject = skuStatusSelection
           ? `${selection.sku || "貨號"}｜${selection.status || "訂單狀態"}`
           : `交易 ${selection.transactionNo}`;
