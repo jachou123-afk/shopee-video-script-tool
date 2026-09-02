@@ -26,6 +26,14 @@ git pull --ff-only origin agent/line-schedule-handoff
 
 ## LINE 私訊查 ERP 訂單（2026-08-28 起；2026-08-29 子貨號／儲位版已正式部署並完成 LINE 畫面驗收）
 
+### 2026-09-02 指定 5 位私訊使用者直接授權（已完成）
+
+- 使用者在 LINE Official Account Manager 畫面指定 5 位聯絡人後，已於正確帳號 `@059hdfyo` 逐一核對聊天室名稱與唯一 user ID；沒有修改另一個帳號 `@037vajci`，也沒有授權其他聯絡人。
+- 5 個 user ID 已直接寫入正式 Durable Object 的訂單查詢授權紀錄，寫入後即時回讀為 `requested=5`、`authorized=5`。Durable Object 只保存 user ID 的 SHA-256 雜湊與授權時間，不保存原始 ID；原始 ID、聯絡人名稱與一次性密鑰都未寫入程式碼、Git 或本文件。
+- 授權範圍只包含既有的一對一 ERP 訂單查詢：狀態、出貨單號、平台單號、品項、規格、數量、單價、金額與出貨資訊；既有 PII 白名單仍會排除收件人／買家姓名、電話與地址，群組與聊天室仍不回傳訂單資料。
+- 寫入前先部署一次性 Bearer 管理入口；未帶密鑰的正式請求實測為 HTTP 401。5/5 寫入完成後，已刪除 `LINE_ORDER_ADMIN_TOKEN` Cloudflare Secret、移除一次性入口並重新部署乾淨來源；一次性程式碼沒有提交到 GitHub。
+- 驗證：最終來源 `git diff --check` 通過，Worker 測試 84/84 通過；最終 Cloudflare Worker version `a98ab30e-2e7c-4466-a859-e22662269989` 已正式部署。待真人驗收：上述任一已授權使用者在 `@059hdfyo` 私訊輸入貨號，例如 `K119` 或 `A817`，應可選 `查訂單` 並取得三種狀態結果。
+
 ### 2026-09-01 貨號導向的訂單狀態查詢（已正式部署，待 LINE 畫面驗收）
 
 #### 狀態清單 10 秒數字直達（由 5 秒延長；已正式部署，待 LINE 畫面驗收）
