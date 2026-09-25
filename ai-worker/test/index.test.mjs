@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { loadSnapshot } from "../src/snapshot-blocks.js";
 import worker, {
   armLineGroup,
   canonicalShopeeUrl,
@@ -672,15 +673,16 @@ test("warehouse position dry-run command requires a SKU and safe new location", 
   assert.equal(parseWarehousePositionDryRunCommand("儲位 A861"), null);
 });
 
-test("warehouse position wizard starts from a SKU and only builds valid B warehouse locations", () => {
+test("warehouse position wizard starts from a SKU and offers B warehouse preview or custom entry", () => {
   assert.equal(parseWarehousePositionDryRunStartCommand("改儲位 A861"), "A861");
   assert.equal(parseWarehousePositionDryRunStartCommand("改儲位 ａ８６１"), "A861");
   assert.equal(parseWarehousePositionDryRunStartCommand("改儲位 洗衣袋"), null);
   assert.equal(parseWarehousePositionDryRunStartCommand("改儲位 A861 02-R04-01/T1"), null);
 
   const start = createWarehousePositionWizardMessage({ step: "warehouse", sku: "A861" });
-  assert.match(start.text, /全部選完後只會顯示預覽，不會寫入 ERP/);
-  assert.deepEqual(start.quickReply.items.map((item) => item.action.label), ["A倉", "B倉", "取消"]);
+  assert.match(start.text, /A／B 倉選項只做預覽/);
+  assert.match(start.text, /「自訂」可手打儲位，另經備份與確認後才會寫入 ERP/);
+  assert.deepEqual(start.quickReply.items.map((item) => item.action.label), ["A倉", "B倉", "自訂", "取消"]);
 
   assert.equal(warehousePositionWizardLocation({
     warehouse: "B", zone: "02", side: "R", shelf: "04", level: "01", tray: "T1",
@@ -1936,7 +1938,8 @@ test("LineActivation indexes orders by parent SKU and the three selectable ERP s
   assert.ok(data.skuStatusEntryCount >= 4);
   const metadata = values.get("erp-order-active");
   assert.equal(metadata.skuStatusBucketCount, 128);
-  assert.ok([...values.keys()].some((key) => key.startsWith(`erp-order-sku-status:${metadata.version}:`)));
+  const hydrated = await loadSnapshot({ get: async (key) => values.get(key) }, metadata);
+  assert.ok(Object.keys(hydrated.blockRefs).some((slot) => slot.startsWith("erp-order-sku-status:")));
 
   const query = (sku, status, page = 1) => object.fetch(new Request(
     "https://line-schedule/erp-orders/query-sku-status",
@@ -1967,7 +1970,7 @@ test("LineActivation indexes orders by parent SKU and the three selectable ERP s
   assert.equal(data.totalCount, 1, "the active pre-index snapshot must remain queryable until the next NAS sync");
 });
 
-test("LineActivation rejects unsafe ERP order snapshots before replacing the active version", async () => {
+test("LineActivation rejects unsafe ERP order snapshots and pages oversized alias indexes", async () => {
   const stableMetadata = {
     version: "stable-version",
     orderCount: 1,
@@ -2085,8 +2088,8 @@ test("LineActivation rejects unsafe ERP order snapshots before replacing the act
   assert.deepEqual([...values.entries()], expectedEntries);
 
   const crowdedAliases = [];
-  for (let candidate = 0; crowdedAliases.length < 600; candidate += 1) {
-    const alias = `BUCKET-${String(candidate).padStart(7, "0")}-${"X".repeat(130)}`;
+  for (let candidate = 0; crowdedAliases.length < 1200; candidate += 1) {
+    const alias = `BUCKET-${String(candidate).padStart(7, "0")}-${"X".repeat(55)}`;
     if (warehouseLocationBucket(alias, 128) === 0) crowdedAliases.push(alias);
   }
   response = await sync(crowdedAliases.map((alias, index) => ({
@@ -2094,11 +2097,194 @@ test("LineActivation rejects unsafe ERP order snapshots before replacing the act
     platformOrderNumbers: [alias],
   })));
   data = await response.json();
-  assert.equal(response.status, 413);
-  assert.equal(data.error, "ORDER_ALIAS_BUCKET_TOO_LARGE");
-  assert.equal(data.bucketIndex, 0);
-  assert.ok(data.receivedBytes > data.limitBytes);
-  assert.deepEqual([...values.entries()], expectedEntries);
+  assert.equal(response.status, 200);
+  assert.equal(data.ok, true);
+  const metadata = values.get("erp-order-active");
+  assert.equal(metadata.indexFormat, 2);
+  assert.ok(metadata.aliasChunkCounts[0] > 1, "crowded alias bucket must span multiple stored pages");
+  const hydrated = await loadSnapshot({ get: async (key) => values.get(key) }, metadata);
+  const secondPageKey = hydrated.blockRefs["erp-order-alias:0:1"]?.key;
+  assert.ok(secondPageKey, "the second alias page must be in the active manifest");
+  const secondPage = values.get(secondPageKey);
+  assert.ok(secondPage && typeof secondPage === "object");
+  const secondPageAlias = crowdedAliases.find((alias) => Object.hasOwn(secondPage, alias));
+  assert.ok(secondPageAlias, "a platform alias must actually live on the second page");
+  response = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: secondPageAlias }),
+  }));
+  data = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(data.order.transactionNo, String(10800000 + crowdedAliases.indexOf(secondPageAlias)));
+  assert.equal(data.metadata.version, metadata.version);
+});
+
+test("LineActivation rejects an overlapping ERP order sync and releases the busy guard", async () => {
+  const values = new Map();
+  let releaseFirstPut;
+  let signalFirstPut;
+  const firstPutEntered = new Promise((resolve) => { signalFirstPut = resolve; });
+  const firstPutGate = new Promise((resolve) => { releaseFirstPut = resolve; });
+  let blocked = false;
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) {
+        if (!blocked && key === "erp-order-active") {
+          blocked = true;
+          signalFirstPut();
+          await firstPutGate;
+        }
+        values.set(key, structuredClone(value));
+      },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const sync = (transactionNo) => object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({ orders: [{ transactionNo }] }),
+  }));
+
+  const firstSync = sync("10741001");
+  await firstPutEntered;
+  try {
+    const overlapping = await sync("10741002");
+    assert.equal(overlapping.status, 409);
+    assert.equal((await overlapping.json()).error, "ORDER_SYNC_BUSY");
+    assert.equal(values.has("erp-order-active"), false, "an overlapping sync must not publish a snapshot");
+  } finally {
+    releaseFirstPut();
+  }
+  assert.equal((await firstSync).status, 200);
+  assert.equal((await sync("10741003")).status, 200, "the guard must release after publication");
+  const lookup = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: "10741003" }),
+  }));
+  assert.equal((await lookup.json()).order.transactionNo, "10741003");
+});
+
+test("index format 2 fails closed when an alias or SKU-status page is missing", async () => {
+  const version = "stored-index-format-2";
+  const transactionNo = "10742001";
+  const statusIndexKey = "可出貨\u001fA817";
+  const aliasBucket = warehouseLocationBucket(transactionNo, 128);
+  const statusBucket = warehouseLocationBucket(statusIndexKey, 128);
+  const aliasChunkCounts = Array(128).fill(0);
+  const skuStatusChunkCounts = Array(128).fill(0);
+  aliasChunkCounts[aliasBucket] = 1;
+  skuStatusChunkCounts[statusBucket] = 1;
+  const metadata = {
+    version,
+    updatedAt: new Date().toISOString(),
+    chunkCount: 1,
+    aliasBucketCount: 128,
+    skuStatusBucketCount: 128,
+    indexFormat: 2,
+    aliasChunkCounts,
+    skuStatusChunkCounts,
+  };
+  const aliasKey = `erp-order-alias:${version}:${aliasBucket}:0`;
+  const statusKey = `erp-order-sku-status:${version}:${statusBucket}:0`;
+  const values = new Map([
+    ["erp-order-active", metadata],
+    [`erp-order:${version}:0`, {
+      [transactionNo]: {
+        transactionNo,
+        status: "可出貨",
+        items: [{ sku: "A817-01", name: "測試商品", quantity: 1, unitPrice: 10 }],
+      },
+    }],
+    [aliasKey, { [transactionNo]: { transactionNo, chunkIndex: 0 } }],
+    [statusKey, { [statusIndexKey]: [[transactionNo, 0]] }],
+  ]);
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  let query = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: transactionNo }),
+  }));
+  assert.equal(query.status, 200);
+  assert.equal((await query.json()).order.transactionNo, transactionNo);
+  const aliasPage = values.get(aliasKey);
+  values.delete(aliasKey);
+  query = await object.fetch(new Request("https://line-schedule/erp-orders/query", {
+    method: "POST",
+    body: JSON.stringify({ query: transactionNo }),
+  }));
+  assert.equal(query.status, 503);
+  assert.equal((await query.json()).error, "UNSAFE_STORED_ORDER_INDEX");
+  values.set(aliasKey, aliasPage);
+
+  query = await object.fetch(new Request("https://line-schedule/erp-orders/query-sku-status", {
+    method: "POST",
+    body: JSON.stringify({ sku: "A817", status: "可出貨", page: 1 }),
+  }));
+  assert.equal(query.status, 200);
+  assert.equal((await query.json()).totalCount, 1);
+  values.delete(statusKey);
+  query = await object.fetch(new Request("https://line-schedule/erp-orders/query-sku-status", {
+    method: "POST",
+    body: JSON.stringify({ sku: "A817", status: "可出貨", page: 1 }),
+  }));
+  assert.equal(query.status, 503);
+  assert.equal((await query.json()).error, "UNSAFE_STORED_ORDER_INDEX");
+});
+
+test("ERP order sync preserves the previous snapshot through a failed and then successful replacement", async () => {
+  const values = new Map();
+  let failActivePut = false;
+  const object = new LineActivation({
+    storage: {
+      async put(key, value) {
+        if (key === "erp-order-active" && failActivePut) {
+          failActivePut = false;
+          throw new Error("simulated storage failure");
+        }
+        values.set(key, structuredClone(value));
+      },
+      async get(key) { return values.has(key) ? structuredClone(values.get(key)) : undefined; },
+      async delete(key) { values.delete(key); },
+    },
+  });
+  const sync = (transactionNo) => object.fetch(new Request("https://line-schedule/erp-orders/sync", {
+    method: "POST",
+    body: JSON.stringify({ orders: [{ transactionNo }] }),
+  }));
+
+  assert.equal((await sync("10743001")).status, 200);
+  const first = values.get("erp-order-active");
+  assert.equal(first.previousSnapshot, undefined);
+  const blockKey = async (metadata) => {
+    const hydrated = await loadSnapshot({ get: async (key) => values.get(key) }, metadata);
+    return hydrated.blockRefs["erp-order:0"]?.key;
+  };
+  const firstBlockKey = await blockKey(first);
+  assert.ok(firstBlockKey && values.has(firstBlockKey));
+  const firstEntries = structuredClone([...values.entries()]);
+  failActivePut = true;
+  const failed = await sync("10743002");
+  assert.equal(failed.status, 503);
+  assert.equal((await failed.json()).error, "ORDER_SNAPSHOT_STORE_FAILED");
+  assert.deepEqual([...values.entries()], firstEntries, "failed staging must leave the active snapshot and its keys intact");
+
+  assert.equal((await sync("10743002")).status, 200);
+  const second = values.get("erp-order-active");
+  assert.equal(second.previousSnapshot.version, first.version);
+  const secondBlockKey = await blockKey(second);
+  assert.equal(values.has(firstBlockKey), true, "the prior snapshot remains available during the next publish");
+  assert.equal((await sync("10743003")).status, 200);
+  const third = values.get("erp-order-active");
+  assert.equal(third.previousSnapshot.version, second.version);
+  const thirdBlockKey = await blockKey(third);
+  assert.equal(values.has(firstBlockKey), false, "only the retired snapshot is cleaned up");
+  assert.equal(values.has(secondBlockKey), true);
+  assert.equal(values.has(thirdBlockKey), true);
 });
 
 test("LineActivation re-sanitizes legacy stored orders and fails closed on corrupt records", async () => {
@@ -2659,9 +2845,10 @@ test("LineActivation builds an exact reverse index and paginates every item at a
   assert.equal(data.locationCount, 2);
   assert.equal(data.locatedItemCount, 58, "an exact duplicate is removed but a distinct variant remains");
   assert.ok(values.has("warehouse-location-active"));
-  const reverseChunks = [...values.entries()]
-    .filter(([key]) => key.startsWith("warehouse-location-reverse-items:"))
-    .map(([, value]) => value);
+  const active = await loadSnapshot({ get: async (key) => values.get(key) }, values.get("warehouse-location-active"));
+  const reverseChunks = Object.entries(active.blockRefs)
+    .filter(([slot]) => slot.startsWith("warehouse-location-reverse-items:"))
+    .map(([, ref]) => values.get(ref.key));
   assert.ok(reverseChunks.length > 0);
   assert.ok(reverseChunks.every((chunk) => Array.isArray(chunk) && chunk.length <= 50));
 
@@ -3442,7 +3629,7 @@ test("warehouse position wizard uses buttons to build B warehouse preview withou
       replyToken: "wizard-start",
       message: { type: "text", text: "改儲位 A861" },
     }, env);
-    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.map((item) => item.action.label), ["A倉", "B倉", "取消"]);
+    assert.deepEqual(replies.at(-1).messages[0].quickReply.items.map((item) => item.action.label), ["A倉", "B倉", "自訂", "取消"]);
 
     await press("A倉");
     assert.match(replies.at(-1).messages[0].text, /A倉目前尚未開放/);
@@ -3537,8 +3724,9 @@ test("warehouse position wizard asks for actual child SKU first and previews all
     ]);
     await press("全部");
     assert.deepEqual(replies.at(-1).messages[0].quickReply.items.slice(0, 3).map((item) => item.action.label), [
-      "A倉", "B倉", "重選子貨號",
+      "A倉", "B倉", "自訂",
     ]);
+    assert.equal(replies.at(-1).messages[0].quickReply.items[3].action.label, "重選子貨號");
     await press("B倉");
     await press("02");
     await press("右邊 R");

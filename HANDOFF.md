@@ -1,5 +1,18 @@
 # Shopee Video Script Tool — Handoff
 
+## 2026-09-26 同步寫入節省（已通過測試，尚未部署）
+
+- 使用者確認先做「內容相同不重寫」與「只寫變動區塊」，NAS 仍每 600 秒檢查 ERP，推送格式與 NAS 程式維持相容。
+- 本次先由 Cloudflare 正式 Worker `shopee-video-script-ai` 取回目前承接 100% 流量的 `0159b0ad-6657-4cee-a635-5cdf33b0f745`（2026-09-17 部署）完整程式。GitHub 舊 HEAD `36e3a60` 不含現行訂單分頁索引與儲位寫回功能；已以正式部署內容重建 `src/index.js` 基底，避免舊版覆蓋。取回原始 JS 的 SHA-256 為 `c872d516ca1eb7701c7eecefe8d52d528d82600dfb09223c690394f83090132f`。打包產生的格式差異屬來源復原，不能據此刪除既有功能。
+- `snapshot-blocks.js` 以業務內容雜湊共用不可變資料區塊，變動區塊與引用表寫完才切換 active；完全相同時保留資料版本，只更新成功檢查時間。訂單 `lastSeenAt` 只供 NAS 90 天保留期使用，Worker 不再把它寫入業務區塊；新增、刪除或過期移除的訂單仍會觸發變動。
+- 引用表每頁小於 48 KiB，active metadata 不內嵌大型引用表；清理佇列也分頁。保留 active 與前一版所有共用資料，清理失敗可於後續同步重試；互斥發布與時間檢查避免舊請求覆蓋新快照。
+- 既有舊格式與 `indexFormat:2` 訂單分頁皆可讀；直接貨號、關鍵字、儲位反查、圖片清單與訂單查詢均透過引用表讀取。保留原有 LINE 權限、30 分鐘失效限制、PII 白名單及正式儲位寫回保護；本次不執行 ERP 寫回或代送 LINE 訊息。
+- 新增 `SYNC_SNAPSHOT_SAVINGS` 結構化紀錄與推送回應 `syncStats`，僅包含區塊寫入／重用／清理數量，不含商品、訂單或個資。這些是本同步的 storage 操作計數，不等於帳號總計費 rows；圖片快取、LINE 使用者選單等其他寫入仍存在。
+- 驗證：`node --check src/index.js`、`node --check src/snapshot-blocks.js`、`node --test test/*.test.mjs` 共 113/113 通過，Wrangler 本機 dry-run 打包通過。涵蓋無異動兩類同步各只 1 次 active put、單品異動三種查詢、大於 496 KiB 訂單重新分塊、失敗回復、三代共用回收、4,000 塊的引用表、並行拒絕與旧格式升級。獨立複核未見 P0/P1。
+- 尚未部署。正式部署將只替換 Worker content，保留現有 bindings、Secrets 與設定，並回讀版本、程式 SHA-256 與設定比對。
+- 實際節省率需等自然 NAS 同步驗證。先前免費 rows-written 額度已耗盡，部署不會重置額度；UTC 00:00（台灣 08:00）後才能驗證自然寫入。若 staging 寫入失敗且 rollback delete 同時因配額失敗，未發布的孤兒 block 可能殘留；本次不掃描或刪除未知舊資料。
+- 認證：使用者明確核准官方 Wrangler 僅 `account:read`、`workers_scripts:write`、`offline_access`；憑證由本機 Wrangler 管理，不進 Git。
+
 ## 下一台電腦開始工作前（必須先執行）
 
 下一位 Codex 在公司電腦讀到本文件後，必須先同步本交接分支，再進行任何修改；不需要使用者自行輸入指令：
@@ -14,7 +27,7 @@ git pull --ff-only origin agent/line-schedule-handoff
 - 同步後確認 `git rev-parse HEAD` 至少包含本次交接提交，並重新讀取完整 `HANDOFF.md`。
 - 如果 `git status -sb` 顯示公司電腦有未提交或未追蹤的內容，不可覆蓋、重設或刪除；先檢查差異並向使用者回報，再安全整合。
 - 工作目標帳號是 `@059hdfyo`。`@037vajci` 是使用者另外使用的帳號，不可修改。
-- 正式功能目前仍是純演練版：只預覽儲位，不得寫入 ERP。除非使用者之後明確同意進入下一階段，否則維持唯讀。
+- 正式功能以本文件最上方最新交接及已核對部署為準。2026-09-26 已復原線上既有且受白名單、備份、使用者確認與回讀驗證保護的儲位寫回流程；不得以舊演練版覆蓋。同步維護任務本身不得執行 ERP 寫回。
 
 ## 交接文件維護規則（永久執行）
 

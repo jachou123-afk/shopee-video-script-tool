@@ -6,7 +6,7 @@ Cloudflare Worker backend for the Shopee script web tool and LINE official accou
 
 ```bash
 node --check src/index.js
-node --test test/index.test.mjs
+node --test test/*.test.mjs
 ```
 
 ## Deploy
@@ -47,3 +47,13 @@ Image queue status is available to the ERP integration at `GET /erp/images/statu
 Schedule lists use Shopee product IDs to look up `skuLabel` in the current pure-profit dashboard period and display `【貨號】商品名稱`. This requires the `PROFIT_DASHBOARD_BYPASS_TOKEN` Worker secret and gracefully falls back to the original name if the dashboard is unavailable.
 
 Never commit secret values, `.dev.vars`, Wrangler caches, NAS cookies, or browser profiles.
+
+## Incremental ERP snapshots (2026-09-26)
+
+The NAS keeps its existing ten-minute full-payload contract. The Worker validates and builds the complete business snapshot, then `snapshot-blocks.js` reuses unchanged immutable blocks. An unchanged snapshot updates only the active verification timestamp and retains its version; a changed snapshot publishes only after all new blocks and manifest pages succeed. NAS `lastSeenAt` is excluded from Worker business blocks while NAS retention remains authoritative. The 30-minute freshness guard remains in force.
+
+Both legacy snapshots and paged order indexes remain readable. Manifest and garbage queue pages stay below 48 KiB, and garbage collection preserves shared references from the current and previous snapshots. Failures before publication preserve the active snapshot; failed retired-data cleanup is retried. Quota exhaustion can prevent rollback deletion of staged, unpublished data, so residual orphan blocks are a known recovery limitation.
+
+Push responses and `SYNC_SNAPSHOT_SAVINGS` logs report changed/reused blocks, manifest writes and cleanup counts. These are operation counts for snapshot synchronization, not account-wide billed rows. Image queues and user interaction writes are separate. Never refresh snapshot timestamps merely because a scheduler ran: the existing authenticated push follows a successful ERP export.
+
+The source baseline was recovered from production version `0159b0ad-6657-4cee-a635-5cdf33b0f745` before this change because GitHub had not recorded several already deployed features. For this repair, the documented Cloudflare `PUT /accounts/{account_id}/workers/scripts/{script_name}/content` API changes code while preserving existing settings and bindings. Confirm the expected active version before uploading and compare downloaded code and settings afterward. See `HANDOFF.md` for deployment evidence.
