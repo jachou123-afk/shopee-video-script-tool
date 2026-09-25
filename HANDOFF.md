@@ -11,6 +11,7 @@
 - 驗證：`node --check src/index.js`、`node --check src/snapshot-blocks.js`、`node --test test/*.test.mjs` 共 113/113 通過，Wrangler 本機 dry-run 打包通過。涵蓋無異動兩類同步各只 1 次 active put、單品異動三種查詢、大於 496 KiB 訂單重新分塊、失敗回復、三代共用回收、4,000 塊的引用表、並行拒絕與旧格式升級。獨立複核未見 P0/P1。
 - 功能提交 `b91bde675489c62989cd0612dc6281949f3f14c7` 已推送 `agent/line-schedule-handoff` 並回讀遠端 SHA 相符。2026-09-26 00:39:19（台灣）透過 content-only API 正式部署 `c7aa1fc0-71df-4d24-8869-bd2b62f2d326`，deployment `235c9605-0a2d-4822-9fb7-e012058474a6` 承接 100% 流量。回讀正式程式 SHA-256 `b6983703f9abaff7d7a70c2b7fc2dedcffb97074054ef2b1cf19bd8b07423e7c` 與本機測試打包檔一致；部署前後 bindings（含 Secret 名稱）、compatibility、observability、placement、usage_model 完全一致。
 - 部署後公開根網址 GET 為預期 HTTP 405；未授權 `/erp/orders/push`、`/erp/locations/push` POST 與 `/erp/orders/status` GET 均為 HTTP 401。沒有傳送正式測試資料或 LINE 訊息。本機同步設定不含可用的正式 Worker token，NAS SMB 設定檔亦無法取得，因此沒有宣稱已完成授權狀態端點或真人 LINE 畫面驗收。
+- 00:40:42（台灣）Cloudflare Live Logs 已確認自然 NAS `/erp-orders/sync` 承接版本為 `c7aa1fc0-71df-4d24-8869-bd2b62f2d326`，仍回報 `Exceeded allowed rows written in Durable Objects free tier.`；00:40:45 外部 `/erp/orders/push` 亦同。這證明自然排程已接新版，但不代表新快照已成功發布；須於 08:00 額度重置後再核對 `SYNC_SNAPSHOT_SAVINGS`，不可先宣稱 LINE 或同步已恢復。
 - 實際節省率需等自然 NAS 同步驗證。先前免費 rows-written 額度已耗盡，部署不會重置額度；UTC 00:00（台灣 08:00）後才能驗證自然寫入。若 staging 寫入失敗且 rollback delete 同時因配額失敗，未發布的孤兒 block 可能殘留；本次不掃描或刪除未知舊資料。
 - 認證：使用者明確核准官方 Wrangler 僅 `account:read`、`workers_scripts:write`、`offline_access`；憑證由本機 Wrangler 管理，不進 Git。
 
