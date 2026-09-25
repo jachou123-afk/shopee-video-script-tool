@@ -1,6 +1,6 @@
 # Shopee Video Script Tool — Handoff
 
-## 2026-09-26 同步寫入節省（已通過測試，尚未部署）
+## 2026-09-26 同步寫入節省（已部署；自然同步待免費額度重置驗證）
 
 - 使用者確認先做「內容相同不重寫」與「只寫變動區塊」，NAS 仍每 600 秒檢查 ERP，推送格式與 NAS 程式維持相容。
 - 本次先由 Cloudflare 正式 Worker `shopee-video-script-ai` 取回目前承接 100% 流量的 `0159b0ad-6657-4cee-a635-5cdf33b0f745`（2026-09-17 部署）完整程式。GitHub 舊 HEAD `36e3a60` 不含現行訂單分頁索引與儲位寫回功能；已以正式部署內容重建 `src/index.js` 基底，避免舊版覆蓋。取回原始 JS 的 SHA-256 為 `c872d516ca1eb7701c7eecefe8d52d528d82600dfb09223c690394f83090132f`。打包產生的格式差異屬來源復原，不能據此刪除既有功能。
@@ -9,7 +9,8 @@
 - 既有舊格式與 `indexFormat:2` 訂單分頁皆可讀；直接貨號、關鍵字、儲位反查、圖片清單與訂單查詢均透過引用表讀取。保留原有 LINE 權限、30 分鐘失效限制、PII 白名單及正式儲位寫回保護；本次不執行 ERP 寫回或代送 LINE 訊息。
 - 新增 `SYNC_SNAPSHOT_SAVINGS` 結構化紀錄與推送回應 `syncStats`，僅包含區塊寫入／重用／清理數量，不含商品、訂單或個資。這些是本同步的 storage 操作計數，不等於帳號總計費 rows；圖片快取、LINE 使用者選單等其他寫入仍存在。
 - 驗證：`node --check src/index.js`、`node --check src/snapshot-blocks.js`、`node --test test/*.test.mjs` 共 113/113 通過，Wrangler 本機 dry-run 打包通過。涵蓋無異動兩類同步各只 1 次 active put、單品異動三種查詢、大於 496 KiB 訂單重新分塊、失敗回復、三代共用回收、4,000 塊的引用表、並行拒絕與旧格式升級。獨立複核未見 P0/P1。
-- 尚未部署。正式部署將只替換 Worker content，保留現有 bindings、Secrets 與設定，並回讀版本、程式 SHA-256 與設定比對。
+- 功能提交 `b91bde675489c62989cd0612dc6281949f3f14c7` 已推送 `agent/line-schedule-handoff` 並回讀遠端 SHA 相符。2026-09-26 00:39:19（台灣）透過 content-only API 正式部署 `c7aa1fc0-71df-4d24-8869-bd2b62f2d326`，deployment `235c9605-0a2d-4822-9fb7-e012058474a6` 承接 100% 流量。回讀正式程式 SHA-256 `b6983703f9abaff7d7a70c2b7fc2dedcffb97074054ef2b1cf19bd8b07423e7c` 與本機測試打包檔一致；部署前後 bindings（含 Secret 名稱）、compatibility、observability、placement、usage_model 完全一致。
+- 部署後公開根網址 GET 為預期 HTTP 405；未授權 `/erp/orders/push`、`/erp/locations/push` POST 與 `/erp/orders/status` GET 均為 HTTP 401。沒有傳送正式測試資料或 LINE 訊息。本機同步設定不含可用的正式 Worker token，NAS SMB 設定檔亦無法取得，因此沒有宣稱已完成授權狀態端點或真人 LINE 畫面驗收。
 - 實際節省率需等自然 NAS 同步驗證。先前免費 rows-written 額度已耗盡，部署不會重置額度；UTC 00:00（台灣 08:00）後才能驗證自然寫入。若 staging 寫入失敗且 rollback delete 同時因配額失敗，未發布的孤兒 block 可能殘留；本次不掃描或刪除未知舊資料。
 - 認證：使用者明確核准官方 Wrangler 僅 `account:read`、`workers_scripts:write`、`offline_access`；憑證由本機 Wrangler 管理，不進 Git。
 
