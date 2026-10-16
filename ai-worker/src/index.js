@@ -2462,6 +2462,7 @@ var LineActivation = class {
     __name(this, "LineActivation");
   }
   constructor(state, env) {
+    this.state = state;
     this.storage = state.storage;
     this.env = env || {};
     this.readerSocket = null;
@@ -2469,6 +2470,36 @@ var LineActivation = class {
     this.readerPending = /* @__PURE__ */ new Map();
     this.erpWritebackSocket = null;
     this.erpWritebackPending = /* @__PURE__ */ new Map();
+    // Connections survive hibernation; pending HTTP jobs and their bounded timers keep us awake.
+    this.readerSocket = this.restoreBrokerSocket("nas-reader");
+    this.erpWritebackSocket = this.restoreBrokerSocket("erp-writeback");
+    if (this.readerSocket) {
+      try {
+        this.readerHello = this.readerSocket.deserializeAttachment()?.hello || null;
+      } catch {
+        this.readerHello = null;
+      }
+    }
+  }
+  restoreBrokerSocket(tag) {
+    return this.state.getWebSockets?.(tag)?.find((socket) => socket.readyState === 1) || null;
+  }
+  webSocketMessage(socket, message) {
+    if (typeof message !== "string") return;
+    if (socket === this.readerSocket) this.handleReaderMessage({ data: message });
+    else if (socket === this.erpWritebackSocket) this.handleErpWritebackMessage({ data: message });
+  }
+  webSocketClose(socket) {
+    this.clearReaderIfCurrent(socket);
+    if (socket === this.erpWritebackSocket) this.clearErpWriteback();
+  }
+  webSocketError(socket) {
+    this.webSocketClose(socket);
+    try {
+      socket.close(1011, "Broker connection error");
+    } catch {
+      // A socket that is already closed needs no further cleanup.
+    }
   }
   readerAuthorized(request) {
     const token = String(this.env.SHOPEE_READER_TOKEN || "");
@@ -2495,15 +2526,8 @@ var LineActivation = class {
     const [client, server] = Object.values(pair);
     this.erpWritebackSocket?.close(1012, "Replaced by a new ERP client");
     this.clearErpWriteback("ERP_WRITEBACK_REPLACED");
+    this.state.acceptWebSocket(server, ["erp-writeback"]);
     this.erpWritebackSocket = server;
-    server.accept();
-    server.addEventListener("message", (event) => this.handleErpWritebackMessage(event));
-    server.addEventListener("close", () => {
-      if (this.erpWritebackSocket === server) this.clearErpWriteback();
-    });
-    server.addEventListener("error", () => {
-      if (this.erpWritebackSocket === server) this.clearErpWriteback();
-    });
     return new Response(null, { status: 101, webSocket: client });
   }
   handleErpWritebackMessage(event) {
@@ -2590,11 +2614,8 @@ var LineActivation = class {
     const [client, server] = Object.values(pair);
     this.readerSocket?.close(1012, "Replaced by a new reader connection");
     this.clearReader("SHOPEE_READER_REPLACED");
+    this.state.acceptWebSocket(server, ["nas-reader"]);
     this.readerSocket = server;
-    server.accept();
-    server.addEventListener("message", (event) => this.handleReaderMessage(event));
-    server.addEventListener("close", () => this.clearReaderIfCurrent(server));
-    server.addEventListener("error", () => this.clearReaderIfCurrent(server));
     return new Response(null, { status: 101, webSocket: client });
   }
   handleReaderMessage(event) {
@@ -2606,6 +2627,14 @@ var LineActivation = class {
     }
     if (message?.type === "hello") {
       this.readerHello = { receivedAt: Date.now(), browser: message.browser || null };
+      if (this.readerSocket?.serializeAttachment) {
+        let attachment = { hello: this.readerHello };
+        // Attachments have a 2 KiB limit; oversized diagnostics must not break a connection.
+        if (new TextEncoder().encode(JSON.stringify(attachment)).byteLength > 1900) {
+          attachment = { hello: { receivedAt: this.readerHello.receivedAt, browser: null } };
+        }
+        this.readerSocket.serializeAttachment(attachment);
+      }
       return;
     }
     if (!message?.id) return;

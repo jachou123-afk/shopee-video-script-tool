@@ -1,5 +1,17 @@
 # Shopee Video Script Tool — Handoff
 
+## 2026-10-16 NAS 待命連線改為可休眠（測試完成；尚未部署）
+
+- 使用者已授權本次修改；目標為長頸鹿超級小幫手 @059hdfyo 的 shopee-video-script-ai，另一帳號 @037vajci 不在範圍內。
+- 10/14、10/15 的 Cloudflare 通知原文均為 duration 額度耗盡，與 9/25 的 rows-written 事件不同。查核時帳號只有 LineActivation 一個 namespace；原版兩條一般 accept() NAS WebSocket 會持續消耗執行時間。
+- 修改前即時 fetch：agent/line-schedule-handoff 與 upstream 一致、工作樹乾淨，HEAD 4621350714f2b5067ae0a9d255256bd62b27ae9e。Cloudflare 正式版本仍為 c7aa1fc0-71df-4d24-8869-bd2b62f2d326；下載原程式 SHA-256 b6983703f9abaff7d7a70c2b7fc2dedcffb97074054ef2b1cf19bd8b07423e7c 與既有基準相符。
+- NAS 讀取與 ERP 回寫以 acceptWebSocket() 接受並分別標記 nas-reader／erp-writeback；建構時由 getWebSockets() 恢復有效連線。reader hello 放入小於 2 KiB 的連線 attachment，不新增資料庫寫入。
+- 收訊、關閉、錯誤改由 Durable Object 事件處理；只接受目前連線的回覆。既有工作編號、等待中 HTTP 請求、有限逾時、斷線拒絕、確認流程與不自動重送回寫保留。閒置不建立保活計時器。每 600 秒的 NAS HTTP 同步、增量快照及 30 分鐘失效限制均不變。
+- 驗證：語法、git diff --check、125/125 單元／回歸測試通過，Wrangler 4.151.1 dry-run 成功；另 1/1 官方 Miniflare/workerd 整合測試強制真正休眠，確認兩類連線建構子重跑、客戶端不斷線、喚醒後各完成一次本機模擬工作、延遲重複回覆不重送。測試沒有連線正式 NAS、ERP 或代送 LINE。
+- 本提交尚未部署。後續僅用 content-only API 更新程式，避免改動正式 bindings／Secrets／settings；發布前再查 active version，之後回讀程式雜湊、設定與流量版本。發布會使既有 WebSocket 重連一次，不宣稱零中斷。
+- 正式節省率仍須部署後量測；待確認自然 NAS 同步、兩條連線恢復及閒置 duration 下降，不能以本機測試宣稱生產驗收完成。
+
+
 ## 2026-09-26 同步寫入節省（已部署；自然同步待免費額度重置驗證）
 
 - 使用者確認先做「內容相同不重寫」與「只寫變動區塊」，NAS 仍每 600 秒檢查 ERP，推送格式與 NAS 程式維持相容。

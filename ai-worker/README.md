@@ -57,3 +57,16 @@ Both legacy snapshots and paged order indexes remain readable. Manifest and garb
 Push responses and `SYNC_SNAPSHOT_SAVINGS` logs report changed/reused blocks, manifest writes and cleanup counts. These are operation counts for snapshot synchronization, not account-wide billed rows. Image queues and user interaction writes are separate. Never refresh snapshot timestamps merely because a scheduler ran: the existing authenticated push follows a successful ERP export.
 
 The source baseline was recovered from production version `0159b0ad-6657-4cee-a635-5cdf33b0f745` before this change because GitHub had not recorded several already deployed features. For this repair, the documented Cloudflare `PUT /accounts/{account_id}/workers/scripts/{script_name}/content` API changes code while preserving existing settings and bindings. Confirm the expected active version before uploading and compare downloaded code and settings afterward. See `HANDOFF.md` for deployment evidence.
+
+
+## NAS broker WebSocket hibernation (2026-10-16)
+
+The reader and ERP writeback brokers accept tagged sockets with the Hibernation API. Their constructors restore open tagged sockets; reader hello diagnostics survive through bounded WebSocket attachments without database writes. In-flight HTTP jobs and bounded deadlines keep the object active until a reply, disconnect, or timeout. Idle brokers can sleep while NAS clients remain connected. Replaced sockets cannot complete current jobs, and a timed-out ERP write is never automatically replayed. The ten-minute ERP HTTP sync, snapshot blocks, credentials, and NAS wire protocol are unchanged. Code deployments still disconnect existing clients once.
+
+The standard test command includes the broker regression tests. The separate runtime integration test uses a locally installed official Miniflare and esbuild (validated with Wrangler 4.151.1's bundled dependencies). If they are outside normal Node module resolution, set WORKER_TEST_NODE_MODULES to their containing node_modules directory, then run from ai-worker:
+
+~~~powershell
+node --test test/websocket-runtime.integration.mjs
+~~~
+
+This test forces actual hibernation with Miniflare's unsafeEvictDurableObject(..., { webSockets: "hibernate" }), checks that the constructor reruns without losing the client connection, and completes a local fixture job through each broker. Its test wrapper and simulated ERP response are local only; no NAS, LINE, ERP, or production service is contacted.
