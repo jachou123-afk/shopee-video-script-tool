@@ -11,6 +11,7 @@
 - 功能提交 c57ed2d711ac808961492a3b9690c48aa36ece90 已推送目前交接分支，回讀 GitHub SHA 相符。2026-10-16 22:32:17（台灣）以 content-only API 正式部署，deployment 55185999-db43-4f96-b227-9d34daea340e、version 9f95bcf5-0a7a-4bb3-890a-9418be6d0b06 承接 100% 流量；正式程式回讀 SHA-256 44511a53d474ab470e12d5166798fbd9062b52861b4676d505240362da852e07 與本機測試打包檔一致。部署前後完整 settings 比對相同，未修改任何 binding、Secret、相容日期、observability、placement 或 usage model。
 - 正式根網址 GET 為預期 HTTP 405；未授權 /reader/status、/erp/writeback/status、/erp/orders/status GET 均為 HTTP 401，Live Logs 確認這些請求承接新版本。此電腦沒有可用的正式 NAS 同步金鑰，未冒用其它服務金鑰或代送 LINE／ERP 寫入。
 - 重要限制：本輪讀到 Cloudflare 2026-10-16 22:27:49（台灣）的新信，原版在修正發布前已再次耗盡 duration；通知指定 2026-10-17 00:00 UTC（台灣 08:00）重置。部署不會恢復免費額度。不能以部署成功或本機整合測試宣稱正式同步、NAS 連線或節省率已通過。
+- 發布後 Live Logs 證據：22:39–22:41 兩條 /reader/connect、/erp/writeback/connect 均有 NAS 自動重連請求；22:41:11 自然 /erp/locations/push 亦抵達新版。這些請求承接 version 9f95bcf5-0a7a-4bb3-890a-9418be6d0b06，均回 HTTP 500，exception 明確屬於 duration 配額限制，不能誤報連線或自然同步成功。觀察只保存路徑、狀態、版本與錯誤分類，未保存認證標頭或業務內容到 Git。
 - 重置後接手驗收：查看新版本自然 /erp/orders/push、/erp/locations/push 與內部快照同步成功紀錄，確認兩條 NAS 連線重新接上、查貨／圖片正常，最後比較完整閒置時間窗與整日 duration。ERP 回寫先以本機模擬驗證，真實寫入仍遵守既有使用者確認流程。未建立額外排程或調升付費方案。
 
 
