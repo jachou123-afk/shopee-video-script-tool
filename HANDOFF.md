@@ -1,6 +1,6 @@
 # Shopee Video Script Tool — Handoff
 
-## 2026-10-16 NAS 待命連線改為可休眠（測試完成；尚未部署）
+## 2026-10-16 NAS 待命連線改為可休眠（已部署；額度重置後正式驗收）
 
 - 使用者已授權本次修改；目標為長頸鹿超級小幫手 @059hdfyo 的 shopee-video-script-ai，另一帳號 @037vajci 不在範圍內。
 - 10/14、10/15 的 Cloudflare 通知原文均為 duration 額度耗盡，與 9/25 的 rows-written 事件不同。查核時帳號只有 LineActivation 一個 namespace；原版兩條一般 accept() NAS WebSocket 會持續消耗執行時間。
@@ -8,8 +8,10 @@
 - NAS 讀取與 ERP 回寫以 acceptWebSocket() 接受並分別標記 nas-reader／erp-writeback；建構時由 getWebSockets() 恢復有效連線。reader hello 放入小於 2 KiB 的連線 attachment，不新增資料庫寫入。
 - 收訊、關閉、錯誤改由 Durable Object 事件處理；只接受目前連線的回覆。既有工作編號、等待中 HTTP 請求、有限逾時、斷線拒絕、確認流程與不自動重送回寫保留。閒置不建立保活計時器。每 600 秒的 NAS HTTP 同步、增量快照及 30 分鐘失效限制均不變。
 - 驗證：語法、git diff --check、125/125 單元／回歸測試通過，Wrangler 4.151.1 dry-run 成功；另 1/1 官方 Miniflare/workerd 整合測試強制真正休眠，確認兩類連線建構子重跑、客戶端不斷線、喚醒後各完成一次本機模擬工作、延遲重複回覆不重送。測試沒有連線正式 NAS、ERP 或代送 LINE。
-- 本提交尚未部署。後續僅用 content-only API 更新程式，避免改動正式 bindings／Secrets／settings；發布前再查 active version，之後回讀程式雜湊、設定與流量版本。發布會使既有 WebSocket 重連一次，不宣稱零中斷。
-- 正式節省率仍須部署後量測；待確認自然 NAS 同步、兩條連線恢復及閒置 duration 下降，不能以本機測試宣稱生產驗收完成。
+- 功能提交 c57ed2d711ac808961492a3b9690c48aa36ece90 已推送目前交接分支，回讀 GitHub SHA 相符。2026-10-16 22:32:17（台灣）以 content-only API 正式部署，deployment 55185999-db43-4f96-b227-9d34daea340e、version 9f95bcf5-0a7a-4bb3-890a-9418be6d0b06 承接 100% 流量；正式程式回讀 SHA-256 44511a53d474ab470e12d5166798fbd9062b52861b4676d505240362da852e07 與本機測試打包檔一致。部署前後完整 settings 比對相同，未修改任何 binding、Secret、相容日期、observability、placement 或 usage model。
+- 正式根網址 GET 為預期 HTTP 405；未授權 /reader/status、/erp/writeback/status、/erp/orders/status GET 均為 HTTP 401，Live Logs 確認這些請求承接新版本。此電腦沒有可用的正式 NAS 同步金鑰，未冒用其它服務金鑰或代送 LINE／ERP 寫入。
+- 重要限制：本輪讀到 Cloudflare 2026-10-16 22:27:49（台灣）的新信，原版在修正發布前已再次耗盡 duration；通知指定 2026-10-17 00:00 UTC（台灣 08:00）重置。部署不會恢復免費額度。不能以部署成功或本機整合測試宣稱正式同步、NAS 連線或節省率已通過。
+- 重置後接手驗收：查看新版本自然 /erp/orders/push、/erp/locations/push 與內部快照同步成功紀錄，確認兩條 NAS 連線重新接上、查貨／圖片正常，最後比較完整閒置時間窗與整日 duration。ERP 回寫先以本機模擬驗證，真實寫入仍遵守既有使用者確認流程。未建立額外排程或調升付費方案。
 
 
 ## 2026-09-26 同步寫入節省（已部署；自然同步待免費額度重置驗證）
