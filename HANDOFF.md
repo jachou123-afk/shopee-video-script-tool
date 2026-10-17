@@ -1,5 +1,15 @@
 # Shopee Video Script Tool — Handoff
 
+## 2026-10-17 23:12 訂單 413 診斷進行中；庫存自然同步已成功
+
+- 使用者已明確授權查清並修正訂單 413、完整保留訂單資料、不影響作業，同時驗證庫存與 NAS。目標僅 @059hdfyo；本輪不送 LINE、不執行 ERP 寫入、不變更認證或付費方案。
+- 在原有認證後記錄 ERP_SYNC_DIAGNOSTICS，僅包含錯誤碼、限制值與計數；不記錄交易號、內容或認證。訂單推送另以 waitUntil 背景唯讀查詢既有兩個 broker 的受保護狀態，NAS_BROKER_HEALTH 僅記錄連線布林值、browser.started 與 HTTP 狀態。沒有新公開診斷入口、資料庫寫入或定時器。
+- 127/127 測試及 Wrangler 4.151.1 dry-run 通過。診斷部署先為 5de3e883-fb73-4d83-8ac3-253dc1d1837b，整合正確 broker 健康讀取後為 4a8dfe45-76b0-4515-95e2-7ae148f32c0d，deployment 06f5fc1f-6713-424c-90cd-fbc56c54896c，100%。正式來源 SHA-256 f222cbd7f4c30581d83d083419f1550ba26d29c73498f18ff462c589866474c3；部署前後完整 settings 相同。此為診斷部署，尚未完成 413 根因修復。
+- 23:11:15 台灣自然庫存 /warehouse-locations/sync HTTP 200，itemCount=3776，changed=false、reusedBlocks=299、writtenBlocks=0、cleanupFailed=0；外部 /erp/locations/push HTTP 200，1,341,805 bytes，無 quota exception。這是當輪庫存成功證據。
+- 本機 Tailscale 正常執行，NAS_D224 在線且 100.105.238.51:5001 可達；192.168.1.126 LAN 位址不可達。SMB 設定區尚無可用存取，瀏覽器建立 DSM tab 逾時。網路可達不能代替兩條應用連線驗收；等待下一輪自然訂單推送的受認證健康結果。不要將 global snapshot DO 的空 socket 欄位當成兩個獨立 broker 的狀態。
+- 尚待：自然訂單 413 具體 error code、對應修復、正式訂單發布成功及兩條 NAS broker 健康結果。本輪不縮短 90 天、不丟棄訂單、不改 NAS 排程。
+
+
 ## 2026-10-17 重置後查核：訂單同步 HTTP 413；整體驗收尚未完成
 
 - 本輪依使用者「狀況如何」進行正式唯讀驗收；未修改程式、重新部署、ERP 資料、認證或付費方案。修改前 fetch 確認既有交接分支與 GitHub 一致、工作樹乾淨。

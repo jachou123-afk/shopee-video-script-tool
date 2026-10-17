@@ -70,3 +70,8 @@ node --test test/websocket-runtime.integration.mjs
 ~~~
 
 This test forces actual hibernation with Miniflare's unsafeEvictDurableObject(..., { webSockets: "hibernate" }), checks that the constructor reruns without losing the client connection, and completes a local fixture job through each broker. Its test wrapper and simulated ERP response are local only; no NAS, LINE, ERP, or production service is contacted.
+
+
+## Safe ERP sync diagnostics (2026-10-17)
+
+Authenticated syncs emit ERP_SYNC_DIAGNOSTICS with only error codes, limits and counts. Order pushes also read the existing authenticated reader/writeback broker status in waitUntil and emit NAS_BROKER_HEALTH with HTTP status and booleans only. No order identifiers, payloads, URLs or credentials are logged. Health checks add no public endpoint, storage writes, keepalive timer or ERP write.

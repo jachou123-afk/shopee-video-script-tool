@@ -3379,10 +3379,19 @@ var LineActivation = class {
     }
     await this.processWarehouseImageQueue();
   }
+  async logErpSyncDiagnostics(kind, response) {
+    const result = await response.clone().json();
+    const record = { kind, status: response.status };
+    if (typeof result.error === "string" && /^[A-Z_]+$/.test(result.error)) record.error = result.error;
+    for (const key of ["limit", "received", "limitBytes", "receivedBytes", "orderCount", "aliasCount", "skuStatusEntryCount", "itemCount"])
+      if (Number.isFinite(result[key])) record[key] = result[key];
+    console.log("ERP_SYNC_DIAGNOSTICS", JSON.stringify(record));
+    return response;
+  }
   async syncWarehouseLocations(request) {
     if (this.warehouseSyncInProgress) return Response.json({ ok: false, error: "LOCATION_SYNC_BUSY" }, { status: 409 });
     this.warehouseSyncInProgress = true;
-    try { return await this.publishWarehouseLocations(request); }
+    try { return await this.logErpSyncDiagnostics("locations", await this.publishWarehouseLocations(request)); }
     finally { this.warehouseSyncInProgress = false; }
   }
   async publishWarehouseLocations(request) {
@@ -3490,7 +3499,7 @@ var LineActivation = class {
     }
     this.erpOrderSyncInProgress = true;
     try {
-      return await this.publishErpOrders(request);
+      return await this.logErpSyncDiagnostics("orders", await this.publishErpOrders(request));
     } finally {
       this.erpOrderSyncInProgress = false;
     }
@@ -6521,7 +6530,19 @@ async function handleWarehouseLocationPush(request, env, context) {
   return response;
 }
 __name(handleWarehouseLocationPush, "handleWarehouseLocationPush");
-async function handleErpOrderPush(request, env) {
+async function logNasBrokerHealth(env) {
+  const checks = await Promise.allSettled([
+    readerBrokerStub(env).fetch("https://shopee-reader/reader/status", { headers: { Authorization: `Bearer ${env.SHOPEE_READER_TOKEN}` } }).then(async response => ({ status: response.status, data: response.ok ? await response.json() : null })),
+    erpWritebackBrokerStub(env).fetch("https://erp-writeback/erp/writeback/status", { headers: { "X-Erp-Sync-Token": env.ERP_SYNC_TOKEN } }).then(async response => ({ status: response.status, data: response.ok ? await response.json() : null }))
+  ]);
+  const [reader, writeback] = checks.map(check => check.status === "fulfilled" ? check.value : null);
+  console.log("NAS_BROKER_HEALTH", JSON.stringify({
+    readerStatus: reader?.status || 0, readerConnected: reader?.data?.connected === true,
+    browserStarted: reader?.data?.hello?.browser?.started === true,
+    writebackStatus: writeback?.status || 0, writebackConnected: writeback?.data?.connected === true
+  }));
+}
+async function handleErpOrderPush(request, env, context) {
   const expected = String(env.ERP_SYNC_TOKEN || "");
   const supplied = String(request.headers.get("X-Erp-Sync-Token") || "");
   if (!expected || supplied !== expected) return new Response("Unauthorized", { status: 401 });
@@ -6533,6 +6554,7 @@ async function handleErpOrderPush(request, env) {
   } catch {
     return Response.json({ ok: false, error: "INVALID_JSON" }, { status: 400 });
   }
+  if (context?.waitUntil) context.waitUntil(logNasBrokerHealth(env).catch(() => console.warn("NAS_BROKER_HEALTH_FAILED")));
   return lineScheduleStub(env, globalLineScheduleName).fetch("https://line-schedule/erp-orders/sync", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -6745,7 +6767,7 @@ var index_default = {
     }
     if (url.pathname === "/erp/orders/push") {
       if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
-      return handleErpOrderPush(request, env);
+      return handleErpOrderPush(request, env, context);
     }
     if (url.pathname === "/erp/orders/status") {
       if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
