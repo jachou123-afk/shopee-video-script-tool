@@ -1,6 +1,6 @@
 # Shopee Video Script Tool — Handoff
 
-## 2026-10-17 訂單 413 根因修正（測試完成；待部署與自然同步驗收）
+## 2026-10-17 訂單 413 根因修正（已部署；訂單／庫存／NAS 正式驗收通過）
 
 - 23:12:37 台灣正式自然訂單推送共 53,851,665 bytes、20,276 筆，內部明確回 ORDER_LIMIT_EXCEEDED（limit=20000、received=20276）。並非 duration quota、單筆大小或索引問題；不能刪掉超過的 276 筆或縮短 90 天保留期處理。
 - 同輪受認證 /reader/status 與 /erp/writeback/status 都 HTTP 200、connected=true，reader browser.started=true；Tailscale NAS 在線與管理埠可達另有獨立確認。庫存 23:11 自然同步 3,776 貨號成功，詳見下節。
@@ -8,7 +8,12 @@
 - 移除造成事故的固定 20,000 筆限制，依 100 MiB 輸入位元組界線保護；完整 JSON 與每筆驗證結束前不寫入快照；錯誤格式在位元組界線內讀完上傳再回覆，避免主動取消合法大小請求造成連線重置。空、無效、重複交易、重複頂層欄位、半截／錯誤 JSON、超過整包或原單筆限制均拒絕並保留舊版。沒有截去訂單，NAS 原始 CSV、索引、90 天保留、匯出與排程不變，也沒有 ERP 寫入或 LINE 訊息。
 - 回應及安全日誌新增 receivedOrderCount 與 incompleteOrderCount（既有明細截斷旗標計數），正式驗收需 receivedOrderCount=orderCount 且 incompleteOrderCount=0 才可宣稱這輪完整。
 - 驗證：137/137 單元／回歸測試、語法、Wrangler 4.151.1 dry-run；官方 Miniflare/workerd 大容量與休眠整合測試 2/2。容量測試輸入 59,043,778 bytes、20,276 筆，逐筆核對貨號／品名／規格／數量／單價／小計／儲位／出貨單與平台單號；共 60,828 件、金額 800,902（20,276 × 39.5）均一致。第二次相同內容 writtenBlocks=0，錯誤串流保留前版。測試資料為本機合成，不接觸正式 NAS/ERP/LINE；測試用讀取入口未進正式來源。
-- 此節程式尚未部署；下一步以正式預期版本 4a8dfe45-76b0-4515-95e2-7ae148f32c0d 執行 content-only 更新，回讀來源／settings 後等待 NAS 自然訂單與庫存成功及兩條連線重新確認。
+- 功能提交 41e217065f3ab640760f0c5fe1774ddc03d9aa6f 已推送交接分支並回讀遠端 SHA 相符。2026-10-17 23:24:39（台灣）content-only 正式部署 version 9c5e8285-7b3d-4230-a91e-61bfc660a6fa，deployment 14e7697c-c02d-4add-8685-e7eb2e444a61，100%。回讀正式來源 SHA-256 d716328ec0a1473124a8935eb6bdbf71ae1527f5ce3cc3274b411378fe3c9391 與測試打包一致；完整 settings 部署前後相同。公開根 GET 405；未認證訂單與兩條 NAS 狀態入口 GET 401。正式自然同步驗收已通過，證據如下。
+- 23:32:41 開始的自然 /erp/orders/push 與內部 /erp-orders/sync，於 23:34:26 查核時均已完成 HTTP 200、outcome=ok、exceptionCount=0，承接上述正式 version。NAS 本文 53,877,546 bytes；receivedOrderCount=20285、orderCount=20285、incompleteOrderCount=0，aliasCount=440808、skuStatusEntryCount=2778。沒有截去超過原門檻的 285 筆，也沒有縮短保留期。
+- 同輪訂單 changed=true、writtenBlocks=578、reusedBlocks=579、writtenManifestPages=3、writtenGarbagePages=1、deletedBlocks=350、cleanupFailed=0。這是原增量快照機制只寫變動內容並安全清理退休區塊的操作計數；不能換算成帳號整日額度節省率。
+- 新版 23:31:13 自然 /erp/locations/push 及 /warehouse-locations/sync 均 HTTP 200，itemCount=3776；changed=false、reusedBlocks=299、writtenBlocks=0、cleanupFailed=0，本文 1,341,805 bytes。庫存同步在訂單修正後仍正常。
+- 新版同輪背景查核正確兩個獨立 broker：readerStatus=200、readerConnected=true、browserStarted=true；writebackStatus=200、writebackConnected=true。沒有送出 ERP 回寫工作或 LINE 訊息；連線正常不等於已檢查 NAS RAID／硬碟、Shopee CAPTCHA 或所有其它 NAS 工作。
+- 本次訂單 413、庫存同步及兩條 NAS 應用連線的驗收已完成。整日 Durable Objects duration 統計／節省百分比仍未取得，本次成功不能代替該統計；不要宣稱已量得 80% 或保證日後不會達其它平台上限。
 
 
 ## 2026-10-17 23:12 訂單 413 診斷進行中；庫存自然同步已成功
