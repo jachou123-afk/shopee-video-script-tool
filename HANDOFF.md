@@ -1,5 +1,16 @@
 # Shopee Video Script Tool — Handoff
 
+## 2026-10-17 重置後查核：訂單同步 HTTP 413；整體驗收尚未完成
+
+- 本輪依使用者「狀況如何」進行正式唯讀驗收；未修改程式、重新部署、ERP 資料、認證或付費方案。修改前 fetch 確認既有交接分支與 GitHub 一致、工作樹乾淨。
+- 2026-10-17 22:41 起（台灣）即時確認 Cloudflare 正式 deployment 仍為 55185999-db43-4f96-b227-9d34daea340e，version 9f95bcf5-0a7a-4bb3-890a-9418be6d0b06 承接 100% 流量。
+- Gmail 查詢沒有發現指向下一次重置的新一輪額度警告。今日 08:08:41 到達的信仍寫 2026-10-17 00:00 UTC 重置，不能單靠到信時間判定重置後又耗盡。沒有新信本身也不能證明同步成功。
+- 22:45:19 的自然 POST /erp/orders/push 及 22:45:21 的內部 POST /erp-orders/sync 均承接上述新版、HTTP 413、outcome=ok、exceptionCount=0；本次觀察沒有 duration quota exception。這只證明請求能進入應用程式，該輪訂單未成功發布。
+- 原程式 publishErpOrders() 的 413 分支包含：訂單總數超過 20,000、單筆 alias 超過 500、單筆正規化訂單超過 96 KiB、單個索引項目超過 96 KiB。這些檢查在切換 active snapshot 前拒絕，保留上一版。本輪尚未取得 NAS HTTP 回應本文，不能斷定是哪一個分支，也不能以放寬上限或截斷資料當作修復。
+- Cloudflare GraphQL 統計 API 22:43 回覆 budget depleted、要求等 5 分鐘；22:48 等候後只重查一次仍被相同限制拒絕。既有 Wrangler OAuth 呼叫 Workers Observability 歷史查詢回 HTTP 403；本輪未擴大權限。瀏覽器驗證也未能取得可讀的新用量頁面，因此當日 duration 與節省百分比仍未知。
+- 仍待驗收：庫存自然 /erp/locations/push 成功、兩條 NAS 連線及真實查貨／圖片行為，以及完整當日 duration 比較。下一步先從 NAS 同步程式的 413 回應取得 error code 與限制數值，再決定訂單分塊／索引調整；不要省略原始訂單、品項或數量。
+
+
 ## 2026-10-16 NAS 待命連線改為可休眠（已部署；額度重置後正式驗收）
 
 - 使用者已授權本次修改；目標為長頸鹿超級小幫手 @059hdfyo 的 shopee-video-script-ai，另一帳號 @037vajci 不在範圍內。
