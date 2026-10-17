@@ -1996,14 +1996,8 @@ test("LineActivation rejects unsafe ERP order snapshots and pages oversized alia
     body: JSON.stringify({ updatedAt: new Date().toISOString(), orders }),
   }));
 
-  let response = await sync(Array.from({ length: 20001 }, (_, index) => ({
-    transactionNo: String(10750000 + index),
-  })));
-  let data = await response.json();
-  assert.equal(response.status, 413);
-  assert.equal(data.error, "ORDER_LIMIT_EXCEEDED");
-  assert.equal(data.received, 20001);
-  assert.deepEqual([...values.entries()], expectedEntries);
+  let response;
+  let data;
 
   response = await sync([]);
   data = await response.json();

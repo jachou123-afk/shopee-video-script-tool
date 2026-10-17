@@ -1,3 +1,4 @@
+import { readOrderSnapshot, OrderStreamError } from "./order-stream.js";
 import { publishSnapshot, loadSnapshot, resolveSnapshotKey } from "./snapshot-blocks.js";
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
@@ -3383,7 +3384,7 @@ var LineActivation = class {
     const result = await response.clone().json();
     const record = { kind, status: response.status };
     if (typeof result.error === "string" && /^[A-Z_]+$/.test(result.error)) record.error = result.error;
-    for (const key of ["limit", "received", "limitBytes", "receivedBytes", "orderCount", "aliasCount", "skuStatusEntryCount", "itemCount"])
+    for (const key of ["limit", "received", "limitBytes", "receivedBytes", "orderCount", "aliasCount", "skuStatusEntryCount", "itemCount", "receivedOrderCount", "incompleteOrderCount"])
       if (Number.isFinite(result[key])) record[key] = result[key];
     console.log("ERP_SYNC_DIAGNOSTICS", JSON.stringify(record));
     return response;
@@ -3505,49 +3506,21 @@ var LineActivation = class {
     }
   }
   async publishErpOrders(request) {
-    const body = await request.json();
-    if (!Array.isArray(body?.orders)) {
-      return Response.json({ ok: false, error: "INVALID_ORDER_DATA" }, { status: 400 });
+    const byTransaction = new Map();
+    let body;
+    try {
+      body = await readOrderSnapshot(request, (rawOrder, index) => {
+        const order = normalizeErpOrder(rawOrder);
+        if (!order) throw new OrderStreamError("INVALID_ORDER_DATA", 400, { index });
+        if (order.aliasLimitExceeded) throw new OrderStreamError("ORDER_ALIAS_LIMIT_EXCEEDED", 413, { transactionNo: order.transactionNo, limit: erpOrderMaxAliases });
+        if (byTransaction.has(order.transactionNo)) throw new OrderStreamError("DUPLICATE_TRANSACTION", 409, { transactionNo: order.transactionNo });
+        byTransaction.set(order.transactionNo, order);
+      });
+    } catch (error) {
+      if (error instanceof OrderStreamError) return Response.json(error.data, { status: error.status });
+      throw error;
     }
-    if (body.orders.length > 2e4) {
-      return Response.json({
-        ok: false,
-        error: "ORDER_LIMIT_EXCEEDED",
-        limit: 2e4,
-        received: body.orders.length
-      }, { status: 413 });
-    }
-    if (!body.orders.length) {
-      return Response.json({ ok: false, error: "EMPTY_ORDER_DATA" }, { status: 400 });
-    }
-    const byTransaction = /* @__PURE__ */ new Map();
-    for (let index = 0; index < body.orders.length; index += 1) {
-      const rawOrder = body.orders[index];
-      const order = normalizeErpOrder(rawOrder);
-      if (!order) {
-        return Response.json({
-          ok: false,
-          error: "INVALID_ORDER_DATA",
-          index
-        }, { status: 400 });
-      }
-      if (order.aliasLimitExceeded) {
-        return Response.json({
-          ok: false,
-          error: "ORDER_ALIAS_LIMIT_EXCEEDED",
-          transactionNo: order.transactionNo,
-          limit: erpOrderMaxAliases
-        }, { status: 413 });
-      }
-      if (byTransaction.has(order.transactionNo)) {
-        return Response.json({
-          ok: false,
-          error: "DUPLICATE_TRANSACTION",
-          transactionNo: order.transactionNo
-        }, { status: 409 });
-      }
-      byTransaction.set(order.transactionNo, order);
-    }
+    if (!body.orderCount) return Response.json({ ok: false, error: "EMPTY_ORDER_DATA" }, { status: 400 });
     const orders = [...byTransaction.values()].sort(
       (a, b) => a.transactionNo.localeCompare(b.transactionNo, "en", { numeric: true })
     );
@@ -3641,7 +3614,7 @@ var LineActivation = class {
     try {
       const result = await publishSnapshot(this.storage, { activeKey: "erp-order-active", metadata, blocks, legacyKeys: orderSnapshotKeys });
       logSnapshotSavings("orders", result);
-      return Response.json({ ok: true, orderCount: metadata.orderCount, aliasCount: metadata.aliasCount, skuStatusEntryCount: metadata.skuStatusEntryCount, updatedAt: result.metadata.updatedAt, unchanged: !result.changed, syncStats: snapshotSavings(result) });
+      return Response.json({ ok: true, receivedOrderCount: body.orderCount, incompleteOrderCount: orders.filter(order => order.itemsTruncated || order.printableOrdersTruncated || order.printableOrders?.some(printable => printable.itemsTruncated)).length, orderCount: metadata.orderCount, aliasCount: metadata.aliasCount, skuStatusEntryCount: metadata.skuStatusEntryCount, updatedAt: result.metadata.updatedAt, unchanged: !result.changed, syncStats: snapshotSavings(result) });
     } catch (error) {
       console.warn("ORDER_SNAPSHOT_STORE_FAILED", error?.message);
       return Response.json({ ok: false, error: "ORDER_SNAPSHOT_STORE_FAILED" }, { status: 503 });
@@ -6547,18 +6520,12 @@ async function handleErpOrderPush(request, env, context) {
   const supplied = String(request.headers.get("X-Erp-Sync-Token") || "");
   if (!expected || supplied !== expected) return new Response("Unauthorized", { status: 401 });
   if (!env.LINE_ACTIVATION) return Response.json({ ok: false, error: "STORAGE_NOT_CONFIGURED" }, { status: 503 });
-  const rawBody = await request.text();
-  try {
-    const body = JSON.parse(rawBody);
-    if (!Array.isArray(body?.orders)) throw new Error("INVALID_ORDER_DATA");
-  } catch {
-    return Response.json({ ok: false, error: "INVALID_JSON" }, { status: 400 });
-  }
   if (context?.waitUntil) context.waitUntil(logNasBrokerHealth(env).catch(() => console.warn("NAS_BROKER_HEALTH_FAILED")));
   return lineScheduleStub(env, globalLineScheduleName).fetch("https://line-schedule/erp-orders/sync", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: rawBody
+    body: request.body,
+    duplex: "half"
   });
 }
 __name(handleErpOrderPush, "handleErpOrderPush");

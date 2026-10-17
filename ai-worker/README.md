@@ -75,3 +75,10 @@ This test forces actual hibernation with Miniflare's unsafeEvictDurableObject(..
 ## Safe ERP sync diagnostics (2026-10-17)
 
 Authenticated syncs emit ERP_SYNC_DIAGNOSTICS with only error codes, limits and counts. Order pushes also read the existing authenticated reader/writeback broker status in waitUntil and emit NAS_BROKER_HEALTH with HTTP status and booleans only. No order identifiers, payloads, URLs or credentials are logged. Health checks add no public endpoint, storage writes, keepalive timer or ERP write.
+
+
+## Large rolling order snapshots (2026-10-17)
+
+The fixed 20,000-order guard rejected the complete NAS snapshot at 20,276 orders (53,851,665 bytes). Authenticated pushes now forward the request stream directly to the Durable Object. A pinned @streamparser/json 0.0.26 parser retains only the current raw order while the existing normalizer, sorting, 96 KiB storage chunks, paged indexes and atomic snapshot publisher keep their contract. Normalized business data still occupies memory; raw request text and a second full JSON object graph are no longer retained. The complete JSON document must validate before any snapshot write. Duplicate fields, malformed input, duplicate transactions and existing per-order limits fail closed; a 100 MiB input byte bound replaces the arbitrary total-order-count guard. No order is dropped to meet the old count, and NAS exports, archives, 90-day retention and scheduling are unchanged.
+
+Successful responses include receivedOrderCount and incompleteOrderCount alongside orderCount; the latter reports existing item/printable truncation flags so acceptance can verify zero incomplete orders. No customer data is added to logs. The separate local integration test (node --test test/order-capacity.integration.mjs, same WORKER_TEST_NODE_MODULES setup as above) publishes 20,276 orders in a 59,043,778-byte fixture, verifies every item/identifier/quantity/price/amount/location/printable record, proves unchanged block reuse, and confirms malformed input retains the previous snapshot. Its inspection endpoint and all fixture data exist only in the local test bundle.

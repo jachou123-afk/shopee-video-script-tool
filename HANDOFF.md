@@ -1,5 +1,16 @@
 # Shopee Video Script Tool — Handoff
 
+## 2026-10-17 訂單 413 根因修正（測試完成；待部署與自然同步驗收）
+
+- 23:12:37 台灣正式自然訂單推送共 53,851,665 bytes、20,276 筆，內部明確回 ORDER_LIMIT_EXCEEDED（limit=20000、received=20276）。並非 duration quota、單筆大小或索引問題；不能刪掉超過的 276 筆或縮短 90 天保留期處理。
+- 同輪受認證 /reader/status 與 /erp/writeback/status 都 HTTP 200、connected=true，reader browser.started=true；Tailscale NAS 在線與管理埠可達另有獨立確認。庫存 23:11 自然同步 3,776 貨號成功，詳見下節。
+- 外層不再 request.text() + JSON.parse() 後複製整包本文，改直接串流轉送 DO；新增 order-stream.js，以鎖定 @streamparser/json 0.0.26 逐筆解析並即時套原白名單，不保留完整原始 orders 陣列。正規化業務資料仍需記憶體，既有排序、96 KiB 分塊、索引與原子快照均保留。
+- 移除造成事故的固定 20,000 筆限制，依 100 MiB 輸入位元組界線保護；完整 JSON 與每筆驗證結束前不寫入快照；錯誤格式在位元組界線內讀完上傳再回覆，避免主動取消合法大小請求造成連線重置。空、無效、重複交易、重複頂層欄位、半截／錯誤 JSON、超過整包或原單筆限制均拒絕並保留舊版。沒有截去訂單，NAS 原始 CSV、索引、90 天保留、匯出與排程不變，也沒有 ERP 寫入或 LINE 訊息。
+- 回應及安全日誌新增 receivedOrderCount 與 incompleteOrderCount（既有明細截斷旗標計數），正式驗收需 receivedOrderCount=orderCount 且 incompleteOrderCount=0 才可宣稱這輪完整。
+- 驗證：137/137 單元／回歸測試、語法、Wrangler 4.151.1 dry-run；官方 Miniflare/workerd 大容量與休眠整合測試 2/2。容量測試輸入 59,043,778 bytes、20,276 筆，逐筆核對貨號／品名／規格／數量／單價／小計／儲位／出貨單與平台單號；共 60,828 件、金額 800,902（20,276 × 39.5）均一致。第二次相同內容 writtenBlocks=0，錯誤串流保留前版。測試資料為本機合成，不接觸正式 NAS/ERP/LINE；測試用讀取入口未進正式來源。
+- 此節程式尚未部署；下一步以正式預期版本 4a8dfe45-76b0-4515-95e2-7ae148f32c0d 執行 content-only 更新，回讀來源／settings 後等待 NAS 自然訂單與庫存成功及兩條連線重新確認。
+
+
 ## 2026-10-17 23:12 訂單 413 診斷進行中；庫存自然同步已成功
 
 - 使用者已明確授權查清並修正訂單 413、完整保留訂單資料、不影響作業，同時驗證庫存與 NAS。目標僅 @059hdfyo；本輪不送 LINE、不執行 ERP 寫入、不變更認證或付費方案。
