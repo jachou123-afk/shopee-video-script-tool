@@ -3896,7 +3896,7 @@ test("warehouse position dry run refuses a different LINE official account", asy
   assert.match(replies[0].messages[0].text, /本次沒有寫入 ERP/);
 });
 
-test("group users can search warehouse products by a bare keyword without mentioning the bot", async () => {
+test("group and room chats stay silent unless warehouse keyword search is explicit or mentioned", async () => {
   const originalFetch = globalThis.fetch;
   const values = new Map();
   const object = new LineActivation({
@@ -3950,17 +3950,50 @@ test("group users can search warehouse products by a bare keyword without mentio
     },
   };
   try {
+    for (const source of [
+      { type: "group", groupId: "g1", userId: "u1" },
+      { type: "room", roomId: "r1", userId: "u1" },
+    ]) {
+      for (const text of ["影片多拍點3q", "影片多拍點３ｑ", "收到", "謝謝", "好", "查好了，謝謝", "洗衣袋", "今天要拍洗衣袋"]) {
+        await processLineEvent({
+          type: "message", replyToken: "ordinary-chat", timestamp: Date.now(),
+          source, message: { type: "text", text },
+        }, env);
+        assert.equal(replies.length, 0, source.type + " must ignore: " + text);
+      }
+    }
+    for (const source of [
+      { type: "group", groupId: "g1", userId: "u1" },
+      { type: "room", roomId: "r1", userId: "u1" },
+    ]) {
+      for (const text of ["查 洗衣袋", "查詢：洗衣袋", "搜尋 洗衣袋", "儲位 洗衣袋"]) {
+        const beforeCount = replies.length;
+        await processLineEvent({
+          type: "message", replyToken: "explicit-search", timestamp: Date.now(),
+          source, message: { type: "text", text },
+        }, env);
+        assert.equal(replies.length, beforeCount + 1, text);
+      }
+    }
     await processLineEvent({
-      type: "message",
-      replyToken: "warehouse-keyword",
-      timestamp: Date.now(),
+      type: "message", replyToken: "mentioned-keyword", timestamp: Date.now(),
       source: { type: "group", groupId: "g1", userId: "u1" },
+      message: {
+        type: "text", text: "@小幫手 洗衣袋",
+        mention: { mentionees: [{ type: "user", index: 0, length: 4, isSelf: true }] },
+      },
+    }, env);
+    await processLineEvent({
+      type: "message", replyToken: "private-keyword", timestamp: Date.now(),
+      source: { type: "user", userId: "u1" },
       message: { type: "text", text: "洗衣袋" },
     }, env);
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.equal(replies.length, 1);
+  assert.equal(replies.length, 10);
+  assert.ok(replies.every(reply => reply.messages[0].type === "flex"));
+  assert.ok(replies.every(reply => /洗衣袋.*找到 1 項/.test(reply.messages[0].altText)));
   assert.equal(replies[0].messages[0].type, "flex");
   assert.match(replies[0].messages[0].altText, /洗衣袋.*找到 1 項/);
   assert.equal(

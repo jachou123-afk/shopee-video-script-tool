@@ -1,5 +1,15 @@
 # Shopee Video Script Tool — Handoff
 
+## 2026-10-20 群組一般聊天不再自動搜尋 ERP（已正式部署）
+
+- 使用者回報「蝦皮 影片群」一般聊天「影片多拍點3q」被長頸鹿超級小幫手誤當商品關鍵字，要求不要在群組插話。目標服務為 @059hdfyo 的 shopee-video-script-ai；此次群組／多人聊天室共用相同規則，另一帳號 @037vajci 不在範圍內。
+- 根因為 parseWarehouseSearchCommand() 原本將幾乎所有自由文字當成商品關鍵字。現群組／聊天室未 @小幫手時，只接受以「查／查詢／搜／搜尋／儲位」加空白或分隔符號開頭的商品關鍵字指令，例如「查 洗衣袋」、「查詢：洗衣袋」。一般聊天與單獨品名保持靜默；「查好了，謝謝」也不會誤判。@小幫手加關鍵字與私訊裸關鍵字仍可使用。
+- 貨號直查、完整儲位、既有廣告影片排程／完成／取消完成、訂單權限、ERP 同步與儲位寫入確認流程維持原行為。LINE 使用說明同步更新群組查詢用法。未代傳群組或私訊測試訊息，未執行 ERP 寫入。
+- 修改前即時 fetch 確認 agent/line-schedule-handoff 與 upstream 為 0/0、工作樹乾淨，HEAD 5b2d8063de19983d3013d198e622f118930fe78c。正式基底 version 9c5e8285-7b3d-4230-a91e-61bfc660a6fa，原程式 SHA-256 d716328ec0a1473124a8935eb6bdbf71ae1527f5ce3cc3274b411378fe3c9391 與交接相符。
+- 驗證：137/137 單元與回歸測試、node --check、git diff --check、Wrangler 4.151.1 dry-run 通過；回歸覆蓋兩類群聊共 16 次靜默、8 次明確搜尋、@關鍵字與私訊裸關鍵字，既有貨號與排程測試保留。
+- 2026-10-20 22:28:33（Asia/Taipei）以 content-only API 正式部署 version 2505cae5-8855-4d7a-a86d-641c61170c4d，deployment 1bde84e9-5286-4707-b2a0-9ea5d065bacf，100% 流量。回讀正式程式 SHA-256 5e186347614e274eb0e066f4a0deb4112306ff2d48992d8cc3dae94cb4762f3f 與本機測試打包檔一致；完整 settings 部署前後完全相同。公開根 GET 405；未認證 reader/status、erp/writeback/status、erp/orders/status 均為 401。
+- 程式與部署已完成，真實 LINE 畫面尚待使用者自然聊天驗收；本輪測試均為本機模擬，沒有代發 LINE 訊息。
+
 ## 2026-10-17 訂單 413 根因修正（已部署；訂單／庫存／NAS 正式驗收通過）
 
 - 23:12:37 台灣正式自然訂單推送共 53,851,665 bytes、20,276 筆，內部明確回 ORDER_LIMIT_EXCEEDED（limit=20000、received=20276）。並非 duration quota、單筆大小或索引問題；不能刪掉超過的 276 筆或縮短 90 天保留期處理。

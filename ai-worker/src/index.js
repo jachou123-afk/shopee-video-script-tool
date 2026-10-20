@@ -1232,10 +1232,13 @@ function normalizeWarehouseSearchText(value) {
   return String(value || "").normalize("NFKC").toUpperCase().replace(/[\s\p{P}\p{S}]+/gu, "").slice(0, 160);
 }
 __name(normalizeWarehouseSearchText, "normalizeWarehouseSearchText");
-function parseWarehouseSearchCommand(text) {
+function parseWarehouseSearchCommand(text, { requirePrefix = false } = {}) {
   const normalized = normalizeScheduleDigits(text).replace(/\s+/g, " ").trim();
   if (!normalized || /https?:\/\/|shopee/iu.test(normalized)) return null;
-  const prefixed = normalized.match(/^(?:儲位|查詢?|搜(?:尋)?)\s*(?:[+＋:：]\s*)?(.+)$/iu);
+  const prefixed = normalized.match(requirePrefix
+    ? /^(?:儲位|查詢?|搜(?:尋)?)(?:\s+|\s*[+＋:：]\s*)(.+)$/iu
+    : /^(?:儲位|查詢?|搜(?:尋)?)\s*(?:[+＋:：]\s*)?(.+)$/iu);
+  if (requirePrefix && !prefixed) return null;
   const keyword = String(prefixed?.[1] || normalized).trim().slice(0, 80);
   const searchable = normalizeWarehouseSearchText(keyword);
   if (!searchable || parseWarehouseLocationCommand(keyword)) return null;
@@ -1302,8 +1305,8 @@ function lineHelpText() {
     "\u4E5F\u53EF\u4EE5\u8F38\u5165\u300C\u5132\u4F4D 04-R05-02/T5\u300D\u3002",
     "\u56DE\u8986\u8A72\u5132\u4F4D\u6240\u6709\u54C1\u9805\uFF0C\u6BCF\u9801 10 \u7B46\uFF1B\u5EAB\u5B58 0 \u6216\u8CA0\u6578\u4ECD\u6703\u5217\u51FA\u4E26\u6A19\u793A\u3002",
     "",
-    "\u76F4\u63A5\u8F38\u5165\u5546\u54C1\u95DC\u9375\u5B57\uFF0C\u4F8B\u5982\uFF1A\u6D17\u8863\u888B",
-    "\u300C\u67E5 \u6D17\u8863\u888B\u300D\u6216\u300C\u5132\u4F4D \u6D17\u8863\u888B\u300D\u4E5F\u53EF\u4EE5\u4F7F\u7528\u3002",
+    "\u79C1\u8A0A\u53EF\u76F4\u63A5\u8F38\u5165\u5546\u54C1\u95DC\u9375\u5B57\uFF0C\u4F8B\u5982\uFF1A\u6D17\u8863\u888B",
+    "\u7FA4\u7D44\u8ACB\u8F38\u5165\u300C\u67E5 \u6D17\u8863\u888B\u300D\u6216\u300C\u5132\u4F4D \u6D17\u8863\u888B\u300D\uFF0C\u4E5F\u53EF @\u6211 \u4E26\u52A0\u4E0A\u95DC\u9375\u5B57\uFF1B\u4E00\u822C\u804A\u5929\u4E0D\u56DE\u8986\u3002",
     "\u56DE\u8986\u76F8\u95DC\u5546\u54C1\u5716\u7247\u3001\u8CA8\u865F\u3001\u4E3B\u8981\u5132\u4F4D\u8207\u5EAB\u5B58\uFF1B\u9EDE\u300E\u5B8C\u6574\u5132\u4F4D\u300F\u53EF\u67E5\u770B\u6240\u6709\u898F\u683C\u3002",
     "",
     "\u3010\u5132\u4F4D\u4FEE\u6539\u6F14\u7DF4\u3011",
@@ -6375,7 +6378,7 @@ ${retry}`,
         }, env);
       }
     }
-    const warehouseKeyword = parseWarehouseSearchCommand(text);
+    const warehouseKeyword = parseWarehouseSearchCommand(text, { requirePrefix: groupMessage && !mentioned });
     if (warehouseKeyword) {
       await replyWarehouseSearch(event, warehouseKeyword, env);
       return;
