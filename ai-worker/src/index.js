@@ -1497,11 +1497,10 @@ function collectErpOrderAliases(values) {
   return { aliases, limitExceeded: false };
 }
 __name(collectErpOrderAliases, "collectErpOrderAliases");
+const erpOrderTransactionCollator = new Intl.Collator("en", { numeric: true });
+const erpOrderAliasCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 function compareErpOrderAliases(left, right) {
-  return String(left || "").localeCompare(String(right || ""), "en", {
-    numeric: true,
-    sensitivity: "base"
-  });
+  return erpOrderAliasCollator.compare(String(left || ""), String(right || ""));
 }
 __name(compareErpOrderAliases, "compareErpOrderAliases");
 function parseLineOrderLookupRequest(text) {
@@ -1680,6 +1679,13 @@ function buildErpOrderChunks(orders) {
   let chunkBytes = 2;
   for (const order of orders) {
     const entryBytes = encoder.encode(JSON.stringify({ [order.transactionNo]: order })).byteLength;
+    if (entryBytes > erpOrderChunkTargetBytes) {
+      throw new OrderStreamError("ORDER_TOO_LARGE", 413, {
+        transactionNo: order.transactionNo,
+        limitBytes: erpOrderChunkTargetBytes,
+        receivedBytes: entryBytes
+      });
+    }
     if (Object.keys(chunk).length && chunkBytes + entryBytes > erpOrderChunkTargetBytes) {
       chunks.push(chunk);
       chunk = {};
@@ -3525,21 +3531,16 @@ var LineActivation = class {
     }
     if (!body.orderCount) return Response.json({ ok: false, error: "EMPTY_ORDER_DATA" }, { status: 400 });
     const orders = [...byTransaction.values()].sort(
-      (a, b) => a.transactionNo.localeCompare(b.transactionNo, "en", { numeric: true })
+      (a, b) => erpOrderTransactionCollator.compare(a.transactionNo, b.transactionNo)
     );
-    for (const order of orders) {
-      const entryBytes = encoder.encode(JSON.stringify({ [order.transactionNo]: order })).byteLength;
-      if (entryBytes > erpOrderChunkTargetBytes) {
-        return Response.json({
-          ok: false,
-          error: "ORDER_TOO_LARGE",
-          transactionNo: order.transactionNo,
-          limitBytes: erpOrderChunkTargetBytes,
-          receivedBytes: entryBytes
-        }, { status: 413 });
-      }
+    byTransaction.clear();
+    let chunks;
+    try {
+      chunks = buildErpOrderChunks(orders);
+    } catch (error) {
+      if (error instanceof OrderStreamError) return Response.json(error.data, { status: error.status });
+      throw error;
     }
-    const chunks = buildErpOrderChunks(orders);
     const chunkByTransaction = /* @__PURE__ */ new Map();
     chunks.forEach((chunk, index) => {
       for (const transactionNo of Object.keys(chunk)) chunkByTransaction.set(transactionNo, index);
@@ -3550,6 +3551,9 @@ var LineActivation = class {
     let skuStatusEntryCount = 0;
     for (const order of orders) {
       const chunkIndex = chunkByTransaction.get(order.transactionNo);
+      // All aliases of one order resolve to the same immutable location. Reuse
+      // it in memory; stored JSON and collision checks remain unchanged.
+      const aliasLocation = { transactionNo: order.transactionNo, chunkIndex };
       for (const alias of order.aliases) {
         const bucket = aliases[warehouseLocationBucket(alias, erpOrderAliasBucketCount)];
         const existing = bucket[alias];
@@ -3562,7 +3566,7 @@ var LineActivation = class {
           }, { status: 409 });
         }
         if (!existing) aliasCount += 1;
-        bucket[alias] = { transactionNo: order.transactionNo, chunkIndex };
+        bucket[alias] = aliasLocation;
       }
       if (erpOrderSkuStatuses.includes(order.status)) {
         const orderSkuKeys = new Set([
@@ -3579,6 +3583,7 @@ var LineActivation = class {
         }
       }
     }
+    chunkByTransaction.clear();
     let aliasChunks, skuStatusChunks;
     try {
       aliasChunks = buildErpOrderIndexChunks(aliases);
@@ -3590,6 +3595,9 @@ var LineActivation = class {
         limitBytes: erpOrderChunkTargetBytes
       }, { status: 413 });
     }
+    // The paged indexes now own these entries; release the temporary maps before hashing.
+    aliases.length = 0;
+    skuStatusBuckets.length = 0;
     const previous = await loadSnapshot(this.storage, await this.storage.get("erp-order-active"));
     const metadata = {
       orderCount: orders.length,

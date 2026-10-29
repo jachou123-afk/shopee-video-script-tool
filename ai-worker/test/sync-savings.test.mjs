@@ -262,3 +262,45 @@ test("empty warehouse and order syncs reject without touching a published snapsh
   assert.equal((await f.post("/erp-orders/sync", { updatedAt: at(1), orders: [] })).status, 400);
   assert.deepEqual([...f.values], before);
 });
+
+test("oversized order after valid chunks preserves active snapshot and every old lookup", async () => {
+  const f = fixture();
+  const oldOrder = order("10760001", "新訂單", "A817-01", "OLD-SHOP-ALIAS");
+  await success(f, "/erp-orders/sync", { updatedAt: at(0), orders: [oldOrder] });
+  const before = structuredClone([...f.values]);
+  const oldRead = await queryOrder(f, "OLD-SHOP-ALIAS");
+  f.calls.length = 0;
+  const oversized = {
+    ...order("10769999", "可出貨", "B900-01", "REJECTED-ALIAS"),
+    items: Array.from({ length: 100 }, (_, index) => ({
+      sku: `B900-${index}`, name: "測".repeat(240), style: "長".repeat(120),
+      quantity: index + 1, unitPrice: 12.5, subtotalAmount: (index + 1) * 12.5,
+      warehouseArea: "位".repeat(160),
+    })),
+  };
+  const validOrders = Array.from({ length: 80 }, (_, index) => ({
+    ...order(String(10761000 + index)),
+    items: Array.from({ length: 8 }, (_, itemIndex) => ({
+      sku: `C100-${itemIndex}`, name: "測".repeat(200),
+      quantity: 1, unitPrice: 10,
+    })),
+  }));
+  const failed = await f.post("/erp-orders/sync", {
+    updatedAt: at(1), orders: [...validOrders, oversized],
+  });
+  assert.equal(failed.status, 413);
+  assert.deepEqual(Object.keys(failed.data).sort(), ["error", "limitBytes", "ok", "receivedBytes", "transactionNo"]);
+  assert.equal(failed.data.ok, false);
+  assert.equal(failed.data.error, "ORDER_TOO_LARGE");
+  assert.equal(failed.data.transactionNo, oversized.transactionNo);
+  assert.equal(failed.data.limitBytes, 96 * 1024);
+  assert.ok(failed.data.receivedBytes > failed.data.limitBytes);
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual([...f.values], before);
+  assert.deepEqual(await queryOrder(f, "OLD-SHOP-ALIAS"), oldRead);
+  assert.equal((await queryStatus(f, "A817", "新訂單")).totalCount, 1);
+  assert.equal(await queryOrder(f, "REJECTED-ALIAS"), null);
+  assert.equal(await queryOrder(f, validOrders[0].transactionNo), null);
+  const retry = await success(f, "/erp-orders/sync", { updatedAt: at(2), orders: [oldOrder] });
+  assert.equal(retry.unchanged, true);
+});
