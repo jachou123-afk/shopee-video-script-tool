@@ -1,13 +1,19 @@
 # Shopee Video Script Tool — Handoff
 
-## 2026-10-29 訂單同步 CPU 超時修復（程式驗證完成，待正式自然排程驗收）
+## 2026-10-29 訂單同步 CPU 超時修復（已正式部署，連續兩輪自然排程驗收通過）
 
 - Cloudflare 正式紀錄確認 15:56:23.964 的 `/erp-orders/sync` 為 `exceededCpu`，CPU 32,500 ms、wall 75,550 ms，部署 version `2505cae5-8855-4d7a-a86d-641c61170c4d`；外部 `/erp/orders/push` 15:56:42 回 HTTP 500。不是因為訂單格式或既有 20,000 筆限制。
 - 重用兩個排序 Collator；每筆訂單的 alias 共用查詢位置；完成階段後清除中間 Map／索引桶。單筆大小檢查併入分塊，每筆只序列化一次，仍在任何寫入前完成全量驗證。
 - 完整保留 90 天訂單、所有業務欄位、alias／SKU 查詢、原 413 契約、原子 active 切換及舊快照。未加額外 NAS 重送或改庫存排程。
 - 驗證：138 項單元測試、2 項真實 workerd 整合測試均通過。實際 63,479,206 bytes／23,946 筆／519,160 aliases，修改前後完整快照雜湊、儲存位元組與同步統計一致；測試業務資料只留在私人工作區。
-- 本機 CPU 含 GC 與假儲存開銷，不能當成正式節省率。正式是否已留足 CPU 餘裕，仍須部署後查看自然同步事件。
+- 本機 CPU 含 GC 與假儲存開銷，不能當成正式節省率。以下正式數字來自 Cloudflare 事件，屬不同自然快照的觀測，不能解讀為固定節省率或永久不觸及上限的保證。
 - API 已確認本帳戶 Free plan 不允許設定 CPU limit（400／100328）；嘗試未套用，沒有升級方案，正式設定保持原狀。
+- 修正提交 `002e75b3727fcdc82b3361c2c3f60e97f53f1ca2` 已推送 `agent/line-schedule-handoff`。17:04:10 content-only 部署 version `08555286-a169-4f24-bc18-a5001f9790ac`、deployment `086e535a-4835-4b1d-b137-f5ffa18f36a0`，100% 流量。正式程式 SHA-256 `d4a4480496e23be032b8fb62e464208bbd0b66d7fcac30af086efad67ab11b8b` 與測試包一致；完整 settings 部署前後相同。
+- 第一輪 17:10 自然排程：17:13:23 內部 `/erp-orders/sync` 與外部 `/erp/orders/push` 均 HTTP 200／outcome=ok，使用上述新 version；CPU `19,340 ms`、wall `35,857 ms`，requestId `7018848e26f3acb48b6a5ef91897a337`。修正前 16:53 成功輪 CPU `29,358 ms`、wall `60,155 ms`。本輪 accepted=received=`23,960`、incomplete=`0`、aliasCount=`519,504`，63,512,965 bytes；17:13:26 NAS 整輪 success。
+- 同輪 LINE 庫存 3,783 貨號通過。17:15:24 獨立 GET 讀回訂單 active=true／23,960 筆／90 天保留／updatedAt=17:11:54；清貨庫存 updatedAt=17:10:59，兩筆代表商品存在、missingSkus=[]。
+- 17:17:16 另外核對完整 NAS checkpoint：原基線 23,943 筆、第一個失敗輪待重送的 23,944 筆均全數保留，缺少 0 筆；最新 23,960 筆較基線新增 17 筆。此為交易保留驗證，與雲端 ACK／唯讀回查共同判斷完整性。
+- 第二輪 17:20 自然排程：17:23:27.867 內部同步 outcome=ok，CPU `18,918 ms`、wall `39,380 ms`，requestId `b0ca525ef56e29d7098655d93f002e80`。17:23:28 NAS ACK accepted=received=`23,962`、incomplete=`0`、63,521,476 bytes；17:23:31 整輪 success。17:28:46 獨立 GET 讀回 active 訂單 23,962 筆／alias 519,536／90 天保留；庫存 updatedAt=17:21:00，代表商品 missingSkus=[]。
+- 採購網站的 180 秒逾時是另一項未完成問題：NAS 已增加完整庫存 ACK 驗證與安全傳輸階段診斷，採購仍按自然排程更新；Sites 工具本會話不可用，尚未取得該站正式來源與失敗日誌，未用舊 Git 副本覆蓋。請接續 `profit-analysis-cloud/docs/ERP_SYNC_LOAD_REDUCTION_2026-10-29.md`，不要盲目補 POST 或宣稱逾時已根治。
 
 ## 2026-10-20 群組一般聊天不再自動搜尋 ERP（已正式部署）
 
